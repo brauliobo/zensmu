@@ -4,6 +4,7 @@ use crate::doctor::{CheckStatus, DoctorReport};
 use serde::Serialize;
 use std::sync::OnceLock;
 use zensmu_core::config::profile::ProfileDiffEntry;
+use zensmu_core::driver::{DriverActionOutput, DriverStatus};
 use zensmu_core::error::Error;
 use zensmu_core::hw::identity::{driver_has_false_ok_bug, CpuidInfo, HardwareContext};
 use zensmu_core::hw::profiles::CoBounds;
@@ -282,12 +283,18 @@ pub fn error_kind(err: &Error) -> &'static str {
 }
 
 pub fn print_error(err: &Error, json: bool) {
+    let hint = match err {
+        Error::DriverNotLoaded { path } => Some(zensmu_core::driver::driver_remediation_hint(
+            std::path::Path::new(path),
+        )),
+        _ => err.report_hint().map(str::to_string),
+    };
     if json {
         let payload = ErrorOutput {
             ok: false,
             kind: error_kind(err),
             error: err.to_string(),
-            hint: err.report_hint().map(str::to_string),
+            hint,
         };
         if let Ok(s) = serde_json::to_string(&payload) {
             eprintln!("{s}");
@@ -296,7 +303,7 @@ pub fn print_error(err: &Error, json: bool) {
         }
     } else {
         eprintln!("error: {err}");
-        if let Some(hint) = err.report_hint() {
+        if let Some(hint) = hint {
             eprintln!("hint: {hint}");
         }
     }
@@ -992,6 +999,79 @@ pub fn print_persist_action(out: &PersistActionOutput) {
     }
     println!();
     print_persist_status(&out.status);
+}
+
+pub fn print_driver_status(status: &DriverStatus) {
+    println!("ryzen_smu Kernel Driver");
+    println!("=======================");
+    println!("Summary          : {}", status.summary);
+    println!(
+        "Loaded           : {}",
+        if status.loaded { "yes" } else { "no" }
+    );
+    if let Some(ref v) = status.drv_version {
+        println!("Driver Version   : {v}");
+    }
+    println!("Sysfs Path       : {}", status.sysfs_path);
+    println!(
+        "Module Installed : {}{}",
+        if status.module_installed { "yes" } else { "no" },
+        status
+            .module_path
+            .as_deref()
+            .map(|p| format!(" ({p})"))
+            .unwrap_or_default()
+    );
+    println!(
+        "DKMS Registered  : {}{}",
+        if status.dkms_installed { "yes" } else { "no" },
+        status
+            .dkms_status
+            .as_deref()
+            .map(|s| format!(" ({})", s.replace('\n', "; ")))
+            .unwrap_or_default()
+    );
+    println!(
+        "Boot Autoload    : {}",
+        if status.autoload_configured {
+            "configured (/etc/modules-load.d/ryzen_smu.conf)"
+        } else {
+            "not configured"
+        }
+    );
+    println!("Kernel           : {}", status.kernel_release);
+    println!(
+        "Distribution     : {} ({})",
+        status.distro_name, status.distro_family
+    );
+    if !status.loaded {
+        println!();
+        println!("Recommended next step:");
+        println!("  {}", status.recommended_command);
+        if !status.manual_commands.is_empty() {
+            println!();
+            println!("Manual install options:");
+            for cmd in &status.manual_commands {
+                println!("  {cmd}");
+            }
+        }
+    }
+}
+
+pub fn print_driver_action(out: &DriverActionOutput) {
+    let tag = if out.dry_run { "[DRY-RUN]" } else { "[OK]" };
+    println!("{tag} driver {} (method: {})", out.action, out.method);
+    if !out.steps.is_empty() {
+        println!("Steps:");
+        for step in &out.steps {
+            println!("  - {step}");
+        }
+    }
+    for note in &out.notes {
+        println!("Note : {note}");
+    }
+    println!();
+    print_driver_status(&out.status);
 }
 
 pub fn print_record_service_status(status: &RecordServiceStatus) {

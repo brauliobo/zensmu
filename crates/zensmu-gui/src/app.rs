@@ -15,6 +15,7 @@ use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
 use zensmu_core::config::profile::{Profile, ProfileDiffEntry, PROFILE_SCHEMA_VERSION};
+use zensmu_core::driver::{inspect_driver_status, DriverStatus};
 use zensmu_core::hw::identity::{detect_hardware, HardwareContext};
 use zensmu_core::hw::profiles::CpuCapabilities;
 use zensmu_core::ops::apu::{
@@ -744,6 +745,7 @@ pub struct ZensmuApp {
     pub hw_error: Option<String>,
     pub hw_error_suggests_report: bool,
     pub hw_error_hint: Option<&'static str>,
+    pub driver_status: DriverStatus,
     pub board_info: SystemBoardInfo,
     pub board_caps: BTreeMap<String, u32>,
     pub clamp_warning: Option<String>,
@@ -806,6 +808,9 @@ impl ZensmuApp {
             hw_error: None,
             hw_error_suggests_report: false,
             hw_error_hint: None,
+            driver_status: inspect_driver_status(Path::new(
+                zensmu_core::transport::sysfs::DEFAULT_SYSFS_PATH,
+            )),
             board_info: SystemBoardInfo::detect_linux(),
             board_caps: BTreeMap::new(),
             clamp_warning: None,
@@ -900,6 +905,7 @@ impl ZensmuApp {
         self.clamp_warning = None;
 
         let transport = SysfsTransport::default();
+        self.driver_status = inspect_driver_status(transport.sysfs_dir());
         match detect_hardware(&transport, true) {
             Ok(hw) => {
                 let core_count = hw.topology.physical_cores;
@@ -1628,6 +1634,21 @@ impl ZensmuApp {
                             "Boot-loop crash guard was already clean.",
                         );
                     }
+                }
+                ElevatedResult::DriverLoaded(out) => {
+                    let action_verb = if out.action == "install" {
+                        "Installed and loaded"
+                    } else {
+                        "Loaded"
+                    };
+                    self.driver_status = out.status;
+                    self.set_toast(
+                        ToastLevel::Success,
+                        format!(
+                            "{action_verb} ryzen_smu kernel driver — probing Ryzen SMU hardware."
+                        ),
+                    );
+                    self.probe_hardware(ctx);
                 }
                 ElevatedResult::HardwareClamped { message, caps } => {
                     self.cleanup_staging_persist();

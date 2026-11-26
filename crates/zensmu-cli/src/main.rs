@@ -8,21 +8,21 @@ mod tui;
 use clap::{CommandFactory, Parser};
 use clap_complete::Shell;
 use commands::{
-    ApuAction, Cli, CoAction, Command, PboAction, PersistAction, PersistCommand, ProfileAction,
-    RecordAction, RecordCommand, RecordFormatArg, RecordServiceAction, ShaperAction,
+    ApuAction, Cli, CoAction, Command, DriverAction, PboAction, PersistAction, PersistCommand,
+    ProfileAction, RecordAction, RecordCommand, RecordFormatArg, RecordServiceAction, ShaperAction,
     TelemetryAction,
 };
 use doctor::{is_effective_root, run_doctor};
 use output::{
-    print_co_table, print_doctor, print_error, print_info, print_json, print_json_compact,
-    print_mutation, print_pbo_status, print_persist_action, print_persist_status,
-    print_planned_ops, print_profile_diff, print_profile_list, print_record_export_pts,
-    print_record_service_action, print_record_service_status, print_record_stats,
-    print_report_footer, print_shaper_matrix, print_status, print_telemetry, ActivePboLimits,
-    ClearGuardOutput, CoGetOutput, InfoOutput, MutationOutput, PboGetOutput, PersistActionOutput,
-    ProfileDiffOutput, ProfileListItem, ProfileListOutput, ProfileSaveOutput,
-    ProfileValidateOutput, RecordExportPtsOutput, RecordServiceActionOutput, ReportOutput,
-    ShaperGetOutput, StatusOutput, TelemetryDumpOutput,
+    print_co_table, print_doctor, print_driver_action, print_driver_status, print_error,
+    print_info, print_json, print_json_compact, print_mutation, print_pbo_status,
+    print_persist_action, print_persist_status, print_planned_ops, print_profile_diff,
+    print_profile_list, print_record_export_pts, print_record_service_action,
+    print_record_service_status, print_record_stats, print_report_footer, print_shaper_matrix,
+    print_status, print_telemetry, ActivePboLimits, ClearGuardOutput, CoGetOutput, InfoOutput,
+    MutationOutput, PboGetOutput, PersistActionOutput, ProfileDiffOutput, ProfileListItem,
+    ProfileListOutput, ProfileSaveOutput, ProfileValidateOutput, RecordExportPtsOutput,
+    RecordServiceActionOutput, ReportOutput, ShaperGetOutput, StatusOutput, TelemetryDumpOutput,
 };
 use std::fs;
 use std::io::{self, IsTerminal, Read, Write};
@@ -32,6 +32,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
 use std::time::{Duration, Instant};
 use zensmu_core::config::profile::Profile;
+use zensmu_core::driver::{self, DriverInstallOptions};
 use zensmu_core::error::{Error, Result};
 use zensmu_core::hw::identity::{detect_hardware, HardwareContext};
 use zensmu_core::ops::apu::{self, ApuSetRequest};
@@ -85,13 +86,152 @@ fn main() -> ExitCode {
     let cli = Cli::parse();
     let json = cli.json;
 
-    match run(cli) {
+    match run(&cli) {
         Ok(CliOutcome::Success) => ExitCode::SUCCESS,
         Ok(CliOutcome::ExitWithCode(code)) => ExitCode::from(code),
         Err(err) => {
+            if matches!(err, Error::DriverNotLoaded { .. }) && maybe_prompt_and_setup_driver(&cli) {
+                match run(&cli) {
+                    Ok(CliOutcome::Success) => return ExitCode::SUCCESS,
+                    Ok(CliOutcome::ExitWithCode(code)) => return ExitCode::from(code),
+                    Err(retry_err) => {
+                        print_error(&retry_err, json);
+                        return ExitCode::FAILURE;
+                    }
+                }
+            }
             print_error(&err, json);
             ExitCode::FAILURE
         }
+    }
+}
+
+/// Interactive helper invoked when a command fails because `ryzen_smu` is not loaded.
+/// Returns `true` if the driver was successfully loaded/installed and the caller should retry.
+fn maybe_prompt_and_setup_driver(cli: &Cli) -> bool {
+    // Never prompt in JSON mode, quiet mode, dry-run mode, non-TTY pipelines,
+    // custom mock sysfs paths, or when already running `zensmu driver`.
+    if cli.json
+        || cli.quiet
+        || cli.dry_run
+        || cli.sysfs_path.is_some()
+        || matches!(cli.command, Command::Driver { .. })
+        || !io::stdin().is_terminal()
+        || !io::stderr().is_terminal()
+    {
+        return false;
+    }
+
+    let sp = sysfs_path(cli);
+    let status = driver::inspect_driver_status(&sp);
+    if status.loaded {
+        return false;
+    }
+
+    let is_root = is_effective_root();
+    let current_exe = std::env::current_exe().unwrap_or_else(|_| PathBuf::from("zensmu"));
+
+    if status.module_installed {
+        eprintln!();
+        eprintln!("ryzen_smu kernel module is installed but not loaded.");
+        if !prompt_yes_no("Load ryzen_smu now (and enable boot autoload)?", true) {
+            return false;
+        }
+        return run_driver_setup_command(&current_exe, is_root, &["driver", "load"]);
+    }
+
+    eprintln!();
+    eprintln!(
+        "ryzen_smu kernel driver is not installed on {} (kernel {}).",
+        status.distro_name, status.kernel_release
+    );
+
+    if status.distro_family == driver::DistroFamily::Arch {
+        if !is_root {
+            if let Some(helper) = ["paru", "yay"].into_iter().find(|h| command_in_path(h)) {
+                let prompt = format!(
+                    "Install `ryzen_smu-dkms-git` from AUR now via `{helper} -S ryzen_smu-dkms-git`?"
+                );
+                if prompt_yes_no(&prompt, true) {
+                    let installed = ProcessCommand::new(helper)
+                        .args(["-S", "ryzen_smu-dkms-git"])
+                        .status()
+                        .map(|s| s.success())
+                        .unwrap_or(false);
+                    if installed {
+                        return run_driver_setup_command(&current_exe, false, &["driver", "load"]);
+                    }
+                    return false;
+                }
+                return false;
+            }
+        }
+        if prompt_yes_no(
+            "Build & install `ryzen_smu` via DKMS from upstream amkillam/ryzen_smu now?",
+            false,
+        ) {
+            return run_driver_setup_command(
+                &current_exe,
+                is_root,
+                &["driver", "install", "--method", "source"],
+            );
+        }
+        return false;
+    }
+
+    let desc = match status.distro_family {
+        driver::DistroFamily::Debian => {
+            "Download & install verified `ryzen-smu-dkms` .deb package now?"
+        }
+        driver::DistroFamily::Fedora | driver::DistroFamily::OpenSuse => {
+            "Download & install verified `ryzen-smu-dkms` .rpm package now?"
+        }
+        _ => "Build & install `ryzen_smu` via DKMS from upstream source now?",
+    };
+    if !prompt_yes_no(desc, true) {
+        return false;
+    }
+    run_driver_setup_command(&current_exe, is_root, &["driver", "install"])
+}
+
+fn prompt_yes_no(question: &str, default_yes: bool) -> bool {
+    let suffix = if default_yes { "[Y/n]" } else { "[y/N]" };
+    eprint!("{question} {suffix}: ");
+    let _ = io::stderr().flush();
+    let mut line = String::new();
+    if io::stdin().read_line(&mut line).is_err() {
+        return false;
+    }
+    let ans = line.trim().to_ascii_lowercase();
+    if ans.is_empty() {
+        default_yes
+    } else {
+        matches!(ans.as_str(), "y" | "yes")
+    }
+}
+
+fn command_in_path(cmd: &str) -> bool {
+    ProcessCommand::new("sh")
+        .args(["-c", &format!("command -v {cmd} >/dev/null 2>&1")])
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false)
+}
+
+fn run_driver_setup_command(exe: &Path, is_root: bool, args: &[&str]) -> bool {
+    let status = if is_root {
+        ProcessCommand::new(exe).args(args).status()
+    } else {
+        let mut cmd = ProcessCommand::new("sudo");
+        cmd.arg(exe).args(args);
+        cmd.status()
+    };
+    match status {
+        Ok(s) if s.success() => {
+            eprintln!();
+            true
+        }
+        _ => false,
     }
 }
 
@@ -135,12 +275,13 @@ fn parse_confirm_secs(cli: &Cli) -> Result<Option<u64>> {
     }
 }
 
-fn run(cli: Cli) -> Result<CliOutcome> {
-    let transport = build_transport(&cli);
+fn run(cli: &Cli) -> Result<CliOutcome> {
+    let transport = build_transport(cli);
 
     match &cli.command {
         Command::Completions { shell } => cmd_completions(*shell),
-        Command::Doctor => cmd_doctor(&cli, &transport),
+        Command::Doctor => cmd_doctor(cli, &transport),
+        Command::Driver { action } => cmd_driver(cli, action.as_ref()),
         Command::Report {
             note,
             raw_pm_table,
@@ -149,7 +290,7 @@ fn run(cli: Cli) -> Result<CliOutcome> {
             open,
             create,
         } => cmd_report(
-            &cli,
+            cli,
             &transport,
             note.as_deref(),
             *raw_pm_table,
@@ -158,19 +299,19 @@ fn run(cli: Cli) -> Result<CliOutcome> {
             *open,
             *create,
         ),
-        Command::Info => cmd_info(&cli, &transport),
-        Command::Status => cmd_status(&cli, &transport),
-        Command::Co { action } => cmd_co(&cli, &transport, action),
-        Command::Shaper { action } => cmd_shaper(&cli, &transport, action),
-        Command::Pbo { action } => cmd_pbo(&cli, &transport, action),
-        Command::Apu { action } => cmd_apu(&cli, &transport, action),
-        Command::Telemetry { action } => cmd_telemetry(&cli, &transport, action.as_ref()),
-        Command::Record(rec_cmd) => cmd_record(&cli, &transport, rec_cmd),
-        Command::Top { interval } => cmd_top(&cli, &transport, interval),
-        Command::Profile { action } => cmd_profile(&cli, &transport, action),
-        Command::Persist(persist_cmd) => cmd_persist(&cli, &transport, persist_cmd),
-        Command::Rollback => cmd_rollback(&cli, &transport),
-        Command::Reset => cmd_reset(&cli, &transport),
+        Command::Info => cmd_info(cli, &transport),
+        Command::Status => cmd_status(cli, &transport),
+        Command::Co { action } => cmd_co(cli, &transport, action),
+        Command::Shaper { action } => cmd_shaper(cli, &transport, action),
+        Command::Pbo { action } => cmd_pbo(cli, &transport, action),
+        Command::Apu { action } => cmd_apu(cli, &transport, action),
+        Command::Telemetry { action } => cmd_telemetry(cli, &transport, action.as_ref()),
+        Command::Record(rec_cmd) => cmd_record(cli, &transport, rec_cmd),
+        Command::Top { interval } => cmd_top(cli, &transport, interval),
+        Command::Profile { action } => cmd_profile(cli, &transport, action),
+        Command::Persist(persist_cmd) => cmd_persist(cli, &transport, persist_cmd),
+        Command::Rollback => cmd_rollback(cli, &transport),
+        Command::Reset => cmd_reset(cli, &transport),
     }
 }
 
@@ -221,6 +362,55 @@ fn cmd_doctor(cli: &Cli, transport: &dyn SmuTransport) -> Result<CliOutcome> {
         Ok(CliOutcome::Success)
     } else {
         Ok(CliOutcome::ExitWithCode(1))
+    }
+}
+
+fn cmd_driver(cli: &Cli, action: Option<&DriverAction>) -> Result<CliOutcome> {
+    let sp = sysfs_path(cli);
+    match action.unwrap_or(&DriverAction::Status) {
+        DriverAction::Status => {
+            let status = driver::inspect_driver_status(&sp);
+            if cli.json {
+                print_json(&status);
+            } else {
+                print_driver_status(&status);
+            }
+            if status.loaded {
+                Ok(CliOutcome::Success)
+            } else {
+                Ok(CliOutcome::ExitWithCode(1))
+            }
+        }
+        DriverAction::Load { no_autoload } => {
+            let out = driver::load_driver(&sp, !no_autoload, cli.dry_run)?;
+            if cli.json {
+                print_json(&out);
+            } else {
+                print_driver_action(&out);
+            }
+            Ok(CliOutcome::Success)
+        }
+        DriverAction::Install {
+            method,
+            release,
+            no_autoload,
+            force,
+        } => {
+            let opts = DriverInstallOptions {
+                method: (*method).into(),
+                release_tag: release.clone(),
+                configure_autoload: !no_autoload,
+                force: *force,
+                dry_run: cli.dry_run,
+            };
+            let out = driver::install_driver(&sp, &opts)?;
+            if cli.json {
+                print_json(&out);
+            } else {
+                print_driver_action(&out);
+            }
+            Ok(CliOutcome::Success)
+        }
     }
 }
 

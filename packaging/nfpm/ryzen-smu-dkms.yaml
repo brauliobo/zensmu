@@ -1,0 +1,75 @@
+name: ryzen-smu-dkms
+arch: all
+platform: linux
+version: "${RYZEN_SMU_VERSION}"
+release: "1"
+section: kernel
+priority: optional
+maintainer: "Braulio Oliveira <brauliobo@gmail.com>"
+description: |
+  DKMS kernel module for AMD Ryzen SMU (/sys/kernel/ryzen_smu_drv),
+  packaged from upstream https://github.com/amkillam/ryzen_smu for use with zensmu.
+vendor: zensmu
+homepage: https://github.com/amkillam/ryzen_smu
+license: GPL-2.0-only
+
+overrides:
+  deb:
+    depends:
+      - dkms
+      - make
+      - gcc
+    recommends:
+      - linux-headers-generic | linux-headers-amd64
+  rpm:
+    depends:
+      - dkms
+      - make
+      - gcc
+      - kernel-devel
+
+contents:
+  - src: build/ryzen_smu_src/drv.c
+    dst: "/usr/src/ryzen_smu-${RYZEN_SMU_VERSION}/drv.c"
+    file_info:
+      mode: 0644
+
+  - src: build/ryzen_smu_src/smu.c
+    dst: "/usr/src/ryzen_smu-${RYZEN_SMU_VERSION}/smu.c"
+    file_info:
+      mode: 0644
+
+  - src: build/ryzen_smu_src/smu.h
+    dst: "/usr/src/ryzen_smu-${RYZEN_SMU_VERSION}/smu.h"
+    file_info:
+      mode: 0644
+
+  - src: build/ryzen_smu_src/Makefile
+    dst: "/usr/src/ryzen_smu-${RYZEN_SMU_VERSION}/Makefile"
+    file_info:
+      mode: 0644
+
+  - src: build/ryzen_smu_src/LICENSE
+    dst: "/usr/src/ryzen_smu-${RYZEN_SMU_VERSION}/LICENSE"
+    file_info:
+      mode: 0644
+
+  - src: build/ryzen_smu_src/dkms.conf
+    dst: "/usr/src/ryzen_smu-${RYZEN_SMU_VERSION}/dkms.conf"
+    file_info:
+      mode: 0644
+
+  - src: build/ryzen_smu_src/ryzen_smu.modules-load.conf
+    dst: /etc/modules-load.d/ryzen_smu.conf
+    type: config|noreplace
+    file_info:
+      mode: 0644
+
+  - src: build/ryzen_smu_src/LICENSE
+    dst: /usr/share/licenses/ryzen-smu-dkms/LICENSE
+    file_info:
+      mode: 0644
+
+scripts:
+  postinstall: build/ryzen_smu_src/postinstall.sh
+  preremove: build/ryzen_smu_src/preremove.sh

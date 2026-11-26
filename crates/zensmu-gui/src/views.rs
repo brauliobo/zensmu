@@ -9,6 +9,7 @@ use crate::elevate::CliAction;
 use eframe::egui::{self, Color32, RichText, Stroke, Ui};
 use egui_plot::{HLine, Line, Plot, PlotPoints};
 use std::collections::BTreeMap;
+use zensmu_core::driver::{DistroFamily, DriverInstallMethod};
 use zensmu_core::hw::identity::{driver_has_false_ok_bug, HardwareContext};
 use zensmu_core::ops::apu::{
     APU_FAST_POWER_SOFT_MAX_W, APU_POWER_MAX_W, APU_POWER_MIN_W, APU_POWER_SOFT_MAX_W,
@@ -1088,16 +1089,82 @@ pub fn render_banners(app: &mut ZensmuApp, ui: &mut Ui, ctx: &egui::Context) {
                     ui.label(RichText::new(hint).small().color(TEXT_MUTED));
                 }
                 ui.add_space(6.0);
+                let driver_cmd = app.driver_status.recommended_command.clone();
+                let driver_installed = app.driver_status.module_installed;
+                let driver_distro = app.driver_status.distro_name.clone();
+                let driver_family = app.driver_status.distro_family;
+                let runner_busy = app.runner.is_busy();
+                let mut requested_driver_action: Option<CliAction> = None;
+                let mut copied_driver_cmd = false;
+                let mut retry_probe = false;
+                let mut open_report = false;
+
                 split_or_wrap_row(
                     ui,
                     "hw_error_banner_actions",
                     |ui| {
-                        ui.label(RichText::new("Load the driver with:").color(TEXT_PRIMARY));
-                        ui.code("sudo modprobe ryzen_smu");
+                        if !is_unsupported_or_mismatch && driver_installed {
+                            ui.label(
+                                RichText::new("Module installed; load with:").color(TEXT_PRIMARY),
+                            );
+                            ui.code(&driver_cmd);
+                            if ui
+                                .add_enabled(
+                                    !runner_busy,
+                                    cta_button("Load ryzen_smu (pkexec)", CTA_EMERALD),
+                                )
+                                .on_hover_text(
+                                    "Elevate via PolicyKit to run `zensmu driver load --json`",
+                                )
+                                .clicked()
+                            {
+                                requested_driver_action = Some(CliAction::DriverLoad);
+                            }
+                        } else if !is_unsupported_or_mismatch {
+                            ui.label(
+                                RichText::new(format!("Install driver ({driver_distro}):"))
+                                    .color(TEXT_PRIMARY),
+                            );
+                            ui.code(&driver_cmd);
+                            let (install_label, install_method, install_hover) =
+                                match driver_family {
+                                    DistroFamily::Debian => (
+                                        "Install ryzen_smu (.deb via pkexec)",
+                                        DriverInstallMethod::Package,
+                                        "Download SHA256-verified ryzen-smu-dkms .deb from GitHub Releases and load ryzen_smu",
+                                    ),
+                                    DistroFamily::Fedora | DistroFamily::OpenSuse => (
+                                        "Install ryzen_smu (.rpm via pkexec)",
+                                        DriverInstallMethod::Package,
+                                        "Download SHA256-verified ryzen-smu-dkms .rpm from GitHub Releases and load ryzen_smu",
+                                    ),
+                                    DistroFamily::Arch | DistroFamily::Other => (
+                                        "Install via DKMS Source (pkexec)",
+                                        DriverInstallMethod::Source,
+                                        "Clone upstream amkillam/ryzen_smu, build via DKMS, and load ryzen_smu",
+                                    ),
+                                };
+                            if ui
+                                .add_enabled(!runner_busy, cta_button(install_label, CTA_EMERALD))
+                                .on_hover_text(install_hover)
+                                .clicked()
+                            {
+                                requested_driver_action = Some(CliAction::DriverInstall {
+                                    method: install_method,
+                                });
+                            }
+                            if ui.button("Copy Command").clicked() {
+                                ctx.copy_text(driver_cmd.clone());
+                                copied_driver_cmd = true;
+                            }
+                        } else {
+                            ui.label(RichText::new("Driver command:").color(TEXT_PRIMARY));
+                            ui.code("sudo modprobe ryzen_smu");
+                        }
                     },
                     |ui| {
                         if ui.button("Retry Hardware Probe").clicked() {
-                            app.probe_hardware(ctx);
+                            retry_probe = true;
                         }
                         let cta_label = if is_unsupported_or_mismatch {
                             "Report on GitHub"
@@ -1111,10 +1178,26 @@ pub fn render_banners(app: &mut ZensmuApp, ui: &mut Ui, ctx: &egui::Context) {
                             )
                             .clicked()
                         {
-                            app.open_report_modal_for_unsupported();
+                            open_report = true;
                         }
                     },
                 );
+
+                if let Some(action) = requested_driver_action {
+                    app.dispatch_cli(action, ctx);
+                }
+                if copied_driver_cmd {
+                    app.set_toast(
+                        ToastLevel::Info,
+                        "Copied ryzen_smu install command to clipboard.",
+                    );
+                }
+                if retry_probe {
+                    app.probe_hardware(ctx);
+                }
+                if open_report {
+                    app.open_report_modal_for_unsupported();
+                }
             });
         ui.add_space(10.0);
     }

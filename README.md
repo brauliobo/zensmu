@@ -36,15 +36,43 @@ Runs directly on the stock [`ryzen_smu`](https://gitlab.com/leogx9r/ryzen_smu) k
 
 ### 1. Kernel Driver (`ryzen_smu`)
 
-On Arch / CachyOS, install **`ryzen_smu-dkms-git`** (note the underscore `_`, not `ryzen-smu-dkms`):
+`ryzen_smu` is an out-of-tree DKMS kernel module (not bundled in official Debian/Ubuntu/Fedora/Arch repos). `zensmu` does not hard-depend on it so installations never break on custom kernels, automatically runs `modprobe ryzen_smu` when invoked as root, and includes built-in `zensmu driver status|load|install` tooling:
 
-```bash
-paru -S ryzen_smu-dkms-git
-```
+- **Arch Linux / CachyOS** — install **`ryzen_smu-dkms-git`** (underscore `_`, not `ryzen-smu-dkms`):
+  ```bash
+  paru -S ryzen_smu-dkms-git
+  ```
+- **Debian / Ubuntu** — run `sudo zensmu driver install` (auto-downloads & SHA256-verifies `ryzen-smu-dkms_*_all.deb` from [Releases](https://github.com/brauliobo/zensmu/releases)), or install manually:
+  ```bash
+  # Option A: automatic verified DKMS .deb install
+  sudo zensmu driver install
+
+  # Option B: manual .deb install from Releases
+  sudo apt install linux-headers-$(uname -r) ./ryzen-smu-dkms_*_all.deb
+
+  # Option C: build directly from upstream amkillam/ryzen_smu via DKMS
+  sudo apt install dkms git build-essential linux-headers-$(uname -r)
+  git clone https://github.com/amkillam/ryzen_smu.git /tmp/ryzen_smu
+  sudo make -C /tmp/ryzen_smu dkms-install && sudo modprobe ryzen_smu
+  ```
+- **Fedora / RHEL / openSUSE** — run `sudo zensmu driver install` (auto-downloads & SHA256-verifies `ryzen-smu-dkms-*.noarch.rpm` from [Releases](https://github.com/brauliobo/zensmu/releases)), or install manually:
+  ```bash
+  # Option A: automatic verified DKMS .rpm install
+  sudo zensmu driver install
+
+  # Option B: manual .rpm install from Releases
+  sudo dnf install kernel-devel-$(uname -r) ./ryzen-smu-dkms-*.noarch.rpm
+  # (openSUSE: sudo zypper install --allow-unsigned-rpm ./ryzen-smu-dkms-*.noarch.rpm)
+
+  # Option C: build directly from upstream amkillam/ryzen_smu via DKMS
+  sudo dnf install dkms git gcc make kernel-devel-$(uname -r)
+  git clone https://github.com/amkillam/ryzen_smu.git /tmp/ryzen_smu
+  sudo make -C /tmp/ryzen_smu dkms-install && sudo modprobe ryzen_smu
+  ```
 
 ### 2. Install `zensmu`
 
-Prebuilt packages for **Debian/Ubuntu (`.deb`)**, **Fedora/RHEL/openSUSE (`.rpm`)**, **Arch/CachyOS (`.pkg.tar.zst`)**, and generic Linux (`.tar.gz`) are published automatically on every [GitHub Release](https://github.com/brauliobo/zensmu/releases):
+Prebuilt packages for **Debian/Ubuntu (`.deb`)**, **Fedora/RHEL/openSUSE (`.rpm`)**, **Arch/CachyOS (`.pkg.tar.zst`)**, and generic Linux (`.tar.gz`) — plus optional `ryzen-smu-dkms` `.deb`/`.rpm` packages — are published automatically on every [GitHub Release](https://github.com/brauliobo/zensmu/releases):
 
 ```bash
 # Arch Linux / CachyOS (AUR)
@@ -84,7 +112,9 @@ In `zensmu top`: `1`–`4` switch tabs (`Overview`, `Clocks & Volts`, `CO & Shap
 ### CLI Essentials
 
 ```bash
-# Diagnostics & inspection
+# Diagnostics & driver management
+zensmu driver status                               # Inspect ryzen_smu module, DKMS, autoload & distro guidance
+sudo zensmu driver install                         # Auto-install verified ryzen-smu-dkms (.deb/.rpm) or DKMS source
 zensmu info                                        # CPU, CPUID, topology, capabilities
 sudo zensmu doctor                                 # Driver, false-OK mitigation, mailbox ping, guard check
 sudo zensmu status                                 # Live telemetry + CO + Shaper + PBO + factory limits

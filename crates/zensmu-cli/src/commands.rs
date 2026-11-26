@@ -3,6 +3,7 @@
 use clap::{ArgAction, Args, Parser, Subcommand, ValueEnum};
 use clap_complete::Shell;
 use std::path::PathBuf;
+use zensmu_core::driver::DriverInstallMethod;
 use zensmu_core::recorder::RecordFormat;
 use zensmu_core::types::ApuPowerMode;
 
@@ -70,6 +71,12 @@ pub enum Command {
 
     /// Run safety diagnostics on ryzen_smu, permissions, CPUID, PM table, boot guard, and mailboxes
     Doctor,
+
+    /// Inspect, load, or install the ryzen_smu DKMS kernel driver
+    Driver {
+        #[command(subcommand)]
+        action: Option<DriverAction>,
+    },
 
     /// Generate a privacy-safe diagnostic report for GitHub issues or CPU support requests (unprivileged)
     #[command(visible_alias = "bug-report")]
@@ -162,6 +169,58 @@ pub enum Command {
         /// Target shell
         #[arg(value_enum)]
         shell: CompletionShell,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum DriverMethodArg {
+    /// Use prebuilt ryzen-smu-dkms .deb/.rpm on Debian/Ubuntu/Fedora/openSUSE, guide AUR on Arch, or DKMS source on other distros
+    Auto,
+    /// Download and install verified ryzen-smu-dkms .deb or .rpm from GitHub Releases
+    Package,
+    /// Clone upstream amkillam/ryzen_smu and install via `make dkms-install`
+    Source,
+}
+
+impl From<DriverMethodArg> for DriverInstallMethod {
+    fn from(arg: DriverMethodArg) -> Self {
+        match arg {
+            DriverMethodArg::Auto => DriverInstallMethod::Auto,
+            DriverMethodArg::Package => DriverInstallMethod::Package,
+            DriverMethodArg::Source => DriverInstallMethod::Source,
+        }
+    }
+}
+
+#[derive(Debug, Subcommand)]
+pub enum DriverAction {
+    /// Inspect ryzen_smu driver, DKMS, autoload, and distro install guidance (unprivileged)
+    Status,
+
+    /// Load ryzen_smu via modprobe and configure /etc/modules-load.d/ryzen_smu.conf (requires root)
+    Load {
+        /// Skip writing /etc/modules-load.d/ryzen_smu.conf
+        #[arg(long)]
+        no_autoload: bool,
+    },
+
+    /// Install and load ryzen_smu DKMS driver via verified GitHub Release package or upstream source (requires root)
+    Install {
+        /// Installation method (auto, package, or source)
+        #[arg(long, value_enum, default_value_t = DriverMethodArg::Auto)]
+        method: DriverMethodArg,
+
+        /// Specific GitHub release tag to download ryzen-smu-dkms from (defaults to latest release)
+        #[arg(long, value_name = "TAG")]
+        release: Option<String>,
+
+        /// Skip writing /etc/modules-load.d/ryzen_smu.conf
+        #[arg(long)]
+        no_autoload: bool,
+
+        /// Reinstall even if ryzen_smu is already installed for the running kernel
+        #[arg(long)]
+        force: bool,
     },
 }
 
@@ -1266,6 +1325,60 @@ mod tests {
                 assert_eq!(pts_name, None);
                 assert_eq!(title, None);
                 assert_eq!(identifier, None);
+            }
+            other => panic!("unexpected command: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_driver_status_load_and_install_subcommands() {
+        let bare = Cli::try_parse_from(["zensmu", "driver"]).unwrap();
+        assert!(matches!(bare.command, Command::Driver { action: None }));
+
+        let st = Cli::try_parse_from(["zensmu", "driver", "status", "--json"]).unwrap();
+        assert!(st.json);
+        assert!(matches!(
+            st.command,
+            Command::Driver {
+                action: Some(DriverAction::Status)
+            }
+        ));
+
+        let load = Cli::try_parse_from(["zensmu", "driver", "load", "--no-autoload"]).unwrap();
+        assert!(matches!(
+            load.command,
+            Command::Driver {
+                action: Some(DriverAction::Load { no_autoload: true })
+            }
+        ));
+
+        let inst = Cli::try_parse_from([
+            "zensmu",
+            "driver",
+            "install",
+            "--method",
+            "source",
+            "--release",
+            "v0.2.1",
+            "--force",
+            "--dry-run",
+        ])
+        .unwrap();
+        assert!(inst.dry_run);
+        match inst.command {
+            Command::Driver {
+                action:
+                    Some(DriverAction::Install {
+                        method,
+                        release,
+                        no_autoload,
+                        force,
+                    }),
+            } => {
+                assert_eq!(method, DriverMethodArg::Source);
+                assert_eq!(release.as_deref(), Some("v0.2.1"));
+                assert!(!no_autoload);
+                assert!(force);
             }
             other => panic!("unexpected command: {other:?}"),
         }

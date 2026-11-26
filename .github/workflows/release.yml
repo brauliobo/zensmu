@@ -10,6 +10,11 @@ on:
         description: "Release tag to build/publish (e.g. v0.2.0)"
         required: true
         type: string
+      only_dkms:
+        description: "Only build & attach optional ryzen-smu-dkms (.deb/.rpm) packages"
+        required: false
+        default: false
+        type: boolean
 
 permissions:
   contents: write
@@ -19,7 +24,8 @@ env:
 
 jobs:
   build-and-publish:
-    name: Build Linux Packages (.tar.gz, .deb, .rpm, .pkg.tar.zst)
+    name: Build zensmu Packages (.tar.gz, .deb, .rpm, .pkg.tar.zst)
+    if: ${{ !inputs.only_dkms }}
     runs-on: ubuntu-24.04
     steps:
       - name: Checkout repository
@@ -136,3 +142,52 @@ jobs:
               --title "zensmu ${TAG}" \
               --generate-notes
           fi
+
+  build-ryzen-smu-dkms:
+    name: Build Optional ryzen-smu-dkms Packages (.deb, .rpm)
+    needs: [build-and-publish]
+    if: ${{ always() && (needs.build-and-publish.result == 'success' || needs.build-and-publish.result == 'skipped') }}
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Resolve release tag
+        id: meta
+        run: |
+          TAG="${{ github.event.inputs.tag || github.ref_name }}"
+          echo "tag=${TAG}" >> "$GITHUB_OUTPUT"
+
+      - name: Install nFPM
+        run: |
+          NFPM_VER="2.41.2"
+          curl -fsSL "https://github.com/goreleaser/nfpm/releases/download/v${NFPM_VER}/nfpm_${NFPM_VER}_Linux_x86_64.tar.gz" \
+            | sudo tar -xz -C /usr/local/bin nfpm
+
+      - name: Fetch upstream amkillam/ryzen_smu and prepare DKMS package files
+        id: smu
+        run: bash packaging/nfpm/prepare-ryzen-smu-dkms.sh
+
+      - name: Build ryzen-smu-dkms .deb and .rpm packages
+        env:
+          RYZEN_SMU_VERSION: ${{ steps.smu.outputs.version }}
+        run: |
+          nfpm package --config packaging/nfpm/ryzen-smu-dkms.yaml --packager deb \
+            --target "dist/ryzen-smu-dkms_${RYZEN_SMU_VERSION}_all.deb"
+          nfpm package --config packaging/nfpm/ryzen-smu-dkms.yaml --packager rpm \
+            --target "dist/ryzen-smu-dkms-${RYZEN_SMU_VERSION}-1.noarch.rpm"
+          (cd dist && sha256sum "ryzen-smu-dkms_${RYZEN_SMU_VERSION}_all.deb" "ryzen-smu-dkms-${RYZEN_SMU_VERSION}-1.noarch.rpm" > ryzen-smu-dkms.SHA256SUMS.txt)
+          cat dist/ryzen-smu-dkms.SHA256SUMS.txt
+
+      - name: Attach ryzen-smu-dkms packages to GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.meta.outputs.tag }}
+          RYZEN_SMU_VERSION: ${{ steps.smu.outputs.version }}
+        run: |
+          FILES=(
+            "dist/ryzen-smu-dkms_${RYZEN_SMU_VERSION}_all.deb"
+            "dist/ryzen-smu-dkms-${RYZEN_SMU_VERSION}-1.noarch.rpm"
+            "dist/ryzen-smu-dkms.SHA256SUMS.txt"
+          )
+          gh release upload "${TAG}" "${FILES[@]}" --clobber

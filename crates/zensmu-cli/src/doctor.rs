@@ -189,15 +189,18 @@ fn check_driver_loaded(
             );
             (check, Some(info))
         }
-        Err(Error::DriverNotLoaded { path }) => (
-            DoctorCheck::fail(
-                "driver_loaded",
-                "ryzen_smu kernel module",
-                format!("sysfs directory not found at {path}"),
-                Some("Load the kernel module: sudo modprobe ryzen_smu"),
-            ),
-            None,
-        ),
+        Err(Error::DriverNotLoaded { path }) => {
+            let hint = zensmu_core::driver::driver_remediation_hint(sysfs_path);
+            (
+                DoctorCheck::fail(
+                    "driver_loaded",
+                    "ryzen_smu kernel module",
+                    format!("sysfs directory not found at {path}"),
+                    Some(hint.as_str()),
+                ),
+                None,
+            )
+        }
         Err(err) => (
             DoctorCheck::fail(
                 "driver_loaded",

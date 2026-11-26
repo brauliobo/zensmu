@@ -14,6 +14,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::thread;
+use zensmu_core::driver::{DriverActionOutput, DriverInstallMethod};
 use zensmu_core::ops::apu::ApuSetRequest;
 use zensmu_core::ops::co::{CoSnapshot, CoreCoMargin};
 use zensmu_core::ops::pbo::{PboSetRequest, PboStatus};
@@ -168,6 +169,10 @@ pub enum CliAction {
     },
     /// `zensmu profile clear-guard --json`
     ClearBootGuard,
+    /// `zensmu driver load --json`
+    DriverLoad,
+    /// `zensmu driver install --method <method> --yes --json`
+    DriverInstall { method: DriverInstallMethod },
     /// `zensmu report --json [--raw-pm-table] [--note <text>]`
     Report {
         raw_pm_table: bool,
@@ -303,6 +308,8 @@ impl CliAction {
                 (false, false) => "Disable Boot Service".into(),
             },
             Self::ClearBootGuard => "Clear Boot-Loop Crash Guard".into(),
+            Self::DriverLoad => "Load ryzen_smu Driver".into(),
+            Self::DriverInstall { .. } => "Install ryzen_smu Driver".into(),
             Self::Report { .. } => "Collect Hardware Report".into(),
         }
     }
@@ -427,6 +434,8 @@ impl CliAction {
             | Self::PersistSave { .. }
             | Self::PersistSetService { .. }
             | Self::ClearBootGuard
+            | Self::DriverLoad
+            | Self::DriverInstall { .. }
             | Self::Report { .. } => true,
             action => !action.is_dry_run(),
         }
@@ -683,6 +692,15 @@ impl CliAction {
                 "clear-guard".into(),
                 "--json".into(),
             ]],
+            Self::DriverLoad => vec![vec!["driver".into(), "load".into(), "--json".into()]],
+            Self::DriverInstall { method } => vec![vec![
+                "driver".into(),
+                "install".into(),
+                "--method".into(),
+                method.as_str().into(),
+                "--yes".into(),
+                "--json".into(),
+            ]],
             Self::Report { raw_pm_table, note } => {
                 let mut args = vec!["report".into(), "--json".into()];
                 if *raw_pm_table {
@@ -864,6 +882,7 @@ pub enum ElevatedResult {
     GuardCleared {
         cleared: bool,
     },
+    DriverLoaded(Box<DriverActionOutput>),
     HardwareClamped {
         message: String,
         caps: Vec<(String, u32)>,
@@ -998,6 +1017,12 @@ fn execute_action(zensmu_bin: &Path, is_root: bool, action: CliAction) -> Elevat
             Ok(cleared) => ElevatedResult::GuardCleared { cleared },
             Err(message) => ElevatedResult::Error { title, message },
         },
+        CliAction::DriverLoad | CliAction::DriverInstall { .. } => {
+            match parse_driver_action_output(first) {
+                Ok(out) => ElevatedResult::DriverLoaded(Box::new(out)),
+                Err(message) => ElevatedResult::Error { title, message },
+            }
+        }
         write_action => {
             let mut all_ops = Vec::new();
             for out in &stdouts {
@@ -1307,6 +1332,16 @@ pub fn parse_shaper_state(json: &str) -> Result<CurveShaperState, String> {
         }
     }
     Err("Failed to parse Curve Shaper state from zensmu JSON output".into())
+}
+
+/// Parse `DriverActionOutput` from `zensmu driver load|install --json`.
+pub fn parse_driver_action_output(json: &str) -> Result<DriverActionOutput, String> {
+    let val: serde_json::Value =
+        serde_json::from_str(json.trim()).map_err(|e| format!("Invalid driver JSON: {e}"))?;
+    if let Some(err) = extract_error_field(&val) {
+        return Err(err);
+    }
+    serde_json::from_value(val).map_err(|e| format!("Failed to decode driver action output: {e}"))
 }
 
 /// Parse a `PboStatus` from `zensmu pbo get --json`.
