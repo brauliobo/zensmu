@@ -1074,7 +1074,11 @@ fn cmd_persist(
                     Profile::from_snapshot(&snap)
                 }
             };
-            profile.validate_for(hw.codename, hw.topology.physical_cores, cli.allow_extreme)?;
+            // Live hardware snapshots may reflect BIOS-configured Motherboard-PBO values
+            // (e.g. PPT=1000W, Scalar=5x) above interactive soft thresholds, so validate
+            // live snapshots against hard hardware bounds while keeping soft checks for --from files.
+            let effective_allow_extreme = cli.allow_extreme || from.is_none();
+            profile.validate_for(hw.codename, hw.topology.physical_cores, effective_allow_extreme)?;
 
             if cli.dry_run {
                 let status = persist::read_persist_status(
@@ -1111,11 +1115,6 @@ fn cmd_persist(
                 }
                 return Ok(CliOutcome::Success);
             }
-
-            // Live hardware snapshots may reflect BIOS-configured Motherboard-PBO values
-            // (e.g. PPT=1000W, Scalar=5x) above interactive soft thresholds, so validate
-            // live snapshots against hard hardware bounds while keeping soft checks for --from files.
-            let effective_allow_extreme = cli.allow_extreme || from.is_none();
 
             persist::persist_profile(
                 &paths,
@@ -1178,7 +1177,7 @@ fn cmd_persist(
                     )));
                 }
                 let prof = Profile::load(&paths.active_profile)?;
-                prof.validate_for(hw.codename, hw.topology.physical_cores, cli.allow_extreme)?;
+                prof.validate_for(hw.codename, hw.topology.physical_cores, true)?;
 
                 let status = persist::read_persist_status(
                     &paths,
@@ -1210,7 +1209,7 @@ fn cmd_persist(
                 true,
                 hw.codename,
                 hw.topology.physical_cores,
-                cli.allow_extreme,
+                true,
             )?;
             let status = persist::read_persist_status(
                 &paths,
