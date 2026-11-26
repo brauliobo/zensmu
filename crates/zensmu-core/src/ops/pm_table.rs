@@ -27,6 +27,34 @@ pub struct TelemetrySnapshot {
     pub edc_value_a: Option<f32>,
     pub tctl_limit_c: Option<f32>,
     pub tctl_value_c: Option<f32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stapm_limit_w: Option<f32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stapm_value_w: Option<f32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub slow_limit_w: Option<f32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub slow_value_w: Option<f32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub apu_slow_limit_w: Option<f32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub apu_slow_value_w: Option<f32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tdc_soc_limit_a: Option<f32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tdc_soc_value_a: Option<f32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub edc_soc_limit_a: Option<f32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub edc_soc_value_a: Option<f32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub apu_skin_temp_limit_c: Option<f32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub apu_skin_temp_value_c: Option<f32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dgpu_skin_temp_limit_c: Option<f32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dgpu_skin_temp_value_c: Option<f32>,
     pub fclk_mhz: Option<f32>,
     pub uclk_mhz: Option<f32>,
     pub mclk_mhz: Option<f32>,
@@ -39,7 +67,7 @@ pub struct TelemetrySnapshot {
 
 /// Verified byte offsets for a specific `(Codename, pm_table_version)` pair
 /// (cross-referenced against `ZenStates-Core/Hardware/PowerTable.cs`).
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, Default)]
 struct PmTableLayout {
     min_size: usize,
     ppt_limit_w: Option<usize>,
@@ -50,6 +78,20 @@ struct PmTableLayout {
     tctl_value_c: Option<usize>,
     edc_limit_a: Option<usize>,
     edc_value_a: Option<usize>,
+    stapm_limit_w: Option<usize>,
+    stapm_value_w: Option<usize>,
+    slow_limit_w: Option<usize>,
+    slow_value_w: Option<usize>,
+    apu_slow_limit_w: Option<usize>,
+    apu_slow_value_w: Option<usize>,
+    tdc_soc_limit_a: Option<usize>,
+    tdc_soc_value_a: Option<usize>,
+    edc_soc_limit_a: Option<usize>,
+    edc_soc_value_a: Option<usize>,
+    apu_skin_temp_limit_c: Option<usize>,
+    apu_skin_temp_value_c: Option<usize>,
+    dgpu_skin_temp_limit_c: Option<usize>,
+    dgpu_skin_temp_value_c: Option<usize>,
     vddcr_soc_v: Option<usize>,
     vddcr_misc_v: Option<usize>,
     fclk_mhz: Option<usize>,
@@ -89,6 +131,7 @@ fn layout_for(codename: Codename, version: u32) -> Option<PmTableLayout> {
                 cldo_vddg_iod_v: Some(0x40C),
                 cldo_vddg_ccd_v: Some(0x414),
                 cldo_vddp_v: Some(0x434),
+                ..PmTableLayout::default()
             })
         }
         Codename::Raphael => {
@@ -115,8 +158,7 @@ fn layout_for(codename: Codename, version: u32) -> Option<PmTableLayout> {
                 uclk_mhz: Some(0x128),
                 mclk_mhz: Some(0x138),
                 cldo_vddp_v: Some(0x430),
-                cldo_vddg_iod_v: None,
-                cldo_vddg_ccd_v: None,
+                ..PmTableLayout::default()
             })
         }
         Codename::Vermeer => {
@@ -144,13 +186,13 @@ fn layout_for(codename: Codename, version: u32) -> Option<PmTableLayout> {
                 edc_limit_a: Some(0x020),
                 edc_value_a: Some(0x024),
                 vddcr_soc_v: Some(0x0B4),
-                vddcr_misc_v: None,
                 fclk_mhz: Some(0x0C0),
                 uclk_mhz: Some(0x0C8),
                 mclk_mhz: Some(0x0CC),
                 cldo_vddp_v: Some(0x224),
                 cldo_vddg_iod_v: Some(0x228),
                 cldo_vddg_ccd_v: Some(0x22C),
+                ..PmTableLayout::default()
             })
         }
         Codename::Matisse => {
@@ -172,13 +214,12 @@ fn layout_for(codename: Codename, version: u32) -> Option<PmTableLayout> {
                 edc_limit_a: Some(0x020),
                 edc_value_a: Some(0x024),
                 vddcr_soc_v: Some(0x0B0),
-                vddcr_misc_v: None,
                 fclk_mhz: Some(0x0BC),
                 uclk_mhz: Some(0x0C4),
                 mclk_mhz: Some(0x0C8),
                 cldo_vddp_v: Some(0x220),
                 cldo_vddg_iod_v: Some(0x224),
-                cldo_vddg_ccd_v: None,
+                ..PmTableLayout::default()
             })
         }
         Codename::Renoir | Codename::Lucienne => {
@@ -194,22 +235,33 @@ fn layout_for(codename: Codename, version: u32) -> Option<PmTableLayout> {
             };
             Some(PmTableLayout {
                 min_size,
+                stapm_limit_w: Some(0x000),
+                stapm_value_w: Some(0x004),
                 ppt_limit_w: Some(0x008),
                 ppt_value_w: Some(0x00C),
+                slow_limit_w: Some(0x010),
+                slow_value_w: Some(0x014),
+                apu_slow_limit_w: Some(0x018),
+                apu_slow_value_w: Some(0x01C),
                 tdc_limit_a: Some(0x020),
                 tdc_value_a: Some(0x024),
+                tdc_soc_limit_a: Some(0x028),
+                tdc_soc_value_a: Some(0x02C),
                 edc_limit_a: Some(0x030),
                 edc_value_a: Some(0x034),
+                edc_soc_limit_a: Some(0x038),
+                edc_soc_value_a: Some(0x03C),
                 tctl_limit_c: Some(0x040),
                 tctl_value_c: Some(0x044),
+                apu_skin_temp_limit_c: Some(0x048),
+                apu_skin_temp_value_c: Some(0x04C),
+                dgpu_skin_temp_limit_c: Some(0x050),
+                dgpu_skin_temp_value_c: Some(0x054),
                 fclk_mhz: Some(fclk),
                 uclk_mhz: Some(uclk),
                 mclk_mhz: Some(mclk),
                 vddcr_soc_v: Some(vsoc),
-                vddcr_misc_v: None,
-                cldo_vddp_v: None,
-                cldo_vddg_iod_v: None,
-                cldo_vddg_ccd_v: None,
+                ..PmTableLayout::default()
             })
         }
         Codename::Cezanne => {
@@ -222,22 +274,33 @@ fn layout_for(codename: Codename, version: u32) -> Option<PmTableLayout> {
             };
             Some(PmTableLayout {
                 min_size,
+                stapm_limit_w: Some(0x000),
+                stapm_value_w: Some(0x004),
                 ppt_limit_w: Some(0x008),
                 ppt_value_w: Some(0x00C),
+                slow_limit_w: Some(0x010),
+                slow_value_w: Some(0x014),
+                apu_slow_limit_w: Some(0x018),
+                apu_slow_value_w: Some(0x01C),
                 tdc_limit_a: Some(0x020),
                 tdc_value_a: Some(0x024),
+                tdc_soc_limit_a: Some(0x028),
+                tdc_soc_value_a: Some(0x02C),
                 edc_limit_a: Some(0x030),
                 edc_value_a: Some(0x034),
+                edc_soc_limit_a: Some(0x038),
+                edc_soc_value_a: Some(0x03C),
                 tctl_limit_c: Some(0x040),
                 tctl_value_c: Some(0x044),
+                apu_skin_temp_limit_c: Some(0x048),
+                apu_skin_temp_value_c: Some(0x04C),
+                dgpu_skin_temp_limit_c: Some(0x050),
+                dgpu_skin_temp_value_c: Some(0x054),
                 fclk_mhz: Some(fclk),
                 uclk_mhz: Some(uclk),
                 mclk_mhz: Some(mclk),
                 vddcr_soc_v: Some(0x19C),
-                vddcr_misc_v: None,
-                cldo_vddp_v: None,
-                cldo_vddg_iod_v: None,
-                cldo_vddg_ccd_v: None,
+                ..PmTableLayout::default()
             })
         }
         Codename::Rembrandt => {
@@ -248,22 +311,33 @@ fn layout_for(codename: Codename, version: u32) -> Option<PmTableLayout> {
             };
             Some(PmTableLayout {
                 min_size,
+                stapm_limit_w: Some(0x000),
+                stapm_value_w: Some(0x004),
                 ppt_limit_w: Some(0x008),
                 ppt_value_w: Some(0x00C),
+                slow_limit_w: Some(0x010),
+                slow_value_w: Some(0x014),
+                apu_slow_limit_w: Some(0x018),
+                apu_slow_value_w: Some(0x01C),
                 tdc_limit_a: Some(0x020),
                 tdc_value_a: Some(0x024),
+                tdc_soc_limit_a: Some(0x028),
+                tdc_soc_value_a: Some(0x02C),
                 edc_limit_a: Some(0x030),
                 edc_value_a: Some(0x034),
+                edc_soc_limit_a: Some(0x038),
+                edc_soc_value_a: Some(0x03C),
                 tctl_limit_c: Some(0x040),
                 tctl_value_c: Some(0x044),
+                apu_skin_temp_limit_c: Some(0x048),
+                apu_skin_temp_value_c: Some(0x04C),
+                dgpu_skin_temp_limit_c: Some(0x050),
+                dgpu_skin_temp_value_c: Some(0x054),
                 fclk_mhz: Some(fclk),
                 uclk_mhz: Some(uclk),
                 mclk_mhz: Some(mclk),
                 vddcr_soc_v: Some(vsoc),
-                vddcr_misc_v: None,
-                cldo_vddp_v: None,
-                cldo_vddg_iod_v: None,
-                cldo_vddg_ccd_v: None,
+                ..PmTableLayout::default()
             })
         }
         Codename::Phoenix | Codename::HawkPoint => {
@@ -274,22 +348,34 @@ fn layout_for(codename: Codename, version: u32) -> Option<PmTableLayout> {
             let has_std_header = matches!(version, 0x004C_0006..=0x004C_0009);
             Some(PmTableLayout {
                 min_size: 0x778,
+                stapm_limit_w: if has_std_header { Some(0x000) } else { None },
+                stapm_value_w: if has_std_header { Some(0x004) } else { None },
                 ppt_limit_w: if has_std_header { Some(0x008) } else { None },
                 ppt_value_w: if has_std_header { Some(0x00C) } else { None },
+                slow_limit_w: if has_std_header { Some(0x010) } else { None },
+                slow_value_w: if has_std_header { Some(0x014) } else { None },
+                apu_slow_limit_w: if has_std_header { Some(0x018) } else { None },
+                apu_slow_value_w: if has_std_header { Some(0x01C) } else { None },
                 tdc_limit_a: if has_std_header { Some(0x020) } else { None },
                 tdc_value_a: if has_std_header { Some(0x024) } else { None },
+                tdc_soc_limit_a: if has_std_header { Some(0x028) } else { None },
+                tdc_soc_value_a: if has_std_header { Some(0x02C) } else { None },
                 edc_limit_a: if has_std_header { Some(0x030) } else { None },
                 edc_value_a: if has_std_header { Some(0x034) } else { None },
+                edc_soc_limit_a: if has_std_header { Some(0x038) } else { None },
+                edc_soc_value_a: if has_std_header { Some(0x03C) } else { None },
                 tctl_limit_c: if has_std_header { Some(0x040) } else { None },
                 tctl_value_c: if has_std_header { Some(0x044) } else { None },
+                apu_skin_temp_limit_c: if has_std_header { Some(0x048) } else { None },
+                apu_skin_temp_value_c: if has_std_header { Some(0x04C) } else { None },
+                dgpu_skin_temp_limit_c: if has_std_header { Some(0x050) } else { None },
+                dgpu_skin_temp_value_c: if has_std_header { Some(0x054) } else { None },
                 fclk_mhz: Some(0x164),
                 uclk_mhz: Some(0x174),
                 mclk_mhz: Some(0x184),
                 vddcr_soc_v: Some(0x1BC),
-                vddcr_misc_v: None,
                 cldo_vddp_v: Some(0x774),
-                cldo_vddg_iod_v: None,
-                cldo_vddg_ccd_v: None,
+                ..PmTableLayout::default()
             })
         }
         _ => None,
@@ -347,6 +433,20 @@ pub fn decode_pm_table(
         edc_value_a: read_f32_sane(raw, layout.edc_value_a, 0.0, 2000.0),
         tctl_limit_c: read_f32_sane(raw, layout.tctl_limit_c, -40.0, 200.0),
         tctl_value_c: read_f32_sane(raw, layout.tctl_value_c, -40.0, 200.0),
+        stapm_limit_w: read_f32_sane(raw, layout.stapm_limit_w, 0.0, 2000.0),
+        stapm_value_w: read_f32_sane(raw, layout.stapm_value_w, 0.0, 2000.0),
+        slow_limit_w: read_f32_sane(raw, layout.slow_limit_w, 0.0, 2000.0),
+        slow_value_w: read_f32_sane(raw, layout.slow_value_w, 0.0, 2000.0),
+        apu_slow_limit_w: read_f32_sane(raw, layout.apu_slow_limit_w, 0.0, 2000.0),
+        apu_slow_value_w: read_f32_sane(raw, layout.apu_slow_value_w, 0.0, 2000.0),
+        tdc_soc_limit_a: read_f32_sane(raw, layout.tdc_soc_limit_a, 0.0, 2000.0),
+        tdc_soc_value_a: read_f32_sane(raw, layout.tdc_soc_value_a, 0.0, 2000.0),
+        edc_soc_limit_a: read_f32_sane(raw, layout.edc_soc_limit_a, 0.0, 2000.0),
+        edc_soc_value_a: read_f32_sane(raw, layout.edc_soc_value_a, 0.0, 2000.0),
+        apu_skin_temp_limit_c: read_f32_sane(raw, layout.apu_skin_temp_limit_c, -40.0, 200.0),
+        apu_skin_temp_value_c: read_f32_sane(raw, layout.apu_skin_temp_value_c, -40.0, 200.0),
+        dgpu_skin_temp_limit_c: read_f32_sane(raw, layout.dgpu_skin_temp_limit_c, -40.0, 200.0),
+        dgpu_skin_temp_value_c: read_f32_sane(raw, layout.dgpu_skin_temp_value_c, -40.0, 200.0),
         fclk_mhz: read_f32_sane(raw, layout.fclk_mhz, 100.0, 10_000.0),
         uclk_mhz: read_f32_sane(raw, layout.uclk_mhz, 100.0, 10_000.0),
         mclk_mhz: read_f32_sane(raw, layout.mclk_mhz, 100.0, 10_000.0),

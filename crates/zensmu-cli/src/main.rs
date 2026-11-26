@@ -1112,12 +1112,17 @@ fn cmd_persist(
                 return Ok(CliOutcome::Success);
             }
 
+            // Live hardware snapshots may reflect BIOS-configured Motherboard-PBO values
+            // (e.g. PPT=1000W, Scalar=5x) above interactive soft thresholds, so validate
+            // live snapshots against hard hardware bounds while keeping soft checks for --from files.
+            let effective_allow_extreme = cli.allow_extreme || from.is_none();
+
             persist::persist_profile(
                 &paths,
                 &profile,
                 hw.codename,
                 hw.topology.physical_cores,
-                cli.allow_extreme,
+                effective_allow_extreme,
             )?;
             if *enable {
                 persist::set_service_enabled(
@@ -1125,7 +1130,7 @@ fn cmd_persist(
                     true,
                     hw.codename,
                     hw.topology.physical_cores,
-                    cli.allow_extreme,
+                    effective_allow_extreme,
                 )?;
             }
 

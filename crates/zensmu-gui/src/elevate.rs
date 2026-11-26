@@ -15,12 +15,13 @@ use std::process::Command;
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::thread;
 use zensmu_core::config::profile::ProfileDiffEntry;
+use zensmu_core::ops::apu::ApuSetRequest;
 use zensmu_core::ops::co::{CoSnapshot, CoreCoMargin};
 use zensmu_core::ops::pbo::{PboSetRequest, PboStatus};
 use zensmu_core::ops::pm_table::TelemetrySnapshot;
 use zensmu_core::safety::persist::PersistStatus;
 use zensmu_core::safety::snapshot::SmuStateSnapshot;
-use zensmu_core::types::{CurveShaperState, FreqTier, PlannedOp, ShaperTierMargins};
+use zensmu_core::types::{ApuPowerMode, CurveShaperState, FreqTier, PlannedOp, ShaperTierMargins};
 
 /// Fallback system path matching `packaging/polkit/org.zensmu.policy`.
 pub const SYSTEM_ZENSMU_PATH: &str = "/usr/bin/zensmu";
@@ -135,6 +136,12 @@ pub enum CliAction {
     },
     /// `zensmu pbo reset`
     PboReset { dry_run: bool },
+    /// `zensmu apu set ...`
+    ApuSet {
+        req: ApuSetRequest,
+        allow_extreme: bool,
+        dry_run: bool,
+    },
     /// `zensmu profile apply <path>`
     ProfileApply {
         path: PathBuf,
@@ -238,6 +245,13 @@ impl CliAction {
                     "Preview Reset PBO Limits".into()
                 } else {
                     "Reset PBO Limits".into()
+                }
+            }
+            Self::ApuSet { dry_run, .. } => {
+                if *dry_run {
+                    "Preview APU DPTC Limits".into()
+                } else {
+                    "Apply APU DPTC Limits".into()
                 }
             }
             Self::ProfileApply { path, dry_run, .. } => {
@@ -347,6 +361,13 @@ impl CliAction {
                 dry_run: false,
             },
             Self::PboReset { .. } => Self::PboReset { dry_run: false },
+            Self::ApuSet {
+                req, allow_extreme, ..
+            } => Self::ApuSet {
+                req,
+                allow_extreme,
+                dry_run: false,
+            },
             Self::ProfileApply {
                 path,
                 allow_extreme,
@@ -375,6 +396,7 @@ impl CliAction {
                 | Self::ShaperReset { dry_run: true }
                 | Self::PboSet { dry_run: true, .. }
                 | Self::PboReset { dry_run: true }
+                | Self::ApuSet { dry_run: true, .. }
                 | Self::ProfileApply { dry_run: true, .. }
                 | Self::Rollback { dry_run: true }
                 | Self::Reset { dry_run: true }
@@ -520,6 +542,63 @@ impl CliAction {
             Self::PboReset { dry_run } => {
                 let mut args = vec!["pbo".into(), "reset".into()];
                 append_write_flags(&mut args, false, *dry_run);
+                args.push("--json".into());
+                vec![args]
+            }
+            Self::ApuSet {
+                req,
+                allow_extreme,
+                dry_run,
+            } => {
+                let mut args = vec!["apu".into(), "set".into()];
+                if let Some(stapm) = req.stapm_w {
+                    args.push("--stapm".into());
+                    args.push(format!("{stapm}W"));
+                }
+                if let Some(stapm_time) = req.stapm_time_s {
+                    args.push("--stapm-time".into());
+                    args.push(format!("{stapm_time}s"));
+                }
+                if let Some(fast) = req.fast_w {
+                    args.push("--fast".into());
+                    args.push(format!("{fast}W"));
+                }
+                if let Some(slow) = req.slow_w {
+                    args.push("--slow".into());
+                    args.push(format!("{slow}W"));
+                }
+                if let Some(slow_time) = req.slow_time_s {
+                    args.push("--slow-time".into());
+                    args.push(format!("{slow_time}s"));
+                }
+                if let Some(apu_slow) = req.apu_slow_w {
+                    args.push("--apu-slow".into());
+                    args.push(format!("{apu_slow}W"));
+                }
+                if let Some(tdc_soc) = req.tdc_soc_a {
+                    args.push("--tdc-soc".into());
+                    args.push(format!("{tdc_soc}A"));
+                }
+                if let Some(edc_soc) = req.edc_soc_a {
+                    args.push("--edc-soc".into());
+                    args.push(format!("{edc_soc}A"));
+                }
+                if let Some(apu_skin) = req.apu_skin_temp_c {
+                    args.push("--apu-skin".into());
+                    args.push(format!("{apu_skin}C"));
+                }
+                if let Some(dgpu_skin) = req.dgpu_skin_temp_c {
+                    args.push("--dgpu-skin".into());
+                    args.push(format!("{dgpu_skin}C"));
+                }
+                if let Some(mode) = req.power_mode {
+                    args.push("--mode".into());
+                    args.push(match mode {
+                        ApuPowerMode::MaxPerformance => "max-performance".into(),
+                        ApuPowerMode::PowerSaving => "power-saving".into(),
+                    });
+                }
+                append_write_flags(&mut args, *allow_extreme, *dry_run);
                 args.push("--json".into());
                 vec![args]
             }
@@ -1652,5 +1731,144 @@ mod tests {
         assert!(parse_clear_guard_output(guard_err)
             .unwrap_err()
             .contains("permission denied"));
+    }
+
+    #[test]
+    fn apu_set_cli_args_build_all_and_partial_fields_with_write_flags() {
+        let full_dry = CliAction::ApuSet {
+            req: ApuSetRequest {
+                stapm_w: Some(45),
+                stapm_time_s: Some(120),
+                fast_w: Some(54),
+                slow_w: Some(45),
+                slow_time_s: Some(10),
+                apu_slow_w: Some(35),
+                tdc_soc_a: Some(30),
+                edc_soc_a: Some(50),
+                apu_skin_temp_c: Some(55),
+                dgpu_skin_temp_c: Some(60),
+                power_mode: Some(ApuPowerMode::MaxPerformance),
+            },
+            allow_extreme: false,
+            dry_run: true,
+        };
+        assert!(full_dry.is_dry_run());
+        assert!(!full_dry.requires_privilege());
+        assert_eq!(full_dry.title(), "Preview APU DPTC Limits");
+        assert_eq!(
+            full_dry.to_arg_batches(),
+            vec![vec![
+                "apu",
+                "set",
+                "--stapm",
+                "45W",
+                "--stapm-time",
+                "120s",
+                "--fast",
+                "54W",
+                "--slow",
+                "45W",
+                "--slow-time",
+                "10s",
+                "--apu-slow",
+                "35W",
+                "--tdc-soc",
+                "30A",
+                "--edc-soc",
+                "50A",
+                "--apu-skin",
+                "55C",
+                "--dgpu-skin",
+                "60C",
+                "--mode",
+                "max-performance",
+                "--dry-run",
+                "--json",
+            ]]
+        );
+
+        let full_live = full_dry.into_live();
+        assert!(!full_live.is_dry_run());
+        assert!(full_live.requires_privilege());
+        assert_eq!(full_live.title(), "Apply APU DPTC Limits");
+        assert_eq!(
+            full_live.to_arg_batches(),
+            vec![vec![
+                "apu",
+                "set",
+                "--stapm",
+                "45W",
+                "--stapm-time",
+                "120s",
+                "--fast",
+                "54W",
+                "--slow",
+                "45W",
+                "--slow-time",
+                "10s",
+                "--apu-slow",
+                "35W",
+                "--tdc-soc",
+                "30A",
+                "--edc-soc",
+                "50A",
+                "--apu-skin",
+                "55C",
+                "--dgpu-skin",
+                "60C",
+                "--mode",
+                "max-performance",
+                "--yes",
+                "--json",
+            ]]
+        );
+
+        let partial_extreme = CliAction::ApuSet {
+            req: ApuSetRequest {
+                stapm_w: Some(115),
+                apu_skin_temp_c: Some(70),
+                power_mode: Some(ApuPowerMode::PowerSaving),
+                ..Default::default()
+            },
+            allow_extreme: true,
+            dry_run: true,
+        };
+        assert!(partial_extreme.is_dry_run());
+        assert!(!partial_extreme.requires_privilege());
+        assert_eq!(
+            partial_extreme.to_arg_batches(),
+            vec![vec![
+                "apu",
+                "set",
+                "--stapm",
+                "115W",
+                "--apu-skin",
+                "70C",
+                "--mode",
+                "power-saving",
+                "--allow-extreme",
+                "--dry-run",
+                "--json",
+            ]]
+        );
+
+        let partial_live = partial_extreme.into_live();
+        assert!(partial_live.requires_privilege());
+        assert_eq!(
+            partial_live.to_arg_batches(),
+            vec![vec![
+                "apu",
+                "set",
+                "--stapm",
+                "115W",
+                "--apu-skin",
+                "70C",
+                "--mode",
+                "power-saving",
+                "--allow-extreme",
+                "--yes",
+                "--json",
+            ]]
+        );
     }
 }

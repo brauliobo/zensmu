@@ -39,6 +39,20 @@ pub struct SmuStateSnapshot {
     pub tdc_a: Option<u32>,
     pub edc_a: Option<u32>,
     pub tctl_c: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stapm_w: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub slow_w: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub apu_slow_w: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tdc_soc_a: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub edc_soc_a: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub apu_skin_temp_c: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dgpu_skin_temp_c: Option<u32>,
 }
 
 impl SmuStateSnapshot {
@@ -58,6 +72,13 @@ impl SmuStateSnapshot {
             tdc_a: None,
             edc_a: None,
             tctl_c: None,
+            stapm_w: None,
+            slow_w: None,
+            apu_slow_w: None,
+            tdc_soc_a: None,
+            edc_soc_a: None,
+            apu_skin_temp_c: None,
+            dgpu_skin_temp_c: None,
         }
     }
 }

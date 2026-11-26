@@ -25,9 +25,9 @@ pub const APU_SOC_EDC_MIN_A: u32 = 5;
 pub const APU_SOC_EDC_MAX_A: u32 = 150;
 pub const APU_SOC_EDC_SOFT_MAX_A: u32 = 90;
 
-pub const APU_SKIN_TEMP_MIN_C: u32 = 35;
-pub const APU_SKIN_TEMP_MAX_C: u32 = 80;
-pub const APU_SKIN_TEMP_SOFT_MAX_C: u32 = 65;
+pub const APU_SKIN_TEMP_MIN_C: u32 = 30;
+pub const APU_SKIN_TEMP_MAX_C: u32 = 95;
+pub const APU_SKIN_TEMP_SOFT_MAX_C: u32 = 80;
 
 /// Request to update one or more mobile APU DPTC parameters.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -43,6 +43,23 @@ pub struct ApuSetRequest {
     pub apu_skin_temp_c: Option<u32>,
     pub dgpu_skin_temp_c: Option<u32>,
     pub power_mode: Option<ApuPowerMode>,
+}
+
+impl ApuSetRequest {
+    /// Returns true if no APU limit or power-mode fields are set.
+    pub fn is_empty(&self) -> bool {
+        self.stapm_w.is_none()
+            && self.stapm_time_s.is_none()
+            && self.fast_w.is_none()
+            && self.slow_w.is_none()
+            && self.slow_time_s.is_none()
+            && self.apu_slow_w.is_none()
+            && self.tdc_soc_a.is_none()
+            && self.edc_soc_a.is_none()
+            && self.apu_skin_temp_c.is_none()
+            && self.dgpu_skin_temp_c.is_none()
+            && self.power_mode.is_none()
+    }
 }
 
 fn validate_range(
@@ -507,7 +524,7 @@ mod tests {
         ));
 
         let bad_skin = ApuSetRequest {
-            apu_skin_temp_c: Some(85),
+            apu_skin_temp_c: Some(96),
             ..Default::default()
         };
         assert!(matches!(
@@ -526,7 +543,7 @@ mod tests {
 
         // Soft max requires allow_extreme
         let soft_skin = ApuSetRequest {
-            apu_skin_temp_c: Some(70),
+            apu_skin_temp_c: Some(85),
             ..Default::default()
         };
         assert!(matches!(

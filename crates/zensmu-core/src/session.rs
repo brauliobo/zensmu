@@ -43,10 +43,18 @@ pub fn capture_snapshot(
     }
 
     if let Ok(telem) = pm_table::read_telemetry(transport, hw) {
-        snap.ppt_w = telem.ppt_limit_w.map(|v| v.round() as u32);
-        snap.tdc_a = telem.tdc_limit_a.map(|v| v.round() as u32);
-        snap.edc_a = telem.edc_limit_a.map(|v| v.round() as u32);
-        snap.tctl_c = telem.tctl_limit_c.map(|v| v.round() as u32);
+        let pos_u32 = |opt: Option<f32>| opt.filter(|&v| v >= 1.0).map(|v| v.round() as u32);
+        snap.ppt_w = pos_u32(telem.ppt_limit_w);
+        snap.tdc_a = pos_u32(telem.tdc_limit_a);
+        snap.edc_a = pos_u32(telem.edc_limit_a);
+        snap.tctl_c = pos_u32(telem.tctl_limit_c);
+        snap.stapm_w = pos_u32(telem.stapm_limit_w);
+        snap.slow_w = pos_u32(telem.slow_limit_w);
+        snap.apu_slow_w = pos_u32(telem.apu_slow_limit_w);
+        snap.tdc_soc_a = pos_u32(telem.tdc_soc_limit_a);
+        snap.edc_soc_a = pos_u32(telem.edc_soc_limit_a);
+        snap.apu_skin_temp_c = pos_u32(telem.apu_skin_temp_limit_c);
+        snap.dgpu_skin_temp_c = pos_u32(telem.dgpu_skin_temp_limit_c);
     }
 
     Ok(snap)
@@ -123,12 +131,36 @@ pub fn apply_snapshot(
     };
 
     let pbo_req = pbo::PboSetRequest {
-        ppt_w: changed_u32(snap.ppt_w, live_telem.as_ref().and_then(|t| t.ppt_limit_w)),
-        tdc_a: changed_u32(snap.tdc_a, live_telem.as_ref().and_then(|t| t.tdc_limit_a)),
-        edc_a: changed_u32(snap.edc_a, live_telem.as_ref().and_then(|t| t.edc_limit_a)),
-        tctl_c: changed_u32(snap.tctl_c, live_telem.as_ref().and_then(|t| t.tctl_limit_c)),
-        scalar: scalar_req,
-        fmax_mhz: fmax_req,
+        ppt_w: if hw.capabilities.set_ppt.is_some() {
+            changed_u32(snap.ppt_w, live_telem.as_ref().and_then(|t| t.ppt_limit_w))
+        } else {
+            None
+        },
+        tdc_a: if hw.capabilities.set_tdc.is_some() {
+            changed_u32(snap.tdc_a, live_telem.as_ref().and_then(|t| t.tdc_limit_a))
+        } else {
+            None
+        },
+        edc_a: if hw.capabilities.set_edc.is_some() {
+            changed_u32(snap.edc_a, live_telem.as_ref().and_then(|t| t.edc_limit_a))
+        } else {
+            None
+        },
+        tctl_c: if hw.capabilities.set_tctl.is_some() {
+            changed_u32(snap.tctl_c, live_telem.as_ref().and_then(|t| t.tctl_limit_c))
+        } else {
+            None
+        },
+        scalar: if hw.capabilities.set_pbo_scalar.is_some() {
+            scalar_req
+        } else {
+            None
+        },
+        fmax_mhz: if hw.capabilities.set_fmax.is_some() {
+            fmax_req
+        } else {
+            None
+        },
     };
     if pbo_req.ppt_w.is_some()
         || pbo_req.tdc_a.is_some()
@@ -145,6 +177,68 @@ pub fn apply_snapshot(
             true,
             dry_run,
         )?);
+    }
+
+    if hw.codename.is_apu() {
+        let apu_req = apu::ApuSetRequest {
+            stapm_w: if hw.capabilities.set_stapm_limit.is_some() {
+                changed_u32(snap.stapm_w, live_telem.as_ref().and_then(|t| t.stapm_limit_w))
+            } else {
+                None
+            },
+            stapm_time_s: None,
+            fast_w: None,
+            slow_w: if hw.capabilities.set_slow_limit.is_some() {
+                changed_u32(snap.slow_w, live_telem.as_ref().and_then(|t| t.slow_limit_w))
+            } else {
+                None
+            },
+            slow_time_s: None,
+            apu_slow_w: if hw.capabilities.set_apu_slow_limit.is_some() {
+                changed_u32(
+                    snap.apu_slow_w,
+                    live_telem.as_ref().and_then(|t| t.apu_slow_limit_w),
+                )
+            } else {
+                None
+            },
+            tdc_soc_a: if hw.capabilities.set_tdc_soc.is_some() {
+                changed_u32(
+                    snap.tdc_soc_a,
+                    live_telem.as_ref().and_then(|t| t.tdc_soc_limit_a),
+                )
+            } else {
+                None
+            },
+            edc_soc_a: if hw.capabilities.set_edc_soc.is_some() {
+                changed_u32(
+                    snap.edc_soc_a,
+                    live_telem.as_ref().and_then(|t| t.edc_soc_limit_a),
+                )
+            } else {
+                None
+            },
+            apu_skin_temp_c: if hw.capabilities.set_apu_skin_temp.is_some() {
+                changed_u32(
+                    snap.apu_skin_temp_c,
+                    live_telem.as_ref().and_then(|t| t.apu_skin_temp_limit_c),
+                )
+            } else {
+                None
+            },
+            dgpu_skin_temp_c: if hw.capabilities.set_dgpu_skin_temp.is_some() {
+                changed_u32(
+                    snap.dgpu_skin_temp_c,
+                    live_telem.as_ref().and_then(|t| t.dgpu_skin_temp_limit_c),
+                )
+            } else {
+                None
+            },
+            power_mode: None,
+        };
+        if !apu_req.is_empty() {
+            ops.extend(apu::set_apu(transport, hw, &apu_req, true, dry_run)?);
+        }
     }
 
     Ok(ops)
@@ -223,13 +317,41 @@ pub fn apply_profile(
     }
 
     if let Some(ref pbo_prof) = profile.pbo {
+        // When applying live, skip PBO fields already matching hardware so BIOS-set
+        // Motherboard-PBO values don't trigger unnecessary SMU writes or rejections.
+        let (live_telem, live_pbo) = if dry_run {
+            (None, None)
+        } else {
+            (
+                pm_table::read_telemetry(transport, hw).ok(),
+                pbo::get_pbo_status(transport, hw).ok(),
+            )
+        };
+        let skip_same_f32 = |desired: Option<u32>, current: Option<f32>| -> Option<u32> {
+            let d = desired?;
+            if let Some(c) = current {
+                if (c - d as f32).abs() <= 0.5 {
+                    return None;
+                }
+            }
+            Some(d)
+        };
+        let scalar = match (pbo_prof.scalar, live_pbo.as_ref().and_then(|p| p.scalar)) {
+            (Some(d), Some(c)) if (c - d as f32).abs() <= 0.05 => None,
+            (d, _) => d,
+        };
+        let fmax_mhz = match (pbo_prof.fmax_mhz, live_pbo.as_ref().and_then(|p| p.fmax_mhz)) {
+            (Some(d), Some(c)) if d == c => None,
+            (d, _) => d,
+        };
+
         let req = pbo::PboSetRequest {
-            ppt_w: pbo_prof.ppt_w,
-            tdc_a: pbo_prof.tdc_a,
-            edc_a: pbo_prof.edc_a,
-            tctl_c: pbo_prof.tctl_c,
-            scalar: pbo_prof.scalar,
-            fmax_mhz: pbo_prof.fmax_mhz,
+            ppt_w: skip_same_f32(pbo_prof.ppt_w, live_telem.as_ref().and_then(|t| t.ppt_limit_w)),
+            tdc_a: skip_same_f32(pbo_prof.tdc_a, live_telem.as_ref().and_then(|t| t.tdc_limit_a)),
+            edc_a: skip_same_f32(pbo_prof.edc_a, live_telem.as_ref().and_then(|t| t.edc_limit_a)),
+            tctl_c: skip_same_f32(pbo_prof.tctl_c, live_telem.as_ref().and_then(|t| t.tctl_limit_c)),
+            scalar,
+            fmax_mhz,
         };
         if req.ppt_w.is_some()
             || req.tdc_a.is_some()
@@ -243,20 +365,60 @@ pub fn apply_profile(
     }
 
     if let Some(ref apu_prof) = profile.apu {
+        let live_telem = if dry_run {
+            None
+        } else {
+            pm_table::read_telemetry(transport, hw).ok()
+        };
+        let skip_same_f32 = |desired: Option<u32>, current: Option<f32>| -> Option<u32> {
+            let d = desired?;
+            if let Some(c) = current {
+                if (c - d as f32).abs() <= 0.5 {
+                    return None;
+                }
+            }
+            Some(d)
+        };
         let req = apu::ApuSetRequest {
-            stapm_w: apu_prof.stapm_w,
-            stapm_time_s: None,
-            fast_w: apu_prof.fast_w,
-            slow_w: apu_prof.slow_w,
-            slow_time_s: None,
-            apu_slow_w: apu_prof.apu_slow_w,
-            tdc_soc_a: None,
-            edc_soc_a: None,
-            apu_skin_temp_c: apu_prof.apu_skin_temp_c,
-            dgpu_skin_temp_c: apu_prof.dgpu_skin_temp_c,
+            stapm_w: skip_same_f32(
+                apu_prof.stapm_w,
+                live_telem.as_ref().and_then(|t| t.stapm_limit_w),
+            ),
+            stapm_time_s: apu_prof.stapm_time_s,
+            fast_w: skip_same_f32(
+                apu_prof.fast_w,
+                live_telem.as_ref().and_then(|t| t.ppt_limit_w),
+            ),
+            slow_w: skip_same_f32(
+                apu_prof.slow_w,
+                live_telem.as_ref().and_then(|t| t.slow_limit_w),
+            ),
+            slow_time_s: apu_prof.slow_time_s,
+            apu_slow_w: skip_same_f32(
+                apu_prof.apu_slow_w,
+                live_telem.as_ref().and_then(|t| t.apu_slow_limit_w),
+            ),
+            tdc_soc_a: skip_same_f32(
+                apu_prof.tdc_soc_a,
+                live_telem.as_ref().and_then(|t| t.tdc_soc_limit_a),
+            ),
+            edc_soc_a: skip_same_f32(
+                apu_prof.edc_soc_a,
+                live_telem.as_ref().and_then(|t| t.edc_soc_limit_a),
+            ),
+            apu_skin_temp_c: skip_same_f32(
+                apu_prof.apu_skin_temp_c,
+                live_telem.as_ref().and_then(|t| t.apu_skin_temp_limit_c),
+            ),
+            dgpu_skin_temp_c: skip_same_f32(
+                apu_prof.dgpu_skin_temp_c,
+                live_telem.as_ref().and_then(|t| t.dgpu_skin_temp_limit_c),
+            ),
             power_mode: apu_prof.power_mode,
         };
-        ops.extend(apu::set_apu(transport, hw, &req, allow_extreme, dry_run)?);
+        if !req.is_empty() {
+            ops.extend(apu::set_apu(transport, hw, &req, allow_extreme, dry_run)?);
+        }
     }
 
     Ok(ops)

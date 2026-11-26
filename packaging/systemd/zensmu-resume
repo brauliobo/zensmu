@@ -22,7 +22,7 @@ ZENSMU_BIN="/usr/bin/zensmu"
 case "${1:-}/${2:-}" in
     post/*)
         if [[ -x "${ZENSMU_BIN}" && -f "${PROFILE}" && -r "${SYSFS_CODENAME}" ]]; then
-            exec "${ZENSMU_BIN}" profile apply "${PROFILE}" --yes --boot-guard --settle-secs 5
+            exec "${ZENSMU_BIN}" profile apply "${PROFILE}" --yes --allow-extreme --boot-guard --settle-secs 5
         fi
         ;;
 esac

@@ -87,17 +87,25 @@ pub struct PboProfile {
     pub fmax_mhz: Option<u32>,
 }
 
-/// APU-specific DPTC power and skin-temperature section.
+/// APU-specific DPTC power, current, time-constant, and skin-temperature section.
 #[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq, Eq)]
 pub struct ApuProfile {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub stapm_w: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stapm_time_s: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub fast_w: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub slow_w: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub slow_time_s: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub apu_slow_w: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tdc_soc_a: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub edc_soc_a: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub apu_skin_temp_c: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -384,6 +392,102 @@ impl Profile {
                 }
                 validate_apu_watts("apu.apu_slow_w", w, allow_extreme)?;
             }
+            if let Some(s) = apu.stapm_time_s {
+                if caps.set_stapm_time.is_none() {
+                    return Err(Error::UnsupportedCapability {
+                        capability: "apu_stapm_time",
+                        codename: codename.to_string(),
+                    });
+                }
+                if !(crate::ops::apu::APU_TIME_MIN_S..=crate::ops::apu::APU_TIME_MAX_S).contains(&s)
+                {
+                    return Err(Error::OutOfBounds {
+                        field: "apu.stapm_time_s".into(),
+                        value: s.to_string(),
+                        bounds: format!(
+                            "{}..={}",
+                            crate::ops::apu::APU_TIME_MIN_S,
+                            crate::ops::apu::APU_TIME_MAX_S
+                        ),
+                    });
+                }
+            }
+            if let Some(s) = apu.slow_time_s {
+                if caps.set_slow_time.is_none() {
+                    return Err(Error::UnsupportedCapability {
+                        capability: "apu_slow_time",
+                        codename: codename.to_string(),
+                    });
+                }
+                if !(crate::ops::apu::APU_TIME_MIN_S..=crate::ops::apu::APU_TIME_MAX_S).contains(&s)
+                {
+                    return Err(Error::OutOfBounds {
+                        field: "apu.slow_time_s".into(),
+                        value: s.to_string(),
+                        bounds: format!(
+                            "{}..={}",
+                            crate::ops::apu::APU_TIME_MIN_S,
+                            crate::ops::apu::APU_TIME_MAX_S
+                        ),
+                    });
+                }
+            }
+            if let Some(a) = apu.tdc_soc_a {
+                if caps.set_tdc_soc.is_none() {
+                    return Err(Error::UnsupportedCapability {
+                        capability: "apu_tdc_soc",
+                        codename: codename.to_string(),
+                    });
+                }
+                if !(crate::ops::apu::APU_SOC_TDC_MIN_A..=crate::ops::apu::APU_SOC_TDC_MAX_A)
+                    .contains(&a)
+                {
+                    return Err(Error::OutOfBounds {
+                        field: "apu.tdc_soc_a".into(),
+                        value: a.to_string(),
+                        bounds: format!(
+                            "{}..={}",
+                            crate::ops::apu::APU_SOC_TDC_MIN_A,
+                            crate::ops::apu::APU_SOC_TDC_MAX_A
+                        ),
+                    });
+                }
+                if a > crate::ops::apu::APU_SOC_TDC_SOFT_MAX_A && !allow_extreme {
+                    return Err(Error::ExtremeValueBlocked {
+                        field: "apu.tdc_soc_a".into(),
+                        value: format!("{a}A"),
+                        threshold: format!("<= {}A", crate::ops::apu::APU_SOC_TDC_SOFT_MAX_A),
+                    });
+                }
+            }
+            if let Some(a) = apu.edc_soc_a {
+                if caps.set_edc_soc.is_none() {
+                    return Err(Error::UnsupportedCapability {
+                        capability: "apu_edc_soc",
+                        codename: codename.to_string(),
+                    });
+                }
+                if !(crate::ops::apu::APU_SOC_EDC_MIN_A..=crate::ops::apu::APU_SOC_EDC_MAX_A)
+                    .contains(&a)
+                {
+                    return Err(Error::OutOfBounds {
+                        field: "apu.edc_soc_a".into(),
+                        value: a.to_string(),
+                        bounds: format!(
+                            "{}..={}",
+                            crate::ops::apu::APU_SOC_EDC_MIN_A,
+                            crate::ops::apu::APU_SOC_EDC_MAX_A
+                        ),
+                    });
+                }
+                if a > crate::ops::apu::APU_SOC_EDC_SOFT_MAX_A && !allow_extreme {
+                    return Err(Error::ExtremeValueBlocked {
+                        field: "apu.edc_soc_a".into(),
+                        value: format!("{a}A"),
+                        threshold: format!("<= {}A", crate::ops::apu::APU_SOC_EDC_SOFT_MAX_A),
+                    });
+                }
+            }
             if let Some(c) = apu.apu_skin_temp_c {
                 if caps.set_apu_skin_temp.is_none() {
                     return Err(Error::UnsupportedCapability {
@@ -416,10 +520,48 @@ impl Profile {
     }
 
     /// Construct a declarative profile from a captured hardware [`SmuStateSnapshot`].
+    ///
+    /// Only fields that are actually writable on `snap.codename` (according to
+    /// [`capabilities_for`]) are included, so read-only telemetry/queries such as
+    /// `fmax_mhz` on Zen 2/3 or Lucienne never fail validation or apply.
     pub fn from_snapshot(snap: &SmuStateSnapshot) -> Self {
-        let curve_optimizer = if snap.co_per_core.is_some() || snap.igpu_co.is_some() {
+        let caps = capabilities_for(snap.codename);
+        let can_set_co = caps
+            .as_ref()
+            .map(|c| c.set_co_per_core.is_some())
+            .unwrap_or(true);
+        let can_set_igpu = caps
+            .as_ref()
+            .map(|c| c.set_igpu_co.is_some())
+            .unwrap_or(true);
+        let can_set_shaper = caps
+            .as_ref()
+            .map(|c| c.set_curve_shaper.is_some())
+            .unwrap_or(true);
+        let can_set_ppt = caps.as_ref().map(|c| c.set_ppt.is_some()).unwrap_or(true);
+        let can_set_tdc = caps.as_ref().map(|c| c.set_tdc.is_some()).unwrap_or(true);
+        let can_set_edc = caps.as_ref().map(|c| c.set_edc.is_some()).unwrap_or(true);
+        let can_set_tctl = caps.as_ref().map(|c| c.set_tctl.is_some()).unwrap_or(true);
+        let can_set_scalar = caps
+            .as_ref()
+            .map(|c| c.set_pbo_scalar.is_some())
+            .unwrap_or(true);
+        let can_set_fmax = caps.as_ref().map(|c| c.set_fmax.is_some()).unwrap_or(true);
+
+        let co_cores = if can_set_co {
+            snap.co_per_core.as_ref()
+        } else {
+            None
+        };
+        let igpu = if can_set_igpu {
+            snap.igpu_co.map(i32::from)
+        } else {
+            None
+        };
+
+        let curve_optimizer = if co_cores.is_some() || igpu.is_some() {
             let mut per_core = BTreeMap::new();
-            if let Some(cores) = &snap.co_per_core {
+            if let Some(cores) = co_cores {
                 for &(core, margin) in cores {
                     per_core.insert(core, i32::from(margin));
                 }
@@ -427,50 +569,150 @@ impl Profile {
             Some(CoProfile {
                 all: None,
                 per_core,
-                igpu: snap.igpu_co.map(i32::from),
+                igpu,
             })
         } else {
             None
         };
 
-        let curve_shaper = snap.curve_shaper.map(|cs| {
-            let mut map = BTreeMap::new();
-            for tier in FreqTier::ALL {
-                let m = cs.tier(tier);
-                map.insert(
-                    tier,
-                    ShaperTierProfile {
-                        low: Some(m.low),
-                        med: Some(m.med),
-                        high: Some(m.high),
-                    },
-                );
-            }
-            map
-        });
+        let curve_shaper = if can_set_shaper {
+            snap.curve_shaper.map(|cs| {
+                let mut map = BTreeMap::new();
+                for tier in FreqTier::ALL {
+                    let m = cs.tier(tier);
+                    map.insert(
+                        tier,
+                        ShaperTierProfile {
+                            low: Some(m.low),
+                            med: Some(m.med),
+                            high: Some(m.high),
+                        },
+                    );
+                }
+                map
+            })
+        } else {
+            None
+        };
 
-        let scalar = snap.pbo_scalar.and_then(|s| {
-            if s.is_finite() && s >= 1.0 {
-                Some(s.round() as u32)
+        let ppt_w = if can_set_ppt { snap.ppt_w } else { None };
+        let tdc_a = if can_set_tdc { snap.tdc_a } else { None };
+        let edc_a = if can_set_edc { snap.edc_a } else { None };
+        let tctl_c = if can_set_tctl { snap.tctl_c } else { None };
+        let scalar = if can_set_scalar {
+            snap.pbo_scalar.and_then(|s| {
+                if s.is_finite() && s >= 1.0 {
+                    Some(s.round() as u32)
+                } else {
+                    None
+                }
+            })
+        } else {
+            None
+        };
+        let fmax_mhz = if can_set_fmax { snap.fmax_mhz } else { None };
+
+        let pbo = if ppt_w.is_some()
+            || tdc_a.is_some()
+            || edc_a.is_some()
+            || tctl_c.is_some()
+            || scalar.is_some()
+            || fmax_mhz.is_some()
+        {
+            Some(PboProfile {
+                ppt_w,
+                tdc_a,
+                edc_a,
+                tctl_c,
+                scalar,
+                fmax_mhz,
+            })
+        } else {
+            None
+        };
+
+        let can_set_stapm = caps
+            .as_ref()
+            .map(|c| c.set_stapm_limit.is_some())
+            .unwrap_or(false);
+        let can_set_slow = caps
+            .as_ref()
+            .map(|c| c.set_slow_limit.is_some())
+            .unwrap_or(false);
+        let can_set_apu_slow = caps
+            .as_ref()
+            .map(|c| c.set_apu_slow_limit.is_some())
+            .unwrap_or(false);
+        let can_set_tdc_soc = caps
+            .as_ref()
+            .map(|c| c.set_tdc_soc.is_some())
+            .unwrap_or(false);
+        let can_set_edc_soc = caps
+            .as_ref()
+            .map(|c| c.set_edc_soc.is_some())
+            .unwrap_or(false);
+        let can_set_apu_skin = caps
+            .as_ref()
+            .map(|c| c.set_apu_skin_temp.is_some())
+            .unwrap_or(false);
+        let can_set_dgpu_skin = caps
+            .as_ref()
+            .map(|c| c.set_dgpu_skin_temp.is_some())
+            .unwrap_or(false);
+
+        let apu = if snap.codename.is_apu() {
+            let stapm_w = if can_set_stapm { snap.stapm_w } else { None };
+            let slow_w = if can_set_slow { snap.slow_w } else { None };
+            let apu_slow_w = if can_set_apu_slow {
+                snap.apu_slow_w
+            } else {
+                None
+            };
+            let tdc_soc_a = if can_set_tdc_soc {
+                snap.tdc_soc_a
+            } else {
+                None
+            };
+            let edc_soc_a = if can_set_edc_soc {
+                snap.edc_soc_a
+            } else {
+                None
+            };
+            let apu_skin_temp_c = if can_set_apu_skin {
+                snap.apu_skin_temp_c
+            } else {
+                None
+            };
+            let dgpu_skin_temp_c = if can_set_dgpu_skin {
+                snap.dgpu_skin_temp_c
+            } else {
+                None
+            };
+
+            if stapm_w.is_some()
+                || slow_w.is_some()
+                || apu_slow_w.is_some()
+                || tdc_soc_a.is_some()
+                || edc_soc_a.is_some()
+                || apu_skin_temp_c.is_some()
+                || dgpu_skin_temp_c.is_some()
+            {
+                Some(ApuProfile {
+                    stapm_w,
+                    stapm_time_s: None,
+                    fast_w: None, // already represented by pbo.ppt_w
+                    slow_w,
+                    slow_time_s: None,
+                    apu_slow_w,
+                    tdc_soc_a,
+                    edc_soc_a,
+                    apu_skin_temp_c,
+                    dgpu_skin_temp_c,
+                    power_mode: None,
+                })
             } else {
                 None
             }
-        });
-        let pbo = if snap.ppt_w.is_some()
-            || snap.tdc_a.is_some()
-            || snap.edc_a.is_some()
-            || snap.tctl_c.is_some()
-            || scalar.is_some()
-            || snap.fmax_mhz.is_some()
-        {
-            Some(PboProfile {
-                ppt_w: snap.ppt_w,
-                tdc_a: snap.tdc_a,
-                edc_a: snap.edc_a,
-                tctl_c: snap.tctl_c,
-                scalar,
-                fmax_mhz: snap.fmax_mhz,
-            })
         } else {
             None
         };
@@ -484,7 +726,7 @@ impl Profile {
             curve_optimizer,
             curve_shaper,
             pbo,
-            apu: None,
+            apu,
         }
     }
 
@@ -661,46 +903,90 @@ impl Profile {
 
         if let Some(apu) = &self.apu {
             if let Some(w) = apu.stapm_w {
+                if current.stapm_w != Some(w) {
+                    diffs.push(ProfileDiffEntry {
+                        field: "apu.stapm_w".into(),
+                        current: fmt_opt_unit(current.stapm_w, "W"),
+                        desired: format!("{w}W"),
+                    });
+                }
+            }
+            if let Some(s) = apu.stapm_time_s {
                 diffs.push(ProfileDiffEntry {
-                    field: "apu.stapm_w".into(),
+                    field: "apu.stapm_time_s".into(),
                     current: "unknown".into(),
-                    desired: format!("{w}W"),
+                    desired: format!("{s}s"),
                 });
             }
             if let Some(w) = apu.fast_w {
-                diffs.push(ProfileDiffEntry {
-                    field: "apu.fast_w".into(),
-                    current: "unknown".into(),
-                    desired: format!("{w}W"),
-                });
+                if current.ppt_w != Some(w) {
+                    diffs.push(ProfileDiffEntry {
+                        field: "apu.fast_w".into(),
+                        current: fmt_opt_unit(current.ppt_w, "W"),
+                        desired: format!("{w}W"),
+                    });
+                }
             }
             if let Some(w) = apu.slow_w {
+                if current.slow_w != Some(w) {
+                    diffs.push(ProfileDiffEntry {
+                        field: "apu.slow_w".into(),
+                        current: fmt_opt_unit(current.slow_w, "W"),
+                        desired: format!("{w}W"),
+                    });
+                }
+            }
+            if let Some(s) = apu.slow_time_s {
                 diffs.push(ProfileDiffEntry {
-                    field: "apu.slow_w".into(),
+                    field: "apu.slow_time_s".into(),
                     current: "unknown".into(),
-                    desired: format!("{w}W"),
+                    desired: format!("{s}s"),
                 });
             }
             if let Some(w) = apu.apu_slow_w {
-                diffs.push(ProfileDiffEntry {
-                    field: "apu.apu_slow_w".into(),
-                    current: "unknown".into(),
-                    desired: format!("{w}W"),
-                });
+                if current.apu_slow_w != Some(w) {
+                    diffs.push(ProfileDiffEntry {
+                        field: "apu.apu_slow_w".into(),
+                        current: fmt_opt_unit(current.apu_slow_w, "W"),
+                        desired: format!("{w}W"),
+                    });
+                }
+            }
+            if let Some(a) = apu.tdc_soc_a {
+                if current.tdc_soc_a != Some(a) {
+                    diffs.push(ProfileDiffEntry {
+                        field: "apu.tdc_soc_a".into(),
+                        current: fmt_opt_unit(current.tdc_soc_a, "A"),
+                        desired: format!("{a}A"),
+                    });
+                }
+            }
+            if let Some(a) = apu.edc_soc_a {
+                if current.edc_soc_a != Some(a) {
+                    diffs.push(ProfileDiffEntry {
+                        field: "apu.edc_soc_a".into(),
+                        current: fmt_opt_unit(current.edc_soc_a, "A"),
+                        desired: format!("{a}A"),
+                    });
+                }
             }
             if let Some(c) = apu.apu_skin_temp_c {
-                diffs.push(ProfileDiffEntry {
-                    field: "apu.apu_skin_temp_c".into(),
-                    current: "unknown".into(),
-                    desired: format!("{c}°C"),
-                });
+                if current.apu_skin_temp_c != Some(c) {
+                    diffs.push(ProfileDiffEntry {
+                        field: "apu.apu_skin_temp_c".into(),
+                        current: fmt_opt_unit(current.apu_skin_temp_c, "°C"),
+                        desired: format!("{c}°C"),
+                    });
+                }
             }
             if let Some(c) = apu.dgpu_skin_temp_c {
-                diffs.push(ProfileDiffEntry {
-                    field: "apu.dgpu_skin_temp_c".into(),
-                    current: "unknown".into(),
-                    desired: format!("{c}°C"),
-                });
+                if current.dgpu_skin_temp_c != Some(c) {
+                    diffs.push(ProfileDiffEntry {
+                        field: "apu.dgpu_skin_temp_c".into(),
+                        current: fmt_opt_unit(current.dgpu_skin_temp_c, "°C"),
+                        desired: format!("{c}°C"),
+                    });
+                }
             }
             if let Some(mode) = apu.power_mode {
                 let label = match mode {
@@ -1055,9 +1341,13 @@ fmax_mhz = 5550
             pbo: None,
             apu: Some(ApuProfile {
                 stapm_w: Some(35),
+                stapm_time_s: Some(120),
                 fast_w: Some(54),
                 slow_w: Some(45),
+                slow_time_s: Some(10),
                 apu_slow_w: Some(35),
+                tdc_soc_a: Some(20),
+                edc_soc_a: Some(35),
                 apu_skin_temp_c: Some(80),
                 dgpu_skin_temp_c: Some(75),
                 power_mode: Some(ApuPowerMode::MaxPerformance),
@@ -1072,5 +1362,63 @@ fmax_mhz = 5550
             desktop_apu.validate_for(Codename::GraniteRidge, 8, false),
             Err(Error::UnsupportedCapability { .. })
         ));
+    }
+
+    #[test]
+    fn from_snapshot_on_lucienne_filters_unwritable_fmax_and_captures_all_apu_limits() {
+        let mut snap = SmuStateSnapshot::new(Codename::Lucienne, 8);
+        snap.pbo_scalar = Some(1.0);
+        snap.fmax_mhz = Some(4350); // readable via get_fmax on Lucienne, NOT writable!
+        snap.ppt_w = Some(30);
+        snap.tdc_a = Some(33);
+        snap.edc_a = Some(70);
+        snap.tctl_c = Some(80);
+        snap.stapm_w = Some(20);
+        snap.slow_w = Some(25);
+        snap.apu_slow_w = Some(25);
+        snap.tdc_soc_a = Some(13);
+        snap.edc_soc_a = Some(17);
+        snap.apu_skin_temp_c = Some(80);
+        snap.dgpu_skin_temp_c = Some(80);
+
+        let profile = Profile::from_snapshot(&snap);
+        let pbo = profile.pbo.as_ref().expect("pbo section populated");
+        assert_eq!(pbo.fmax_mhz, None, "read-only fmax must not be emitted");
+        assert_eq!(pbo.ppt_w, Some(30));
+        assert_eq!(pbo.tdc_a, Some(33));
+        assert_eq!(pbo.edc_a, Some(70));
+        assert_eq!(pbo.tctl_c, Some(80));
+        assert_eq!(pbo.scalar, Some(1));
+
+        let apu = profile.apu.as_ref().expect("apu section populated");
+        assert_eq!(apu.stapm_w, Some(20));
+        assert_eq!(apu.slow_w, Some(25));
+        assert_eq!(apu.apu_slow_w, Some(25));
+        assert_eq!(apu.tdc_soc_a, Some(13));
+        assert_eq!(apu.edc_soc_a, Some(17));
+        assert_eq!(apu.apu_skin_temp_c, Some(80));
+        assert_eq!(apu.dgpu_skin_temp_c, Some(80));
+
+        // Validates cleanly with allow_extreme=true (as persist/boot service does) and diffs empty
+        assert!(profile.validate_for(Codename::Lucienne, 8, true).is_ok());
+        assert!(profile.diff_against(&snap).is_empty());
+    }
+
+    #[test]
+    fn from_snapshot_on_vermeer_filters_unwritable_fmax() {
+        let mut snap = SmuStateSnapshot::new(Codename::Vermeer, 16);
+        snap.co_per_core = Some((0..16).map(|i| (i, -10)).collect());
+        snap.pbo_scalar = Some(1.0);
+        snap.fmax_mhz = Some(5150); // read-only on Vermeer
+        snap.ppt_w = Some(1000);
+        snap.tdc_a = Some(140);
+        snap.edc_a = Some(220);
+        snap.tctl_c = Some(75);
+
+        let profile = Profile::from_snapshot(&snap);
+        assert_eq!(profile.pbo.as_ref().unwrap().fmax_mhz, None);
+        assert!(profile.apu.is_none());
+        assert!(profile.validate_for(Codename::Vermeer, 16, true).is_ok());
+        assert!(profile.diff_against(&snap).is_empty());
     }
 }

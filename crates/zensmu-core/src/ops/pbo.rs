@@ -13,19 +13,19 @@ use serde::{Deserialize, Serialize};
 // Safe hard and soft limits for desktop PBO tuning.
 // Hard ceilings accommodate BIOS "Motherboard/Unlimited" PBO profiles (e.g. PPT=1000W)
 // so snapshots and rollbacks never fail, while conservative soft ceilings still require `--allow-extreme`.
-pub const PPT_MIN_W: u32 = 15;
+pub const PPT_MIN_W: u32 = 10;
 pub const PPT_MAX_W: u32 = 1000;
 pub const PPT_SOFT_MAX_W: u32 = 230;
 
-pub const TDC_MIN_A: u32 = 15;
+pub const TDC_MIN_A: u32 = 10;
 pub const TDC_MAX_A: u32 = 500;
 pub const TDC_SOFT_MAX_A: u32 = 180;
 
-pub const EDC_MIN_A: u32 = 20;
+pub const EDC_MIN_A: u32 = 10;
 pub const EDC_MAX_A: u32 = 500;
 pub const EDC_SOFT_MAX_A: u32 = 240;
 
-pub const TCTL_MIN_C: u32 = 50;
+pub const TCTL_MIN_C: u32 = 40;
 pub const TCTL_MAX_C: u32 = 95;
 
 pub const SCALAR_MIN: u32 = 1;

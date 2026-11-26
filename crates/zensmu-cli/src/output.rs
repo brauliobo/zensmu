@@ -521,51 +521,143 @@ pub fn print_pbo_status(out: &PboGetOutput) {
     }
 }
 
-pub fn print_telemetry(t: &TelemetrySnapshot) {
-    println!(
+pub fn format_telemetry(t: &TelemetrySnapshot) -> String {
+    use std::fmt::Write as _;
+
+    let mut out = String::new();
+    let _ = writeln!(
+        out,
         "Telemetry — {} (PM Table 0x{:08X}, {} bytes)",
         t.codename.display_name(),
         t.table_version,
         t.table_size
     );
-    println!("============================================================");
-    println!("Power & Thermals:");
-    println!(
-        "  PPT   : {}",
+    let _ = writeln!(out, "============================================================");
+    let _ = writeln!(out, "Power & Thermals:");
+
+    let has_apu_fields = t.stapm_value_w.is_some()
+        || t.stapm_limit_w.is_some()
+        || t.slow_value_w.is_some()
+        || t.slow_limit_w.is_some()
+        || t.apu_slow_value_w.is_some()
+        || t.apu_slow_limit_w.is_some()
+        || t.tdc_soc_value_a.is_some()
+        || t.tdc_soc_limit_a.is_some()
+        || t.edc_soc_value_a.is_some()
+        || t.edc_soc_limit_a.is_some()
+        || t.apu_skin_temp_value_c.is_some()
+        || t.apu_skin_temp_limit_c.is_some()
+        || t.dgpu_skin_temp_value_c.is_some()
+        || t.dgpu_skin_temp_limit_c.is_some();
+
+    let w = if has_apu_fields { 9 } else { 5 };
+    if t.stapm_value_w.is_some() || t.stapm_limit_w.is_some() {
+        let _ = writeln!(
+            out,
+            "  {:<w$} : {}",
+            "STAPM",
+            fmt_ratio(t.stapm_value_w, t.stapm_limit_w, "W")
+        );
+    }
+    let _ = writeln!(
+        out,
+        "  {:<w$} : {}",
+        "PPT",
         fmt_ratio(t.ppt_value_w, t.ppt_limit_w, "W")
     );
-    println!(
-        "  TDC   : {}",
+    if t.slow_value_w.is_some() || t.slow_limit_w.is_some() {
+        let _ = writeln!(
+            out,
+            "  {:<w$} : {}",
+            "Slow PPT",
+            fmt_ratio(t.slow_value_w, t.slow_limit_w, "W")
+        );
+    }
+    if t.apu_slow_value_w.is_some() || t.apu_slow_limit_w.is_some() {
+        let _ = writeln!(
+            out,
+            "  {:<w$} : {}",
+            "APU Slow",
+            fmt_ratio(t.apu_slow_value_w, t.apu_slow_limit_w, "W")
+        );
+    }
+    let _ = writeln!(
+        out,
+        "  {:<w$} : {}",
+        "TDC",
         fmt_ratio(t.tdc_value_a, t.tdc_limit_a, "A")
     );
-    println!(
-        "  EDC   : {}",
+    if t.tdc_soc_value_a.is_some() || t.tdc_soc_limit_a.is_some() {
+        let _ = writeln!(
+            out,
+            "  {:<w$} : {}",
+            "SoC TDC",
+            fmt_ratio(t.tdc_soc_value_a, t.tdc_soc_limit_a, "A")
+        );
+    }
+    let _ = writeln!(
+        out,
+        "  {:<w$} : {}",
+        "EDC",
         fmt_ratio(t.edc_value_a, t.edc_limit_a, "A")
     );
-    println!(
-        "  Tctl  : {}",
+    if t.edc_soc_value_a.is_some() || t.edc_soc_limit_a.is_some() {
+        let _ = writeln!(
+            out,
+            "  {:<w$} : {}",
+            "SoC EDC",
+            fmt_ratio(t.edc_soc_value_a, t.edc_soc_limit_a, "A")
+        );
+    }
+    let _ = writeln!(
+        out,
+        "  {:<w$} : {}",
+        "Tctl",
         fmt_ratio(t.tctl_value_c, t.tctl_limit_c, "°C")
     );
+    if t.apu_skin_temp_value_c.is_some() || t.apu_skin_temp_limit_c.is_some() {
+        let _ = writeln!(
+            out,
+            "  {:<w$} : {}",
+            "APU Skin",
+            fmt_ratio(t.apu_skin_temp_value_c, t.apu_skin_temp_limit_c, "°C")
+        );
+    }
+    if t.dgpu_skin_temp_value_c.is_some() || t.dgpu_skin_temp_limit_c.is_some() {
+        let _ = writeln!(
+            out,
+            "  {:<w$} : {}",
+            "dGPU Skin",
+            fmt_ratio(t.dgpu_skin_temp_value_c, t.dgpu_skin_temp_limit_c, "°C")
+        );
+    }
 
-    println!();
-    println!("Fabric & Memory Clocks:");
-    println!("  FCLK  : {}", fmt_opt_f32(t.fclk_mhz, 1, "MHz"));
-    println!("  UCLK  : {}", fmt_opt_f32(t.uclk_mhz, 1, "MHz"));
-    println!("  MCLK  : {}", fmt_opt_f32(t.mclk_mhz, 1, "MHz"));
+    let _ = writeln!(out);
+    let _ = writeln!(out, "Fabric & Memory Clocks:");
+    let _ = writeln!(out, "  FCLK  : {}", fmt_opt_f32(t.fclk_mhz, 1, "MHz"));
+    let _ = writeln!(out, "  UCLK  : {}", fmt_opt_f32(t.uclk_mhz, 1, "MHz"));
+    let _ = writeln!(out, "  MCLK  : {}", fmt_opt_f32(t.mclk_mhz, 1, "MHz"));
 
-    println!();
-    println!("Voltages:");
-    println!("  VDDCR_SOC     : {}", fmt_opt_f32(t.vddcr_soc_v, 4, "V"));
-    println!("  VDDCR_MISC    : {}", fmt_opt_f32(t.vddcr_misc_v, 4, "V"));
-    println!("  CLDO_VDDP     : {}", fmt_opt_f32(t.cldo_vddp_v, 4, "V"));
-    println!(
+    let _ = writeln!(out);
+    let _ = writeln!(out, "Voltages:");
+    let _ = writeln!(out, "  VDDCR_SOC     : {}", fmt_opt_f32(t.vddcr_soc_v, 4, "V"));
+    let _ = writeln!(out, "  VDDCR_MISC    : {}", fmt_opt_f32(t.vddcr_misc_v, 4, "V"));
+    let _ = writeln!(out, "  CLDO_VDDP     : {}", fmt_opt_f32(t.cldo_vddp_v, 4, "V"));
+    let _ = writeln!(
+        out,
         "  CLDO_VDDG_IOD : {}",
         fmt_opt_f32(t.cldo_vddg_iod_v, 4, "V")
     );
-    println!(
+    let _ = writeln!(
+        out,
         "  CLDO_VDDG_CCD : {}",
         fmt_opt_f32(t.cldo_vddg_ccd_v, 4, "V")
     );
+    out
+}
+
+pub fn print_telemetry(t: &TelemetrySnapshot) {
+    print!("{}", format_telemetry(t));
 }
 
 pub fn print_status(status: &StatusOutput) {
@@ -824,5 +916,122 @@ fn fmt_ratio(val: Option<f32>, limit: Option<f32>, unit: &str) -> String {
         (Some(v), None) => format!("{v:>6.1} {unit}"),
         (None, Some(l)) => format!("   n/a / {l:<6.1} {unit}"),
         (None, None) => "n/a".into(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn desktop_snapshot() -> TelemetrySnapshot {
+        TelemetrySnapshot {
+            codename: Codename::GraniteRidge,
+            table_version: 0x0062_0105,
+            table_size: 0x724,
+            ppt_limit_w: Some(88.0),
+            ppt_value_w: Some(42.5),
+            tdc_limit_a: Some(75.0),
+            tdc_value_a: Some(21.0),
+            edc_limit_a: Some(150.0),
+            edc_value_a: Some(38.0),
+            tctl_limit_c: Some(95.0),
+            tctl_value_c: Some(54.2),
+            stapm_limit_w: None,
+            stapm_value_w: None,
+            slow_limit_w: None,
+            slow_value_w: None,
+            apu_slow_limit_w: None,
+            apu_slow_value_w: None,
+            tdc_soc_limit_a: None,
+            tdc_soc_value_a: None,
+            edc_soc_limit_a: None,
+            edc_soc_value_a: None,
+            apu_skin_temp_limit_c: None,
+            apu_skin_temp_value_c: None,
+            dgpu_skin_temp_limit_c: None,
+            dgpu_skin_temp_value_c: None,
+            fclk_mhz: Some(2000.0),
+            uclk_mhz: Some(3000.0),
+            mclk_mhz: Some(3000.0),
+            vddcr_soc_v: Some(1.24),
+            vddcr_misc_v: Some(1.10),
+            cldo_vddp_v: Some(1.05),
+            cldo_vddg_iod_v: Some(0.95),
+            cldo_vddg_ccd_v: Some(0.95),
+        }
+    }
+
+    #[test]
+    fn telemetry_format_keeps_desktop_uncluttered() {
+        let out = format_telemetry(&desktop_snapshot());
+        assert!(out.contains("  PPT   :"));
+        assert!(out.contains("  TDC   :"));
+        assert!(out.contains("  EDC   :"));
+        assert!(out.contains("  Tctl  :"));
+        for apu_label in [
+            "STAPM",
+            "Slow PPT",
+            "APU Slow",
+            "SoC TDC",
+            "SoC EDC",
+            "APU Skin",
+            "dGPU Skin",
+        ] {
+            assert!(
+                !out.contains(apu_label),
+                "desktop output should not contain {apu_label}:\n{out}"
+            );
+        }
+    }
+
+    #[test]
+    fn telemetry_format_renders_all_apu_fields_when_present() {
+        let mut snap = desktop_snapshot();
+        snap.codename = Codename::Lucienne;
+        snap.table_version = 0x0037_0005;
+        snap.table_size = 0x8C8;
+        snap.stapm_limit_w = Some(25.0);
+        snap.stapm_value_w = Some(15.0);
+        snap.ppt_limit_w = Some(30.0);
+        snap.ppt_value_w = Some(18.0);
+        snap.slow_limit_w = Some(25.0);
+        snap.slow_value_w = Some(16.0);
+        snap.apu_slow_limit_w = Some(20.0);
+        snap.apu_slow_value_w = Some(12.0);
+        snap.tdc_soc_limit_a = Some(20.0);
+        snap.tdc_soc_value_a = Some(8.5);
+        snap.edc_soc_limit_a = Some(35.0);
+        snap.edc_soc_value_a = Some(14.0);
+        snap.apu_skin_temp_limit_c = Some(45.0);
+        snap.apu_skin_temp_value_c = Some(39.0);
+        snap.dgpu_skin_temp_limit_c = Some(55.0);
+        snap.dgpu_skin_temp_value_c = Some(42.0);
+
+        let out = format_telemetry(&snap);
+        for expected in [
+            "STAPM",
+            "PPT",
+            "Slow PPT",
+            "APU Slow",
+            "TDC",
+            "SoC TDC",
+            "EDC",
+            "SoC EDC",
+            "Tctl",
+            "APU Skin",
+            "dGPU Skin",
+            "15.0 / 25.0   W",
+            "16.0 / 25.0   W",
+            "12.0 / 20.0   W",
+            "8.5 / 20.0   A",
+            "14.0 / 35.0   A",
+            "39.0 / 45.0   °C",
+            "42.0 / 55.0   °C",
+        ] {
+            assert!(
+                out.contains(expected),
+                "APU output missing {expected:?}:\n{out}"
+            );
+        }
     }
 }

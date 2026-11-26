@@ -13,6 +13,13 @@ use std::thread;
 use std::time::{Duration, Instant};
 use zensmu_core::config::profile::{Profile, ProfileDiffEntry, PROFILE_SCHEMA_VERSION};
 use zensmu_core::hw::identity::{detect_hardware, HardwareContext};
+use zensmu_core::hw::profiles::CpuCapabilities;
+use zensmu_core::ops::apu::{
+    ApuSetRequest, APU_FAST_POWER_SOFT_MAX_W, APU_POWER_MAX_W, APU_POWER_MIN_W,
+    APU_POWER_SOFT_MAX_W, APU_SKIN_TEMP_MAX_C, APU_SKIN_TEMP_MIN_C, APU_SKIN_TEMP_SOFT_MAX_C,
+    APU_SOC_EDC_MAX_A, APU_SOC_EDC_MIN_A, APU_SOC_EDC_SOFT_MAX_A, APU_SOC_TDC_MAX_A,
+    APU_SOC_TDC_MIN_A, APU_SOC_TDC_SOFT_MAX_A,
+};
 use zensmu_core::ops::co::CoSnapshot;
 use zensmu_core::ops::pbo::{PboSetRequest, PboStatus, TCTL_MAX_C};
 use zensmu_core::ops::pm_table::{self, TelemetrySnapshot};
@@ -20,7 +27,7 @@ use zensmu_core::safety::guard::{BootLoopGuard, SentinelInfo};
 use zensmu_core::safety::persist::{read_persist_status, PersistPaths, PersistStatus};
 use zensmu_core::safety::snapshot::{SmuStateSnapshot, SnapshotStore};
 use zensmu_core::transport::sysfs::SysfsTransport;
-use zensmu_core::types::{CurveShaperState, PlannedOp};
+use zensmu_core::types::{ApuPowerMode, CurveShaperState, PlannedOp};
 
 /// Ring buffer depth for live Dashboard plots (180 samples = 90s at 500ms).
 pub const TELEMETRY_RING_CAPACITY: usize = 180;
@@ -167,24 +174,288 @@ impl Default for PboEditorState {
 }
 
 impl PboEditorState {
-    pub fn build_request(&self) -> PboSetRequest {
+    pub fn build_request_for(&self, caps: &CpuCapabilities) -> PboSetRequest {
         PboSetRequest {
-            ppt_w: self.ppt_enabled.then_some(self.ppt_w),
-            tdc_a: self.tdc_enabled.then_some(self.tdc_a),
-            edc_a: self.edc_enabled.then_some(self.edc_a),
-            tctl_c: self.tctl_enabled.then_some(self.tctl_c.min(TCTL_MAX_C)),
-            scalar: self.scalar_enabled.then_some(self.scalar),
-            fmax_mhz: self.fmax_enabled.then_some(self.fmax_mhz),
+            ppt_w: (self.ppt_enabled && caps.set_ppt.is_some()).then_some(self.ppt_w),
+            tdc_a: (self.tdc_enabled && caps.set_tdc.is_some()).then_some(self.tdc_a),
+            edc_a: (self.edc_enabled && caps.set_edc.is_some()).then_some(self.edc_a),
+            tctl_c: (self.tctl_enabled && caps.set_tctl.is_some())
+                .then_some(self.tctl_c.min(TCTL_MAX_C)),
+            scalar: (self.scalar_enabled && caps.set_pbo_scalar.is_some()).then_some(self.scalar),
+            fmax_mhz: (self.fmax_enabled && caps.set_fmax.is_some()).then_some(self.fmax_mhz),
         }
     }
 
-    pub fn has_any_enabled(&self) -> bool {
-        self.ppt_enabled
-            || self.tdc_enabled
-            || self.edc_enabled
-            || self.tctl_enabled
-            || self.scalar_enabled
-            || self.fmax_enabled
+    pub fn has_any_enabled_for(&self, caps: &CpuCapabilities) -> bool {
+        (self.ppt_enabled && caps.set_ppt.is_some())
+            || (self.tdc_enabled && caps.set_tdc.is_some())
+            || (self.edc_enabled && caps.set_edc.is_some())
+            || (self.tctl_enabled && caps.set_tctl.is_some())
+            || (self.scalar_enabled && caps.set_pbo_scalar.is_some())
+            || (self.fmax_enabled && caps.set_fmax.is_some())
+    }
+}
+
+/// Editable mobile APU Dynamic Power and Thermal Configuration (DPTC) UI state.
+#[derive(Debug, Clone)]
+pub struct ApuEditorState {
+    pub stapm_enabled: bool,
+    pub stapm_w: u32,
+    pub stapm_dirty: bool,
+    pub live_stapm_w: Option<f32>,
+
+    pub stapm_time_enabled: bool,
+    pub stapm_time_s: u32,
+
+    pub fast_enabled: bool,
+    pub fast_w: u32,
+    pub fast_dirty: bool,
+    pub live_fast_w: Option<f32>,
+
+    pub slow_enabled: bool,
+    pub slow_w: u32,
+    pub slow_dirty: bool,
+    pub live_slow_w: Option<f32>,
+
+    pub slow_time_enabled: bool,
+    pub slow_time_s: u32,
+
+    pub apu_slow_enabled: bool,
+    pub apu_slow_w: u32,
+    pub apu_slow_dirty: bool,
+    pub live_apu_slow_w: Option<f32>,
+
+    pub tdc_soc_enabled: bool,
+    pub tdc_soc_a: u32,
+    pub tdc_soc_dirty: bool,
+    pub live_tdc_soc_a: Option<f32>,
+
+    pub edc_soc_enabled: bool,
+    pub edc_soc_a: u32,
+    pub edc_soc_dirty: bool,
+    pub live_edc_soc_a: Option<f32>,
+
+    pub apu_skin_temp_enabled: bool,
+    pub apu_skin_temp_c: u32,
+    pub apu_skin_temp_dirty: bool,
+    pub live_apu_skin_temp_c: Option<f32>,
+
+    pub dgpu_skin_temp_enabled: bool,
+    pub dgpu_skin_temp_c: u32,
+    pub dgpu_skin_temp_dirty: bool,
+    pub live_dgpu_skin_temp_c: Option<f32>,
+
+    pub power_mode: Option<ApuPowerMode>,
+    pub allow_extreme: bool,
+}
+
+impl Default for ApuEditorState {
+    fn default() -> Self {
+        Self {
+            stapm_enabled: false,
+            stapm_w: 28,
+            stapm_dirty: false,
+            live_stapm_w: None,
+
+            stapm_time_enabled: false,
+            stapm_time_s: 120,
+
+            fast_enabled: false,
+            fast_w: 45,
+            fast_dirty: false,
+            live_fast_w: None,
+
+            slow_enabled: false,
+            slow_w: 35,
+            slow_dirty: false,
+            live_slow_w: None,
+
+            slow_time_enabled: false,
+            slow_time_s: 10,
+
+            apu_slow_enabled: false,
+            apu_slow_w: 30,
+            apu_slow_dirty: false,
+            live_apu_slow_w: None,
+
+            tdc_soc_enabled: false,
+            tdc_soc_a: 30,
+            tdc_soc_dirty: false,
+            live_tdc_soc_a: None,
+
+            edc_soc_enabled: false,
+            edc_soc_a: 50,
+            edc_soc_dirty: false,
+            live_edc_soc_a: None,
+
+            apu_skin_temp_enabled: false,
+            apu_skin_temp_c: 55,
+            apu_skin_temp_dirty: false,
+            live_apu_skin_temp_c: None,
+
+            dgpu_skin_temp_enabled: false,
+            dgpu_skin_temp_c: 60,
+            dgpu_skin_temp_dirty: false,
+            live_dgpu_skin_temp_c: None,
+
+            power_mode: None,
+            allow_extreme: false,
+        }
+    }
+}
+
+impl ApuEditorState {
+    /// Sync live hardware limits from a PM table telemetry snapshot into non-dirty slider fields.
+    pub fn sync_from_telemetry(&mut self, snap: &TelemetrySnapshot) {
+        self.live_stapm_w = snap.stapm_limit_w;
+        self.live_fast_w = snap.ppt_limit_w;
+        self.live_slow_w = snap.slow_limit_w;
+        self.live_apu_slow_w = snap.apu_slow_limit_w;
+        self.live_tdc_soc_a = snap.tdc_soc_limit_a;
+        self.live_edc_soc_a = snap.edc_soc_limit_a;
+        self.live_apu_skin_temp_c = snap.apu_skin_temp_limit_c;
+        self.live_dgpu_skin_temp_c = snap.dgpu_skin_temp_limit_c;
+
+        if !self.stapm_dirty {
+            if let Some(v) = snap.stapm_limit_w.filter(|&v| v > 0.0) {
+                self.stapm_w = v
+                    .round()
+                    .clamp(APU_POWER_MIN_W as f32, APU_POWER_MAX_W as f32)
+                    as u32;
+            }
+        }
+        if !self.fast_dirty {
+            if let Some(v) = snap.ppt_limit_w.filter(|&v| v > 0.0) {
+                self.fast_w = v
+                    .round()
+                    .clamp(APU_POWER_MIN_W as f32, APU_POWER_MAX_W as f32)
+                    as u32;
+            }
+        }
+        if !self.slow_dirty {
+            if let Some(v) = snap.slow_limit_w.filter(|&v| v > 0.0) {
+                self.slow_w = v
+                    .round()
+                    .clamp(APU_POWER_MIN_W as f32, APU_POWER_MAX_W as f32)
+                    as u32;
+            }
+        }
+        if !self.apu_slow_dirty {
+            if let Some(v) = snap.apu_slow_limit_w.filter(|&v| v > 0.0) {
+                self.apu_slow_w = v
+                    .round()
+                    .clamp(APU_POWER_MIN_W as f32, APU_POWER_MAX_W as f32)
+                    as u32;
+            }
+        }
+        if !self.tdc_soc_dirty {
+            if let Some(v) = snap.tdc_soc_limit_a.filter(|&v| v > 0.0) {
+                self.tdc_soc_a = v
+                    .round()
+                    .clamp(APU_SOC_TDC_MIN_A as f32, APU_SOC_TDC_MAX_A as f32)
+                    as u32;
+            }
+        }
+        if !self.edc_soc_dirty {
+            if let Some(v) = snap.edc_soc_limit_a.filter(|&v| v > 0.0) {
+                self.edc_soc_a = v
+                    .round()
+                    .clamp(APU_SOC_EDC_MIN_A as f32, APU_SOC_EDC_MAX_A as f32)
+                    as u32;
+            }
+        }
+        if !self.apu_skin_temp_dirty {
+            if let Some(v) = snap.apu_skin_temp_limit_c.filter(|&v| v > 0.0) {
+                self.apu_skin_temp_c = v
+                    .round()
+                    .clamp(APU_SKIN_TEMP_MIN_C as f32, APU_SKIN_TEMP_MAX_C as f32)
+                    as u32;
+            }
+        }
+        if !self.dgpu_skin_temp_dirty {
+            if let Some(v) = snap.dgpu_skin_temp_limit_c.filter(|&v| v > 0.0) {
+                self.dgpu_skin_temp_c = v
+                    .round()
+                    .clamp(APU_SKIN_TEMP_MIN_C as f32, APU_SKIN_TEMP_MAX_C as f32)
+                    as u32;
+            }
+        }
+    }
+
+    /// Clear all dirty flags so subsequent telemetry samples resync slider values.
+    pub fn clear_dirty(&mut self) {
+        self.stapm_dirty = false;
+        self.fast_dirty = false;
+        self.slow_dirty = false;
+        self.apu_slow_dirty = false;
+        self.tdc_soc_dirty = false;
+        self.edc_soc_dirty = false;
+        self.apu_skin_temp_dirty = false;
+        self.dgpu_skin_temp_dirty = false;
+    }
+
+    /// Build an `ApuSetRequest` filtered to enabled fields supported by `hw`.
+    pub fn build_request_for(&self, hw: &HardwareContext) -> ApuSetRequest {
+        let caps = &hw.capabilities;
+        let power_mode = self.power_mode.filter(|mode| match mode {
+            ApuPowerMode::MaxPerformance => caps.set_max_performance.is_some(),
+            ApuPowerMode::PowerSaving => caps.set_power_saving.is_some(),
+        });
+        ApuSetRequest {
+            stapm_w: (self.stapm_enabled && caps.set_stapm_limit.is_some()).then_some(self.stapm_w),
+            stapm_time_s: (self.stapm_time_enabled && caps.set_stapm_time.is_some())
+                .then_some(self.stapm_time_s),
+            fast_w: (self.fast_enabled && hw.codename.is_apu() && caps.set_ppt.is_some())
+                .then_some(self.fast_w),
+            slow_w: (self.slow_enabled && caps.set_slow_limit.is_some()).then_some(self.slow_w),
+            slow_time_s: (self.slow_time_enabled && caps.set_slow_time.is_some())
+                .then_some(self.slow_time_s),
+            apu_slow_w: (self.apu_slow_enabled && caps.set_apu_slow_limit.is_some())
+                .then_some(self.apu_slow_w),
+            tdc_soc_a: (self.tdc_soc_enabled && caps.set_tdc_soc.is_some())
+                .then_some(self.tdc_soc_a),
+            edc_soc_a: (self.edc_soc_enabled && caps.set_edc_soc.is_some())
+                .then_some(self.edc_soc_a),
+            apu_skin_temp_c: (self.apu_skin_temp_enabled && caps.set_apu_skin_temp.is_some())
+                .then_some(self.apu_skin_temp_c),
+            dgpu_skin_temp_c: (self.dgpu_skin_temp_enabled && caps.set_dgpu_skin_temp.is_some())
+                .then_some(self.dgpu_skin_temp_c),
+            power_mode,
+        }
+    }
+
+    pub fn has_any_enabled_for(&self, hw: &HardwareContext) -> bool {
+        !self.build_request_for(hw).is_empty()
+    }
+
+    /// Returns true if any enabled APU field exceeds its conservative soft ceiling.
+    pub fn has_any_extreme_for(&self, hw: &HardwareContext) -> bool {
+        let req = self.build_request_for(hw);
+        req.stapm_w.is_some_and(|v| v > APU_POWER_SOFT_MAX_W)
+            || req.fast_w.is_some_and(|v| v > APU_FAST_POWER_SOFT_MAX_W)
+            || req.slow_w.is_some_and(|v| v > APU_POWER_SOFT_MAX_W)
+            || req.apu_slow_w.is_some_and(|v| v > APU_POWER_SOFT_MAX_W)
+            || req.tdc_soc_a.is_some_and(|v| v > APU_SOC_TDC_SOFT_MAX_A)
+            || req.edc_soc_a.is_some_and(|v| v > APU_SOC_EDC_SOFT_MAX_A)
+            || req
+                .apu_skin_temp_c
+                .is_some_and(|v| v > APU_SKIN_TEMP_SOFT_MAX_C)
+            || req
+                .dgpu_skin_temp_c
+                .is_some_and(|v| v > APU_SKIN_TEMP_SOFT_MAX_C)
+    }
+
+    /// Build a `CliAction::ApuSet` containing only enabled, hardware-supported fields.
+    pub fn build_cli_action_for(&self, hw: &HardwareContext, dry_run: bool) -> Option<CliAction> {
+        let req = self.build_request_for(hw);
+        if req.is_empty() {
+            return None;
+        }
+        Some(CliAction::ApuSet {
+            req,
+            allow_extreme: self.allow_extreme,
+            dry_run,
+        })
     }
 }
 
@@ -247,6 +518,7 @@ pub struct ZensmuApp {
     pub co_editor: CoEditorState,
     pub shaper_editor: ShaperEditorState,
     pub pbo_editor: PboEditorState,
+    pub apu_editor: ApuEditorState,
     pub profile_editor: ProfileEditorState,
 
     // Unprivileged boot/resume persistence status & confirmation modal
@@ -289,6 +561,7 @@ impl ZensmuApp {
             co_editor: CoEditorState::default(),
             shaper_editor: ShaperEditorState::default(),
             pbo_editor: PboEditorState::default(),
+            apu_editor: ApuEditorState::default(),
             profile_editor: ProfileEditorState::default(),
             persist_status: read_persist_status(&PersistPaths::default(), None, None),
             persist_confirm: None,
@@ -542,6 +815,13 @@ impl ZensmuApp {
             snap.tdc_a = telem.tdc_limit_a.map(|v| v.round() as u32);
             snap.edc_a = telem.edc_limit_a.map(|v| v.round() as u32);
             snap.tctl_c = telem.tctl_limit_c.map(|v| v.round() as u32);
+            snap.stapm_w = telem.stapm_limit_w.map(|v| v.round() as u32);
+            snap.slow_w = telem.slow_limit_w.map(|v| v.round() as u32);
+            snap.apu_slow_w = telem.apu_slow_limit_w.map(|v| v.round() as u32);
+            snap.tdc_soc_a = telem.tdc_soc_limit_a.map(|v| v.round() as u32);
+            snap.edc_soc_a = telem.edc_soc_limit_a.map(|v| v.round() as u32);
+            snap.apu_skin_temp_c = telem.apu_skin_temp_limit_c.map(|v| v.round() as u32);
+            snap.dgpu_skin_temp_c = telem.dgpu_skin_temp_limit_c.map(|v| v.round() as u32);
         }
 
         let diffs = profile.diff_against(&snap);
@@ -686,6 +966,22 @@ impl ZensmuApp {
         );
     }
 
+    /// Preview enabled APU DPTC limit changes via `zensmu apu set --dry-run --json`.
+    pub fn preview_apply_apu(&mut self, ctx: &egui::Context) {
+        let Some(hw) = self.hw.as_ref() else {
+            self.set_toast(ToastLevel::Warning, "No Ryzen SMU hardware detected.");
+            return;
+        };
+        let Some(action) = self.apu_editor.build_cli_action_for(hw, true) else {
+            self.set_toast(
+                ToastLevel::Info,
+                "Enable at least one APU DPTC parameter or power mode to preview.",
+            );
+            return;
+        };
+        self.dispatch_cli(action, ctx);
+    }
+
     /// Export current live hardware state via `zensmu profile export` to a temp file and display it.
     pub fn export_current_profile(&mut self, ctx: &egui::Context) {
         let tmp_path = std::env::temp_dir().join(format!(
@@ -721,6 +1017,7 @@ impl ZensmuApp {
                         }
                         self.pbo_editor.seeded_from_telemetry = true;
                     }
+                    self.apu_editor.sync_from_telemetry(&sample.snapshot);
                     self.latest_telemetry = Some(sample.snapshot.clone());
                     self.telemetry_error = None;
                     if self.samples.len() >= TELEMETRY_RING_CAPACITY {
@@ -769,6 +1066,7 @@ impl ZensmuApp {
                     });
                 }
                 ElevatedResult::Applied { title, ops } => {
+                    self.apu_editor.clear_dirty();
                     self.refresh_safety_files();
                     self.refresh_persist_status();
                     self.set_toast(
@@ -852,6 +1150,7 @@ impl ZensmuApp {
             self.sync_pbo_from_status(pbo);
         }
         if let Some(telem) = payload.telemetry {
+            self.apu_editor.sync_from_telemetry(&telem);
             self.latest_telemetry = Some(telem);
         }
     }
@@ -1059,5 +1358,119 @@ mod tests {
         assert_eq!(style.spacing.button_padding, egui::vec2(12.0, 6.0));
         assert_eq!(style.spacing.interact_size.y, 26.0);
         assert!(!ctx.options(|o| o.zoom_with_keyboard));
+    }
+
+    #[test]
+    fn apu_editor_syncs_non_dirty_fields_and_builds_filtered_cli_action() {
+        use zensmu_core::hw::profiles::capabilities_for;
+        use zensmu_core::hw::topology::CpuTopology;
+        use zensmu_core::transport::DriverSysfsInfo;
+        use zensmu_core::types::Codename;
+
+        let mut editor = ApuEditorState {
+            slow_dirty: true,
+            slow_w: 42,
+            ..Default::default()
+        };
+
+        let snap = TelemetrySnapshot {
+            codename: Codename::Phoenix,
+            table_version: 0x004C_0008,
+            table_size: 0x800,
+            ppt_limit_w: Some(54.0),
+            ppt_value_w: Some(20.0),
+            tdc_limit_a: Some(45.0),
+            tdc_value_a: Some(15.0),
+            edc_limit_a: Some(75.0),
+            edc_value_a: Some(22.0),
+            tctl_limit_c: Some(95.0),
+            tctl_value_c: Some(55.0),
+            stapm_limit_w: Some(28.0),
+            stapm_value_w: Some(18.0),
+            slow_limit_w: Some(35.0),
+            slow_value_w: Some(19.0),
+            apu_slow_limit_w: Some(25.0),
+            apu_slow_value_w: Some(14.0),
+            tdc_soc_limit_a: Some(22.0),
+            tdc_soc_value_a: Some(8.0),
+            edc_soc_limit_a: Some(40.0),
+            edc_soc_value_a: Some(12.0),
+            apu_skin_temp_limit_c: Some(48.0),
+            apu_skin_temp_value_c: Some(37.0),
+            dgpu_skin_temp_limit_c: Some(0.0),
+            dgpu_skin_temp_value_c: Some(0.0),
+            fclk_mhz: Some(2000.0),
+            uclk_mhz: Some(2000.0),
+            mclk_mhz: Some(2000.0),
+            vddcr_soc_v: Some(1.1),
+            vddcr_misc_v: None,
+            cldo_vddp_v: None,
+            cldo_vddg_iod_v: None,
+            cldo_vddg_ccd_v: None,
+        };
+
+        editor.sync_from_telemetry(&snap);
+        assert_eq!(editor.stapm_w, 28);
+        assert_eq!(editor.fast_w, 54);
+        // Dirty field stays at user value while live value still updates.
+        assert_eq!(editor.slow_w, 42);
+        assert_eq!(editor.live_slow_w, Some(35.0));
+        assert_eq!(editor.apu_slow_w, 25);
+        assert_eq!(editor.tdc_soc_a, 22);
+        assert_eq!(editor.edc_soc_a, 40);
+        assert_eq!(editor.apu_skin_temp_c, 48);
+        // Zero limit leaves default slider untouched.
+        assert_eq!(editor.dgpu_skin_temp_c, 60);
+        assert_eq!(editor.live_dgpu_skin_temp_c, Some(0.0));
+
+        let phoenix_hw = HardwareContext {
+            driver: DriverSysfsInfo {
+                drv_version: "0.1.7".into(),
+                smu_version: "76.70.0".into(),
+                codename_id: Codename::Phoenix as u32,
+                mp1_if_version: 13,
+                has_rsmu: true,
+                has_pm_table: true,
+                pm_table_version: Some(0x004C_0008),
+                pm_table_size: Some(0x800),
+            },
+            codename: Codename::Phoenix,
+            cpuid: None,
+            topology: CpuTopology::synthetic(1, 8, 2),
+            capabilities: capabilities_for(Codename::Phoenix).unwrap(),
+        };
+
+        assert!(!editor.has_any_enabled_for(&phoenix_hw));
+        assert!(editor.build_cli_action_for(&phoenix_hw, true).is_none());
+
+        editor.stapm_enabled = true;
+        editor.stapm_w = 110; // above soft max 100
+        editor.power_mode = Some(ApuPowerMode::MaxPerformance);
+        assert!(editor.has_any_enabled_for(&phoenix_hw));
+        assert!(editor.has_any_extreme_for(&phoenix_hw));
+
+        let action = editor.build_cli_action_for(&phoenix_hw, true).unwrap();
+        assert_eq!(
+            action,
+            CliAction::ApuSet {
+                req: ApuSetRequest {
+                    stapm_w: Some(110),
+                    power_mode: Some(ApuPowerMode::MaxPerformance),
+                    ..Default::default()
+                },
+                allow_extreme: false,
+                dry_run: true,
+            }
+        );
+
+        // Capability filtering on PboEditorState (Lucienne has no set_fmax)
+        let lucienne_caps = capabilities_for(Codename::Lucienne).unwrap();
+        let pbo = PboEditorState {
+            fmax_enabled: true,
+            fmax_mhz: 4500,
+            ..Default::default()
+        };
+        let pbo_req = pbo.build_request_for(&lucienne_caps);
+        assert_eq!(pbo_req.fmax_mhz, None);
     }
 }

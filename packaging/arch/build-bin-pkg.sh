@@ -5,7 +5,7 @@ set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 PKGVER="${PKGVER:-0.1.0}"
-PKGREL="${PKGREL:-6}"
+PKGREL="${PKGREL:-7}"
 TARGET_TRIPLE="x86_64-unknown-linux-gnu"
 STAGE_NAME="zensmu-v${PKGVER}-${TARGET_TRIPLE}"
 

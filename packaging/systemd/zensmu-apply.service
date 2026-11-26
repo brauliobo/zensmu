@@ -44,7 +44,7 @@ ConditionPathExists=/sys/kernel/ryzen_smu_drv/codename
 [Service]
 Type=oneshot
 RemainAfterExit=yes
-ExecStart=/usr/bin/zensmu profile apply /etc/zensmu/active.toml --yes --boot-guard --settle-secs 15
+ExecStart=/usr/bin/zensmu profile apply /etc/zensmu/active.toml --yes --allow-extreme --boot-guard --settle-secs 15
 StandardOutput=journal
 StandardError=journal
 

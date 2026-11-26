@@ -372,9 +372,13 @@ enum TuneParam {
     PboScalar,
     PboFmax,
     ApuStapm,
+    ApuStapmTime,
     ApuFast,
     ApuSlow,
+    ApuSlowTime,
     ApuApuSlow,
+    ApuTdcSoc,
+    ApuEdcSoc,
     ApuSkinTemp,
     ApuDgpuSkinTemp,
     ApuPowerMode,
@@ -392,9 +396,13 @@ impl TuneParam {
             | Self::PboScalar
             | Self::PboFmax => TuneSection::Pbo,
             Self::ApuStapm
+            | Self::ApuStapmTime
             | Self::ApuFast
             | Self::ApuSlow
+            | Self::ApuSlowTime
             | Self::ApuApuSlow
+            | Self::ApuTdcSoc
+            | Self::ApuEdcSoc
             | Self::ApuSkinTemp
             | Self::ApuDgpuSkinTemp
             | Self::ApuPowerMode => TuneSection::Apu,
@@ -784,14 +792,26 @@ impl App {
                 "Mobile Power & Thermal".to_string(),
             ));
             rows.push(TuneRow::Param(TuneParam::ApuStapm));
+            if caps.set_stapm_time.is_some() {
+                rows.push(TuneRow::Param(TuneParam::ApuStapmTime));
+            }
             if hw.codename.is_apu() && caps.set_ppt.is_some() {
                 rows.push(TuneRow::Param(TuneParam::ApuFast));
             }
             if caps.set_slow_limit.is_some() {
                 rows.push(TuneRow::Param(TuneParam::ApuSlow));
             }
+            if caps.set_slow_time.is_some() {
+                rows.push(TuneRow::Param(TuneParam::ApuSlowTime));
+            }
             if caps.set_apu_slow_limit.is_some() {
                 rows.push(TuneRow::Param(TuneParam::ApuApuSlow));
+            }
+            if caps.set_tdc_soc.is_some() {
+                rows.push(TuneRow::Param(TuneParam::ApuTdcSoc));
+            }
+            if caps.set_edc_soc.is_some() {
+                rows.push(TuneRow::Param(TuneParam::ApuEdcSoc));
             }
             if caps.set_apu_skin_temp.is_some() {
                 rows.push(TuneRow::Param(TuneParam::ApuSkinTemp));
@@ -917,33 +937,85 @@ impl App {
                 .and_then(|p| p.fmax_mhz)
                 .map(|v| TuneValue::Int(v as i32)),
             TuneParam::ApuStapm => self
-                .pbo_state
-                .as_loaded()
-                .and_then(|p| p.fused.slow_w)
-                .map(|v| TuneValue::Int(v as i32)),
-            TuneParam::ApuFast => self
-                .pbo_state
-                .as_loaded()
-                .and_then(|p| p.fused.fast_w)
-                .map(|v| TuneValue::Int(v as i32))
+                .telemetry
+                .as_ref()
+                .and_then(|t| t.stapm_limit_w)
+                .filter(|v| v.is_finite())
+                .map(|v| TuneValue::Int(v.round() as i32))
                 .or_else(|| {
-                    self.telemetry
-                        .as_ref()
-                        .and_then(|t| t.ppt_limit_w)
-                        .filter(|v| v.is_finite())
-                        .map(|v| TuneValue::Int(v.round() as i32))
+                    self.pbo_state
+                        .as_loaded()
+                        .and_then(|p| p.fused.slow_w)
+                        .map(|v| TuneValue::Int(v as i32))
+                }),
+            TuneParam::ApuStapmTime => None,
+            TuneParam::ApuFast => self
+                .telemetry
+                .as_ref()
+                .and_then(|t| t.ppt_limit_w)
+                .filter(|v| v.is_finite())
+                .map(|v| TuneValue::Int(v.round() as i32))
+                .or_else(|| {
+                    self.pbo_state
+                        .as_loaded()
+                        .and_then(|p| p.fused.fast_w)
+                        .map(|v| TuneValue::Int(v as i32))
                 }),
             TuneParam::ApuSlow => self
-                .pbo_state
-                .as_loaded()
-                .and_then(|p| p.fused.slow_w)
-                .map(|v| TuneValue::Int(v as i32)),
+                .telemetry
+                .as_ref()
+                .and_then(|t| t.slow_limit_w)
+                .filter(|v| v.is_finite())
+                .map(|v| TuneValue::Int(v.round() as i32))
+                .or_else(|| {
+                    self.pbo_state
+                        .as_loaded()
+                        .and_then(|p| p.fused.slow_w)
+                        .map(|v| TuneValue::Int(v as i32))
+                }),
+            TuneParam::ApuSlowTime => None,
             TuneParam::ApuApuSlow => self
-                .pbo_state
-                .as_loaded()
-                .and_then(|p| p.fused.apu_slow_w)
-                .map(|v| TuneValue::Int(v as i32)),
-            TuneParam::ApuSkinTemp | TuneParam::ApuDgpuSkinTemp => None,
+                .telemetry
+                .as_ref()
+                .and_then(|t| t.apu_slow_limit_w)
+                .filter(|v| v.is_finite())
+                .map(|v| TuneValue::Int(v.round() as i32))
+                .or_else(|| {
+                    self.pbo_state
+                        .as_loaded()
+                        .and_then(|p| p.fused.apu_slow_w)
+                        .map(|v| TuneValue::Int(v as i32))
+                }),
+            TuneParam::ApuTdcSoc => self
+                .telemetry
+                .as_ref()
+                .and_then(|t| t.tdc_soc_limit_a)
+                .filter(|v| v.is_finite())
+                .map(|v| TuneValue::Int(v.round() as i32))
+                .or_else(|| {
+                    self.pbo_state
+                        .as_loaded()
+                        .and_then(|p| p.fused.soc_tdc_a)
+                        .map(|v| TuneValue::Int(v as i32))
+                }),
+            TuneParam::ApuEdcSoc => self
+                .telemetry
+                .as_ref()
+                .and_then(|t| t.edc_soc_limit_a)
+                .filter(|v| v.is_finite())
+                .map(|v| TuneValue::Int(v.round() as i32)),
+            TuneParam::ApuSkinTemp => self
+                .telemetry
+                .as_ref()
+                .and_then(|t| t.apu_skin_temp_limit_c)
+                .filter(|v| v.is_finite())
+                .map(|v| TuneValue::Int(v.round() as i32)),
+            TuneParam::ApuDgpuSkinTemp => self
+                .telemetry
+                .as_ref()
+                .and_then(|t| t.dgpu_skin_temp_limit_c)
+                .filter(|v| v.is_finite())
+                .map(|v| TuneValue::Int(v.round() as i32)),
             TuneParam::ApuPowerMode => Some(TuneValue::PowerMode(None)),
         }
     }
@@ -962,9 +1034,13 @@ impl App {
             TuneParam::PboScalar => TuneValue::Int(1),
             TuneParam::PboFmax => TuneValue::Int(5000),
             TuneParam::ApuStapm => TuneValue::Int(28),
+            TuneParam::ApuStapmTime => TuneValue::Int(200),
             TuneParam::ApuFast => TuneValue::Int(45),
             TuneParam::ApuSlow => TuneValue::Int(35),
+            TuneParam::ApuSlowTime => TuneValue::Int(5),
             TuneParam::ApuApuSlow => TuneValue::Int(30),
+            TuneParam::ApuTdcSoc => TuneValue::Int(20),
+            TuneParam::ApuEdcSoc => TuneValue::Int(35),
             TuneParam::ApuSkinTemp => TuneValue::Int(45),
             TuneParam::ApuDgpuSkinTemp => TuneValue::Int(55),
             TuneParam::ApuPowerMode => TuneValue::PowerMode(None),
@@ -990,6 +1066,11 @@ impl App {
             | TuneParam::ApuFast
             | TuneParam::ApuSlow
             | TuneParam::ApuApuSlow => (apu::APU_POWER_MIN_W as i32, apu::APU_POWER_MAX_W as i32),
+            TuneParam::ApuStapmTime | TuneParam::ApuSlowTime => {
+                (apu::APU_TIME_MIN_S as i32, apu::APU_TIME_MAX_S as i32)
+            }
+            TuneParam::ApuTdcSoc => (apu::APU_SOC_TDC_MIN_A as i32, apu::APU_SOC_TDC_MAX_A as i32),
+            TuneParam::ApuEdcSoc => (apu::APU_SOC_EDC_MIN_A as i32, apu::APU_SOC_EDC_MAX_A as i32),
             TuneParam::ApuSkinTemp | TuneParam::ApuDgpuSkinTemp => (
                 apu::APU_SKIN_TEMP_MIN_C as i32,
                 apu::APU_SKIN_TEMP_MAX_C as i32,
@@ -1014,6 +1095,9 @@ impl App {
             | TuneParam::ApuFast
             | TuneParam::ApuSlow
             | TuneParam::ApuApuSlow => (1, 5),
+            TuneParam::ApuStapmTime => (5, 30),
+            TuneParam::ApuSlowTime => (1, 10),
+            TuneParam::ApuTdcSoc | TuneParam::ApuEdcSoc => (1, 5),
             TuneParam::ApuSkinTemp | TuneParam::ApuDgpuSkinTemp => (1, 5),
             TuneParam::ApuPowerMode => (1, 1),
         }
@@ -1049,6 +1133,9 @@ impl App {
                 v > apu::APU_POWER_SOFT_MAX_W as i32
             }
             TuneParam::ApuFast => v > apu::APU_FAST_POWER_SOFT_MAX_W as i32,
+            TuneParam::ApuStapmTime | TuneParam::ApuSlowTime => false,
+            TuneParam::ApuTdcSoc => v > apu::APU_SOC_TDC_SOFT_MAX_A as i32,
+            TuneParam::ApuEdcSoc => v > apu::APU_SOC_EDC_SOFT_MAX_A as i32,
             TuneParam::ApuSkinTemp | TuneParam::ApuDgpuSkinTemp => {
                 v > apu::APU_SKIN_TEMP_SOFT_MAX_C as i32
             }
@@ -1201,6 +1288,53 @@ impl App {
         }
     }
 
+    fn enrich_apu_op_current(&self, op: &mut PlannedOp) {
+        if op.current.is_some() {
+            return;
+        }
+        if op.description.starts_with("Set APU STAPM limit") {
+            op.current = self
+                .live_param_value(TuneParam::ApuStapm)
+                .and_then(TuneValue::as_int)
+                .map(|v| format!("{v} W"));
+        } else if op.description.starts_with("Set APU Fast PPT") {
+            op.current = self
+                .live_param_value(TuneParam::ApuFast)
+                .and_then(TuneValue::as_int)
+                .map(|v| format!("{v} W"));
+        } else if op.description.starts_with("Set APU Slow PPT limit") {
+            op.current = self
+                .live_param_value(TuneParam::ApuSlow)
+                .and_then(TuneValue::as_int)
+                .map(|v| format!("{v} W"));
+        } else if op.description.starts_with("Set APU-only Slow PPT") {
+            op.current = self
+                .live_param_value(TuneParam::ApuApuSlow)
+                .and_then(TuneValue::as_int)
+                .map(|v| format!("{v} W"));
+        } else if op.description.starts_with("Set APU SoC TDC") {
+            op.current = self
+                .live_param_value(TuneParam::ApuTdcSoc)
+                .and_then(TuneValue::as_int)
+                .map(|v| format!("{v} A"));
+        } else if op.description.starts_with("Set APU SoC EDC") {
+            op.current = self
+                .live_param_value(TuneParam::ApuEdcSoc)
+                .and_then(TuneValue::as_int)
+                .map(|v| format!("{v} A"));
+        } else if op.description.starts_with("Set APU skin") {
+            op.current = self
+                .live_param_value(TuneParam::ApuSkinTemp)
+                .and_then(TuneValue::as_int)
+                .map(|v| format!("{v} C"));
+        } else if op.description.starts_with("Set dGPU skin") {
+            op.current = self
+                .live_param_value(TuneParam::ApuDgpuSkinTemp)
+                .and_then(TuneValue::as_int)
+                .map(|v| format!("{v} C"));
+        }
+    }
+
     fn open_staged_dry_run_modal(
         &mut self,
         transport: &dyn SmuTransport,
@@ -1308,6 +1442,11 @@ impl App {
                 .get(&TuneParam::ApuStapm)
                 .and_then(|v| v.as_int())
                 .map(|v| v as u32),
+            stapm_time_s: self
+                .staged
+                .get(&TuneParam::ApuStapmTime)
+                .and_then(|v| v.as_int())
+                .map(|v| v as u32),
             fast_w: self
                 .staged
                 .get(&TuneParam::ApuFast)
@@ -1318,9 +1457,24 @@ impl App {
                 .get(&TuneParam::ApuSlow)
                 .and_then(|v| v.as_int())
                 .map(|v| v as u32),
+            slow_time_s: self
+                .staged
+                .get(&TuneParam::ApuSlowTime)
+                .and_then(|v| v.as_int())
+                .map(|v| v as u32),
             apu_slow_w: self
                 .staged
                 .get(&TuneParam::ApuApuSlow)
+                .and_then(|v| v.as_int())
+                .map(|v| v as u32),
+            tdc_soc_a: self
+                .staged
+                .get(&TuneParam::ApuTdcSoc)
+                .and_then(|v| v.as_int())
+                .map(|v| v as u32),
+            edc_soc_a: self
+                .staged
+                .get(&TuneParam::ApuEdcSoc)
                 .and_then(|v| v.as_int())
                 .map(|v| v as u32),
             apu_skin_temp_c: self
@@ -1337,15 +1491,8 @@ impl App {
                 .staged
                 .get(&TuneParam::ApuPowerMode)
                 .and_then(|v| v.as_power_mode()),
-            ..Default::default()
         };
-        let has_apu = apu_req.stapm_w.is_some()
-            || apu_req.fast_w.is_some()
-            || apu_req.slow_w.is_some()
-            || apu_req.apu_slow_w.is_some()
-            || apu_req.apu_skin_temp_c.is_some()
-            || apu_req.dgpu_skin_temp_c.is_some()
-            || apu_req.power_mode.is_some();
+        let has_apu = !apu_req.is_empty();
 
         // Check Fmax soft delta in dry-run (since pbo::set_pbo skips live get_fmax in dry_run)
         if let Some(fmax) = pbo_req.fmax_mhz {
@@ -1418,7 +1565,10 @@ impl App {
                 ops.extend(v);
             }
             if has_apu {
-                let v = apu::set_apu(transport, hw, &apu_req, allow_extreme, true)?;
+                let mut v = apu::set_apu(transport, hw, &apu_req, allow_extreme, true)?;
+                for op in &mut v {
+                    self.enrich_apu_op_current(op);
+                }
                 ops.extend(v);
             }
             Ok(ops)
@@ -1815,19 +1965,21 @@ impl App {
                 let res = (|| -> zensmu_core::Result<()> {
                     let snap = session::capture_snapshot(transport, hw)?;
                     let profile = Profile::from_snapshot(&snap);
+                    // Live hardware state may include BIOS Motherboard-PBO values above
+                    // interactive soft limits; hard hardware bounds remain strictly enforced.
                     persist::persist_profile(
                         &self.persist_paths,
                         &profile,
                         hw.codename,
                         hw.topology.physical_cores,
-                        modal.allow_extreme,
+                        true,
                     )?;
                     persist::set_service_enabled(
                         &self.persist_paths,
                         true,
                         hw.codename,
                         hw.topology.physical_cores,
-                        modal.allow_extreme,
+                        true,
                     )?;
                     Ok(())
                 })();
@@ -1860,7 +2012,7 @@ impl App {
                             &profile,
                             hw.codename,
                             hw.topology.physical_cores,
-                            modal.allow_extreme,
+                            true,
                         )?;
                     }
                     persist::set_service_enabled(
@@ -1868,7 +2020,7 @@ impl App {
                         enable,
                         hw.codename,
                         hw.topology.physical_cores,
-                        modal.allow_extreme,
+                        true,
                     )?;
                     Ok(())
                 })();
@@ -2909,12 +3061,37 @@ fn draw_footer(frame: &mut Frame, area: Rect, app: &App) {
 // Tab 1: Overview (btop style)
 // ---------------------------------------------------------------------------
 
+fn has_apu_telemetry(snap: Option<&TelemetrySnapshot>) -> bool {
+    snap.is_some_and(|s| {
+        s.stapm_limit_w.is_some()
+            || s.stapm_value_w.is_some()
+            || s.slow_limit_w.is_some()
+            || s.slow_value_w.is_some()
+            || s.apu_slow_limit_w.is_some()
+            || s.apu_slow_value_w.is_some()
+            || s.tdc_soc_limit_a.is_some()
+            || s.tdc_soc_value_a.is_some()
+            || s.edc_soc_limit_a.is_some()
+            || s.edc_soc_value_a.is_some()
+            || s.apu_skin_temp_limit_c.is_some()
+            || s.apu_skin_temp_value_c.is_some()
+            || s.dgpu_skin_temp_limit_c.is_some()
+            || s.dgpu_skin_temp_value_c.is_some()
+    })
+}
+
 fn draw_overview_tab(frame: &mut Frame, area: Rect, app: &App, hw: &HardwareContext) {
+    let snap = app.telemetry.as_ref();
+    let gauge_height = if has_apu_telemetry(snap) {
+        if area.height >= 28 { 9 } else { 7 }
+    } else {
+        6
+    };
     let rows = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(6),
-            Constraint::Percentage(42),
+            Constraint::Length(gauge_height),
+            Constraint::Percentage(40),
             Constraint::Min(8),
         ])
         .split(area);
@@ -2926,7 +3103,6 @@ fn draw_overview_tab(frame: &mut Frame, area: Rect, app: &App, hw: &HardwareCont
         .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
         .split(rows[1]);
 
-    let snap = app.telemetry.as_ref();
     let ppt_cur = snap.and_then(|s| s.ppt_value_w);
     let ppt_lim = snap.and_then(|s| s.ppt_limit_w);
     let tctl_cur = snap.and_then(|s| s.tctl_value_c);
@@ -2967,98 +3143,260 @@ fn draw_overview_tab(frame: &mut Frame, area: Rect, app: &App, hw: &HardwareCont
     draw_co_pbo_summary(frame, bottom_cols[1], app, hw);
 }
 
+struct GaugeSpec<'a> {
+    label: &'a str,
+    value: Option<f32>,
+    limit: Option<f32>,
+    unit: &'a str,
+    is_thermal: bool,
+}
+
+fn render_gauge_line(frame: &mut Frame, area: Rect, label_w: u16, spec: &GaugeSpec<'_>) {
+    let ratio = gauge_ratio(spec.value, spec.limit);
+    let color = if spec.is_thermal {
+        thermal_color(spec.value, spec.limit)
+    } else {
+        ratio_color(ratio)
+    };
+    let compact = area.width < 48;
+    let readout = if compact {
+        match (spec.value, spec.limit) {
+            (Some(v), Some(l)) if v.is_finite() && l.is_finite() => {
+                format!("{v:4.1}/{l:4.0}{}", spec.unit)
+            }
+            (Some(v), _) if v.is_finite() => format!("{v:4.1}/—{}", spec.unit),
+            (_, Some(l)) if l.is_finite() => format!("—/{l:4.0}{}", spec.unit),
+            _ => format!("—/—{}", spec.unit),
+        }
+    } else {
+        format_gauge_readout(spec.value, spec.limit, spec.unit)
+    };
+    let readout_w = if compact { 14 } else { 25 };
+
+    let cols = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([
+            Constraint::Length(label_w),
+            Constraint::Min(6),
+            Constraint::Length(readout_w),
+        ])
+        .split(area);
+
+    frame.render_widget(
+        Paragraph::new(Line::from(Span::styled(
+            format!(" {}", spec.label),
+            Style::default().fg(palette::MUTED).add_modifier(Modifier::BOLD),
+        ))),
+        cols[0],
+    );
+
+    let gauge = LineGauge::default()
+        .filled_style(Style::default().fg(color).add_modifier(Modifier::BOLD))
+        .unfilled_style(Style::default().fg(palette::GAUGE_TRACK))
+        .line_set(symbols::line::THICK)
+        .ratio(ratio)
+        .label("");
+    frame.render_widget(gauge, cols[1]);
+
+    frame.render_widget(
+        Paragraph::new(Line::from(Span::styled(
+            readout,
+            Style::default().fg(color),
+        )))
+        .alignment(Alignment::Right),
+        cols[2],
+    );
+}
+
 fn draw_power_thermal_gauges(frame: &mut Frame, area: Rect, app: &App) {
-    let block = styled_block(" Power & Thermal Limits ", palette::CYAN);
+    let snap = app.telemetry.as_ref();
+    let is_apu_telem = has_apu_telemetry(snap);
+    let title = if is_apu_telem {
+        " Power, Current & Thermal Limits (APU DPTC) "
+    } else {
+        " Power & Thermal Limits "
+    };
+    let block = styled_block(title, palette::CYAN);
     let inner = block.inner(area);
     frame.render_widget(block, area);
 
-    let snap = app.telemetry.as_ref();
-    let gauge_rows = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Length(1),
-            Constraint::Length(1),
-            Constraint::Length(1),
-            Constraint::Length(1),
-        ])
+    if inner.height == 0 || inner.width == 0 {
+        return;
+    }
+
+    if !is_apu_telem {
+        let gauge_rows = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([
+                Constraint::Length(1),
+                Constraint::Length(1),
+                Constraint::Length(1),
+                Constraint::Length(1),
+            ])
+            .split(inner);
+
+        let specs = [
+            GaugeSpec {
+                label: "PPT ",
+                value: snap.and_then(|s| s.ppt_value_w),
+                limit: snap.and_then(|s| s.ppt_limit_w),
+                unit: "W",
+                is_thermal: false,
+            },
+            GaugeSpec {
+                label: "TDC ",
+                value: snap.and_then(|s| s.tdc_value_a),
+                limit: snap.and_then(|s| s.tdc_limit_a),
+                unit: "A",
+                is_thermal: false,
+            },
+            GaugeSpec {
+                label: "EDC ",
+                value: snap.and_then(|s| s.edc_value_a),
+                limit: snap.and_then(|s| s.edc_limit_a),
+                unit: "A",
+                is_thermal: false,
+            },
+            GaugeSpec {
+                label: "Tctl",
+                value: snap.and_then(|s| s.tctl_value_c),
+                limit: snap.and_then(|s| s.tctl_limit_c),
+                unit: "°C",
+                is_thermal: true,
+            },
+        ];
+
+        for (idx, spec) in specs.iter().enumerate() {
+            if idx >= gauge_rows.len() {
+                break;
+            }
+            render_gauge_line(frame, gauge_rows[idx], 6, spec);
+        }
+        return;
+    }
+
+    // APU 2-column compact layout: Left = Power & Skin Thermal, Right = Currents & Tctl
+    let mut left_specs: Vec<GaugeSpec<'_>> = Vec::new();
+    if snap.is_some_and(|s| s.stapm_limit_w.is_some() || s.stapm_value_w.is_some()) {
+        left_specs.push(GaugeSpec {
+            label: "STAPM",
+            value: snap.and_then(|s| s.stapm_value_w),
+            limit: snap.and_then(|s| s.stapm_limit_w),
+            unit: "W",
+            is_thermal: false,
+        });
+    }
+    left_specs.push(GaugeSpec {
+        label: "Fast ",
+        value: snap.and_then(|s| s.ppt_value_w),
+        limit: snap.and_then(|s| s.ppt_limit_w),
+        unit: "W",
+        is_thermal: false,
+    });
+    if snap.is_some_and(|s| s.slow_limit_w.is_some() || s.slow_value_w.is_some()) {
+        left_specs.push(GaugeSpec {
+            label: "Slow ",
+            value: snap.and_then(|s| s.slow_value_w),
+            limit: snap.and_then(|s| s.slow_limit_w),
+            unit: "W",
+            is_thermal: false,
+        });
+    }
+    if snap.is_some_and(|s| s.apu_slow_limit_w.is_some() || s.apu_slow_value_w.is_some()) {
+        left_specs.push(GaugeSpec {
+            label: "APUSl",
+            value: snap.and_then(|s| s.apu_slow_value_w),
+            limit: snap.and_then(|s| s.apu_slow_limit_w),
+            unit: "W",
+            is_thermal: false,
+        });
+    }
+    if snap.is_some_and(|s| s.apu_skin_temp_limit_c.is_some() || s.apu_skin_temp_value_c.is_some())
+    {
+        left_specs.push(GaugeSpec {
+            label: "ASkin",
+            value: snap.and_then(|s| s.apu_skin_temp_value_c),
+            limit: snap.and_then(|s| s.apu_skin_temp_limit_c),
+            unit: "°C",
+            is_thermal: true,
+        });
+    }
+    if snap.is_some_and(|s| s.dgpu_skin_temp_limit_c.is_some() || s.dgpu_skin_temp_value_c.is_some())
+    {
+        left_specs.push(GaugeSpec {
+            label: "dSkin",
+            value: snap.and_then(|s| s.dgpu_skin_temp_value_c),
+            limit: snap.and_then(|s| s.dgpu_skin_temp_limit_c),
+            unit: "°C",
+            is_thermal: true,
+        });
+    }
+
+    let mut right_specs: Vec<GaugeSpec<'_>> = vec![GaugeSpec {
+        label: "TDC  ",
+        value: snap.and_then(|s| s.tdc_value_a),
+        limit: snap.and_then(|s| s.tdc_limit_a),
+        unit: "A",
+        is_thermal: false,
+    }];
+    if snap.is_some_and(|s| s.tdc_soc_limit_a.is_some() || s.tdc_soc_value_a.is_some()) {
+        right_specs.push(GaugeSpec {
+            label: "SoCTD",
+            value: snap.and_then(|s| s.tdc_soc_value_a),
+            limit: snap.and_then(|s| s.tdc_soc_limit_a),
+            unit: "A",
+            is_thermal: false,
+        });
+    }
+    right_specs.push(GaugeSpec {
+        label: "EDC  ",
+        value: snap.and_then(|s| s.edc_value_a),
+        limit: snap.and_then(|s| s.edc_limit_a),
+        unit: "A",
+        is_thermal: false,
+    });
+    if snap.is_some_and(|s| s.edc_soc_limit_a.is_some() || s.edc_soc_value_a.is_some()) {
+        right_specs.push(GaugeSpec {
+            label: "SoCED",
+            value: snap.and_then(|s| s.edc_soc_value_a),
+            limit: snap.and_then(|s| s.edc_soc_limit_a),
+            unit: "A",
+            is_thermal: false,
+        });
+    }
+    right_specs.push(GaugeSpec {
+        label: "Tctl ",
+        value: snap.and_then(|s| s.tctl_value_c),
+        limit: snap.and_then(|s| s.tctl_limit_c),
+        unit: "°C",
+        is_thermal: true,
+    });
+
+    let cols = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
         .split(inner);
 
-    let specs = [
-        (
-            "PPT ",
-            snap.and_then(|s| s.ppt_value_w),
-            snap.and_then(|s| s.ppt_limit_w),
-            "W",
-            false,
-        ),
-        (
-            "TDC ",
-            snap.and_then(|s| s.tdc_value_a),
-            snap.and_then(|s| s.tdc_limit_a),
-            "A",
-            false,
-        ),
-        (
-            "EDC ",
-            snap.and_then(|s| s.edc_value_a),
-            snap.and_then(|s| s.edc_limit_a),
-            "A",
-            false,
-        ),
-        (
-            "Tctl",
-            snap.and_then(|s| s.tctl_value_c),
-            snap.and_then(|s| s.tctl_limit_c),
-            "°C",
-            true,
-        ),
-    ];
-
-    for (idx, (label, val, lim, unit, is_thermal)) in specs.into_iter().enumerate() {
-        if idx >= gauge_rows.len() {
+    let left_rows = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints(vec![Constraint::Length(1); left_specs.len().min(inner.height as usize)])
+        .split(cols[0]);
+    for (idx, spec) in left_specs.iter().enumerate() {
+        if idx >= left_rows.len() {
             break;
         }
-        let ratio = gauge_ratio(val, lim);
-        let color = if is_thermal {
-            thermal_color(val, lim)
-        } else {
-            ratio_color(ratio)
-        };
-        let readout = format_gauge_readout(val, lim, unit);
+        render_gauge_line(frame, left_rows[idx], 7, spec);
+    }
 
-        let cols = Layout::default()
-            .direction(Direction::Horizontal)
-            .constraints([
-                Constraint::Length(6),
-                Constraint::Min(10),
-                Constraint::Length(25),
-            ])
-            .split(gauge_rows[idx]);
-
-        frame.render_widget(
-            Paragraph::new(Line::from(Span::styled(
-                format!(" {label}"),
-                Style::default().fg(palette::MUTED).add_modifier(Modifier::BOLD),
-            ))),
-            cols[0],
-        );
-
-        let gauge = LineGauge::default()
-            .filled_style(Style::default().fg(color).add_modifier(Modifier::BOLD))
-            .unfilled_style(Style::default().fg(palette::GAUGE_TRACK))
-            .line_set(symbols::line::THICK)
-            .ratio(ratio)
-            .label("");
-        frame.render_widget(gauge, cols[1]);
-
-        frame.render_widget(
-            Paragraph::new(Line::from(Span::styled(
-                readout,
-                Style::default().fg(color),
-            )))
-            .alignment(Alignment::Right),
-            cols[2],
-        );
+    let right_rows = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints(vec![Constraint::Length(1); right_specs.len().min(inner.height as usize)])
+        .split(cols[1]);
+    for (idx, spec) in right_specs.iter().enumerate() {
+        if idx >= right_rows.len() {
+            break;
+        }
+        render_gauge_line(frame, right_rows[idx], 7, spec);
     }
 }
 
@@ -3631,6 +3969,68 @@ fn draw_voltage_rails_table(frame: &mut Frame, area: Rect, app: &App) {
         ]),
     ];
 
+    let mut rows = rows;
+    if let Some(s) = snap {
+        if s.tdc_soc_value_a.is_some() || s.tdc_soc_limit_a.is_some() {
+            rows.push(Row::new(vec![
+                Cell::from("SoC TDC").style(Style::default().fg(palette::FG)),
+                Cell::from(format_opt_f32(s.tdc_soc_value_a, 1, "A")).style(
+                    Style::default().fg(ratio_color(gauge_ratio(
+                        s.tdc_soc_value_a,
+                        s.tdc_soc_limit_a,
+                    ))),
+                ),
+                Cell::from(format!("lim {}", format_opt_f32(s.tdc_soc_limit_a, 1, "A")))
+                    .style(Style::default().fg(palette::MUTED)),
+            ]));
+        }
+        if s.edc_soc_value_a.is_some() || s.edc_soc_limit_a.is_some() {
+            rows.push(Row::new(vec![
+                Cell::from("SoC EDC").style(Style::default().fg(palette::FG)),
+                Cell::from(format_opt_f32(s.edc_soc_value_a, 1, "A")).style(
+                    Style::default().fg(ratio_color(gauge_ratio(
+                        s.edc_soc_value_a,
+                        s.edc_soc_limit_a,
+                    ))),
+                ),
+                Cell::from(format!("lim {}", format_opt_f32(s.edc_soc_limit_a, 1, "A")))
+                    .style(Style::default().fg(palette::MUTED)),
+            ]));
+        }
+        if s.apu_skin_temp_value_c.is_some() || s.apu_skin_temp_limit_c.is_some() {
+            rows.push(Row::new(vec![
+                Cell::from("APU Skin").style(Style::default().fg(palette::FG)),
+                Cell::from(format_opt_f32(s.apu_skin_temp_value_c, 1, "°C")).style(
+                    Style::default().fg(thermal_color(
+                        s.apu_skin_temp_value_c,
+                        s.apu_skin_temp_limit_c,
+                    )),
+                ),
+                Cell::from(format!(
+                    "lim {}",
+                    format_opt_f32(s.apu_skin_temp_limit_c, 1, "°C")
+                ))
+                .style(Style::default().fg(palette::MUTED)),
+            ]));
+        }
+        if s.dgpu_skin_temp_value_c.is_some() || s.dgpu_skin_temp_limit_c.is_some() {
+            rows.push(Row::new(vec![
+                Cell::from("dGPU Skin").style(Style::default().fg(palette::FG)),
+                Cell::from(format_opt_f32(s.dgpu_skin_temp_value_c, 1, "°C")).style(
+                    Style::default().fg(thermal_color(
+                        s.dgpu_skin_temp_value_c,
+                        s.dgpu_skin_temp_limit_c,
+                    )),
+                ),
+                Cell::from(format!(
+                    "lim {}",
+                    format_opt_f32(s.dgpu_skin_temp_limit_c, 1, "°C")
+                ))
+                .style(Style::default().fg(palette::MUTED)),
+            ]));
+        }
+    }
+
     let header = Row::new(vec!["Rail / Metric", "Current", "Min / Avg / Max or Note"]).style(
         Style::default()
             .fg(palette::MUTED)
@@ -4102,9 +4502,13 @@ fn format_tune_param_label(param: TuneParam, hw: &HardwareContext) -> String {
         TuneParam::PboScalar => "PBO Scalar (x)".to_string(),
         TuneParam::PboFmax => "Fmax Boost (MHz)".to_string(),
         TuneParam::ApuStapm => "STAPM Limit (W)".to_string(),
-        TuneParam::ApuFast => "Fast Limit (W)".to_string(),
-        TuneParam::ApuSlow => "Slow Limit (W)".to_string(),
-        TuneParam::ApuApuSlow => "APU Slow (W)".to_string(),
+        TuneParam::ApuStapmTime => "STAPM Time (s)".to_string(),
+        TuneParam::ApuFast => "Fast PPT Limit (W)".to_string(),
+        TuneParam::ApuSlow => "Slow PPT Limit (W)".to_string(),
+        TuneParam::ApuSlowTime => "Slow Time (s)".to_string(),
+        TuneParam::ApuApuSlow => "APU Slow Limit (W)".to_string(),
+        TuneParam::ApuTdcSoc => "SoC TDC Limit (A)".to_string(),
+        TuneParam::ApuEdcSoc => "SoC EDC Limit (A)".to_string(),
         TuneParam::ApuSkinTemp => "APU Skin Temp (°C)".to_string(),
         TuneParam::ApuDgpuSkinTemp => "dGPU Skin Temp (°C)".to_string(),
         TuneParam::ApuPowerMode => "Power Mode".to_string(),
@@ -4128,7 +4532,11 @@ fn format_tune_value(param: TuneParam, val: TuneValue) -> String {
             | TuneParam::ApuApuSlow,
             TuneValue::Int(v),
         ) => format!("{v} W"),
-        (TuneParam::PboTdc | TuneParam::PboEdc, TuneValue::Int(v)) => format!("{v} A"),
+        (TuneParam::ApuStapmTime | TuneParam::ApuSlowTime, TuneValue::Int(v)) => format!("{v} s"),
+        (
+            TuneParam::PboTdc | TuneParam::PboEdc | TuneParam::ApuTdcSoc | TuneParam::ApuEdcSoc,
+            TuneValue::Int(v),
+        ) => format!("{v} A"),
         (
             TuneParam::PboTctl | TuneParam::ApuSkinTemp | TuneParam::ApuDgpuSkinTemp,
             TuneValue::Int(v),
@@ -4228,11 +4636,26 @@ fn param_bounds_summary(app: &App, param: TuneParam, hw: &HardwareContext) -> St
             apu::APU_POWER_MAX_W,
             apu::APU_POWER_SOFT_MAX_W
         ),
+        TuneParam::ApuStapmTime | TuneParam::ApuSlowTime => {
+            format!("{}..={} s", apu::APU_TIME_MIN_S, apu::APU_TIME_MAX_S)
+        }
         TuneParam::ApuFast => format!(
             "{}..={} W (soft <= {} W)",
             apu::APU_POWER_MIN_W,
             apu::APU_POWER_MAX_W,
             apu::APU_FAST_POWER_SOFT_MAX_W
+        ),
+        TuneParam::ApuTdcSoc => format!(
+            "{}..={} A (soft <= {} A)",
+            apu::APU_SOC_TDC_MIN_A,
+            apu::APU_SOC_TDC_MAX_A,
+            apu::APU_SOC_TDC_SOFT_MAX_A
+        ),
+        TuneParam::ApuEdcSoc => format!(
+            "{}..={} A (soft <= {} A)",
+            apu::APU_SOC_EDC_MIN_A,
+            apu::APU_SOC_EDC_MAX_A,
+            apu::APU_SOC_EDC_SOFT_MAX_A
         ),
         TuneParam::ApuSkinTemp | TuneParam::ApuDgpuSkinTemp => format!(
             "{}..={} °C (soft <= {} °C)",
@@ -4367,7 +4790,20 @@ fn draw_tune_telemetry_strip(frame: &mut Frame, area: Rect, app: &App) {
         }
     };
 
-    let line1 = Line::from(vec![
+    let mut line1_spans = vec![];
+    if let Some(s) = snap {
+        if s.stapm_limit_w.is_some() || s.stapm_value_w.is_some() {
+            line1_spans.push(Span::styled("STAPM ", Style::default().fg(palette::MUTED)));
+            line1_spans.push(Span::styled(
+                fmt_pair(s.stapm_value_w, s.stapm_limit_w, "W"),
+                Style::default()
+                    .fg(ratio_color(gauge_ratio(s.stapm_value_w, s.stapm_limit_w)))
+                    .add_modifier(Modifier::BOLD),
+            ));
+            line1_spans.push(Span::styled(" · ", Style::default().fg(palette::MUTED)));
+        }
+    }
+    line1_spans.extend([
         Span::styled("PPT ", Style::default().fg(palette::MUTED)),
         Span::styled(
             fmt_pair(ppt_v, ppt_l, "W"),
@@ -4397,6 +4833,7 @@ fn draw_tune_telemetry_strip(frame: &mut Frame, area: Rect, app: &App) {
                 .add_modifier(Modifier::BOLD),
         ),
     ]);
+    let line1 = Line::from(line1_spans);
 
     let line2 = Line::from(vec![
         Span::styled("FCLK ", Style::default().fg(palette::MUTED)),
@@ -4574,8 +5011,17 @@ fn draw_tune_param_list(frame: &mut Frame, area: Rect, app: &App, hw: &HardwareC
                     ) => Style::default()
                         .fg(palette::CYAN)
                         .add_modifier(Modifier::BOLD),
-                    (TuneParam::PboTdc | TuneParam::PboEdc, Some(_)) => Style::default()
+                    (
+                        TuneParam::PboTdc
+                        | TuneParam::PboEdc
+                        | TuneParam::ApuTdcSoc
+                        | TuneParam::ApuEdcSoc,
+                        Some(_),
+                    ) => Style::default()
                         .fg(palette::TEAL)
+                        .add_modifier(Modifier::BOLD),
+                    (TuneParam::ApuStapmTime | TuneParam::ApuSlowTime, Some(_)) => Style::default()
+                        .fg(palette::PURPLE)
                         .add_modifier(Modifier::BOLD),
                     (
                         TuneParam::PboTctl | TuneParam::ApuSkinTemp | TuneParam::ApuDgpuSkinTemp,
@@ -5738,40 +6184,182 @@ mod tests {
     #[test]
     fn tune_exposes_apu_dptc_controls_on_apu() {
         let transport = MockTransport::granite_ridge_9700x();
-        let mut driver = transport.read_info().unwrap();
-        driver.codename_id = Codename::Phoenix as u32;
-        let hw = HardwareContext {
-            driver,
-            codename: Codename::Phoenix,
-            cpuid: None,
-            topology: CpuTopology::synthetic(1, 8, 2),
-            capabilities: capabilities_for(Codename::Phoenix).unwrap(),
-        };
+        for codename in [Codename::Lucienne, Codename::Phoenix] {
+            let mut driver = transport.read_info().unwrap();
+            driver.codename_id = codename as u32;
+            let hw = HardwareContext {
+                driver,
+                codename,
+                cpuid: None,
+                topology: CpuTopology::synthetic(1, 8, 2),
+                capabilities: capabilities_for(codename).unwrap(),
+            };
 
-        let mut app = App::new(500);
-        app.active_tab = ViewTab::Tune;
-        let params = app.tune_params(&hw);
-        for expected in [
-            TuneParam::ApuStapm,
-            TuneParam::ApuFast,
-            TuneParam::ApuSlow,
-            TuneParam::ApuApuSlow,
-            TuneParam::ApuSkinTemp,
-            TuneParam::ApuDgpuSkinTemp,
-            TuneParam::ApuPowerMode,
-        ] {
-            assert!(params.contains(&expected), "missing APU control {expected:?}");
-        }
+            let mut app = App::new(500);
+            app.active_tab = ViewTab::Tune;
+            let params = app.tune_params(&hw);
+            for expected in [
+                TuneParam::ApuStapm,
+                TuneParam::ApuStapmTime,
+                TuneParam::ApuFast,
+                TuneParam::ApuSlow,
+                TuneParam::ApuSlowTime,
+                TuneParam::ApuApuSlow,
+                TuneParam::ApuTdcSoc,
+                TuneParam::ApuEdcSoc,
+                TuneParam::ApuSkinTemp,
+                TuneParam::ApuDgpuSkinTemp,
+                TuneParam::ApuPowerMode,
+            ] {
+                assert!(
+                    params.contains(&expected),
+                    "missing APU control {expected:?} on {codename:?}"
+                );
+            }
 
-        // Jump to APU section and render at both sizes
-        app.tune_selected = params
-            .iter()
-            .position(|p| *p == TuneParam::ApuStapm)
-            .unwrap();
-        for (w, h) in [(120u16, 36u16), (80, 24)] {
-            let backend = TestBackend::new(w, h);
-            let mut terminal = Terminal::new(backend).unwrap();
-            terminal.draw(|f| draw_ui(f, &app, &hw)).unwrap();
+            // Populate live APU telemetry and verify live_param_value reads all APU limits
+            app.telemetry = Some(TelemetrySnapshot {
+                codename,
+                table_version: if codename == Codename::Lucienne {
+                    0x0037_0005
+                } else {
+                    0x004C_0006
+                },
+                table_size: 0x8C8,
+                ppt_limit_w: Some(30.0),
+                ppt_value_w: Some(18.0),
+                tdc_limit_a: Some(35.0),
+                tdc_value_a: Some(12.0),
+                edc_limit_a: Some(50.0),
+                edc_value_a: Some(20.0),
+                tctl_limit_c: Some(95.0),
+                tctl_value_c: Some(61.0),
+                stapm_limit_w: Some(25.0),
+                stapm_value_w: Some(15.0),
+                slow_limit_w: Some(28.0),
+                slow_value_w: Some(16.0),
+                apu_slow_limit_w: Some(22.0),
+                apu_slow_value_w: Some(14.0),
+                tdc_soc_limit_a: Some(20.0),
+                tdc_soc_value_a: Some(8.5),
+                edc_soc_limit_a: Some(35.0),
+                edc_soc_value_a: Some(14.0),
+                apu_skin_temp_limit_c: Some(45.0),
+                apu_skin_temp_value_c: Some(39.0),
+                dgpu_skin_temp_limit_c: Some(55.0),
+                dgpu_skin_temp_value_c: Some(42.0),
+                fclk_mhz: Some(1600.0),
+                uclk_mhz: Some(1600.0),
+                mclk_mhz: Some(1600.0),
+                vddcr_soc_v: Some(0.95),
+                vddcr_misc_v: None,
+                cldo_vddp_v: None,
+                cldo_vddg_iod_v: None,
+                cldo_vddg_ccd_v: None,
+            });
+
+            assert_eq!(app.live_param_value(TuneParam::ApuStapm), Some(TuneValue::Int(25)));
+            assert_eq!(app.live_param_value(TuneParam::ApuStapmTime), None);
+            assert_eq!(app.live_param_value(TuneParam::ApuFast), Some(TuneValue::Int(30)));
+            assert_eq!(app.live_param_value(TuneParam::ApuSlow), Some(TuneValue::Int(28)));
+            assert_eq!(app.live_param_value(TuneParam::ApuSlowTime), None);
+            assert_eq!(app.live_param_value(TuneParam::ApuApuSlow), Some(TuneValue::Int(22)));
+            assert_eq!(app.live_param_value(TuneParam::ApuTdcSoc), Some(TuneValue::Int(20)));
+            assert_eq!(app.live_param_value(TuneParam::ApuEdcSoc), Some(TuneValue::Int(35)));
+            assert_eq!(app.live_param_value(TuneParam::ApuSkinTemp), Some(TuneValue::Int(45)));
+            assert_eq!(app.live_param_value(TuneParam::ApuDgpuSkinTemp), Some(TuneValue::Int(55)));
+            assert_eq!(
+                app.live_param_value(TuneParam::ApuPowerMode),
+                Some(TuneValue::PowerMode(None))
+            );
+
+            // Stage EVERY APU parameter and open dry-run preview modal
+            app.staged.insert(TuneParam::ApuStapm, TuneValue::Int(35));
+            app.staged.insert(TuneParam::ApuStapmTime, TuneValue::Int(120));
+            app.staged.insert(TuneParam::ApuFast, TuneValue::Int(45));
+            app.staged.insert(TuneParam::ApuSlow, TuneValue::Int(38));
+            app.staged.insert(TuneParam::ApuSlowTime, TuneValue::Int(10));
+            app.staged.insert(TuneParam::ApuApuSlow, TuneValue::Int(30));
+            app.staged.insert(TuneParam::ApuTdcSoc, TuneValue::Int(25));
+            app.staged.insert(TuneParam::ApuEdcSoc, TuneValue::Int(45));
+            app.staged.insert(TuneParam::ApuSkinTemp, TuneValue::Int(50));
+            app.staged.insert(TuneParam::ApuDgpuSkinTemp, TuneValue::Int(60));
+            app.staged.insert(
+                TuneParam::ApuPowerMode,
+                TuneValue::PowerMode(Some(ApuPowerMode::MaxPerformance)),
+            );
+
+            app.open_staged_dry_run_modal(&transport, &hw);
+            let modal = app
+                .confirm_modal
+                .as_ref()
+                .expect("dry-run modal should open for all 11 APU params");
+            assert_eq!(modal.ops.len(), 11, "expected 11 planned APU ops on {codename:?}");
+            match &modal.action {
+                ConfirmAction::ApplyStaged { apu: Some(req), .. } => {
+                    assert_eq!(
+                        req,
+                        &ApuSetRequest {
+                            stapm_w: Some(35),
+                            stapm_time_s: Some(120),
+                            fast_w: Some(45),
+                            slow_w: Some(38),
+                            slow_time_s: Some(10),
+                            apu_slow_w: Some(30),
+                            tdc_soc_a: Some(25),
+                            edc_soc_a: Some(45),
+                            apu_skin_temp_c: Some(50),
+                            dgpu_skin_temp_c: Some(60),
+                            power_mode: Some(ApuPowerMode::MaxPerformance),
+                        }
+                    );
+                }
+                other => panic!("expected ApplyStaged with ApuSetRequest, got {other:?}"),
+            }
+            // Verify live current enrichment on dry-run ops
+            assert_eq!(modal.ops[0].current.as_deref(), Some("25 W"));
+            assert_eq!(modal.ops[6].current.as_deref(), Some("20 A"));
+            assert_eq!(modal.ops[7].current.as_deref(), Some("35 A"));
+            assert_eq!(modal.ops[8].current.as_deref(), Some("45 C"));
+            assert_eq!(modal.ops[9].current.as_deref(), Some("55 C"));
+
+            // Render Overview, ClocksVolts, and Tune tabs with APU telemetry at both sizes
+            app.confirm_modal = None;
+            app.tune_selected = params
+                .iter()
+                .position(|p| *p == TuneParam::ApuStapm)
+                .unwrap();
+            for (w, h) in [(120u16, 36u16), (80, 24)] {
+                let backend = TestBackend::new(w, h);
+                let mut terminal = Terminal::new(backend).unwrap();
+
+                app.active_tab = ViewTab::Overview;
+                terminal.draw(|f| draw_ui(f, &app, &hw)).unwrap();
+                let overview_text = buffer_text(&terminal);
+                assert!(
+                    overview_text.contains("STAPM"),
+                    "Overview should show STAPM on {codename:?} at {w}x{h}"
+                );
+                assert!(
+                    overview_text.contains("SoCTD"),
+                    "Overview should show SoC TDC on {codename:?} at {w}x{h}"
+                );
+                assert!(
+                    overview_text.contains("ASkin"),
+                    "Overview should show APU Skin on {codename:?} at {w}x{h}"
+                );
+
+                app.active_tab = ViewTab::ClocksVolts;
+                terminal.draw(|f| draw_ui(f, &app, &hw)).unwrap();
+
+                app.active_tab = ViewTab::Tune;
+                terminal.draw(|f| draw_ui(f, &app, &hw)).unwrap();
+                let tune_text = buffer_text(&terminal);
+                assert!(
+                    tune_text.contains("STAPM"),
+                    "Tune telemetry strip should show STAPM on {codename:?} at {w}x{h}"
+                );
+            }
         }
     }
 

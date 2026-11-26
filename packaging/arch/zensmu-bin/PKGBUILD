@@ -2,7 +2,7 @@
 
 pkgname=zensmu-bin
 pkgver=0.1.0
-pkgrel=6
+pkgrel=7
 pkgdesc="Safety-first Rust CLI, live TUI, and unprivileged GUI for AMD Ryzen SMU control and telemetry (prebuilt binary)"
 arch=('x86_64')
 url="https://github.com/brauliobo/zensmu"
