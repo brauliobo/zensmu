@@ -21,19 +21,26 @@ use ratatui::widgets::{
     Wrap,
 };
 use ratatui::{Frame, Terminal};
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::io::{self, Stdout, Write};
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Once;
 use std::time::{Duration, Instant};
+use zensmu_core::config::profile::Profile;
 use zensmu_core::error::Error;
 use zensmu_core::hw::identity::HardwareContext;
+use zensmu_core::ops::apu::{self, ApuSetRequest};
 use zensmu_core::ops::co::{self, CoSnapshot};
-use zensmu_core::ops::pbo::{self, PboStatus};
+use zensmu_core::ops::pbo::{self, PboSetRequest, PboStatus};
 use zensmu_core::ops::pm_table::{self, TelemetrySnapshot};
 use zensmu_core::ops::shaper;
+use zensmu_core::safety::snapshot::{SmuStateSnapshot, SnapshotStore};
+use zensmu_core::session;
 use zensmu_core::transport::SmuTransport;
-use zensmu_core::types::{CurveShaperState, FreqTier};
+use zensmu_core::types::{
+    ApuPowerMode, CurveShaperState, FreqTier, PlannedOp, ShaperTierMargins, TempBand,
+};
 
 /// Minimum allowed telemetry polling interval (ms).
 pub const MIN_INTERVAL_MS: u64 = 100;
@@ -61,6 +68,7 @@ mod palette {
     pub const DIM: Color = Color::Rgb(100, 116, 139);
     pub const BORDER: Color = Color::Rgb(71, 85, 105);
     pub const BAR_BG: Color = Color::Rgb(15, 23, 42);
+    pub const ROW_HL: Color = Color::Rgb(30, 41, 59);
     pub const GAUGE_TRACK: Color = Color::Rgb(51, 65, 85);
     pub const BADGE_FG: Color = Color::Rgb(15, 23, 42);
     pub const POPUP_BG: Color = Color::Rgb(15, 23, 42);
@@ -291,7 +299,7 @@ impl TelemetryHistory {
 }
 
 // ---------------------------------------------------------------------------
-// View state & mailbox load tracking
+// View state, interactive tuning model & mailbox load tracking
 // ---------------------------------------------------------------------------
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -299,6 +307,7 @@ enum ViewTab {
     Overview,
     ClocksVolts,
     CoShaper,
+    Tune,
 }
 
 impl ViewTab {
@@ -306,17 +315,150 @@ impl ViewTab {
         match self {
             Self::Overview => Self::ClocksVolts,
             Self::ClocksVolts => Self::CoShaper,
-            Self::CoShaper => Self::Overview,
+            Self::CoShaper => Self::Tune,
+            Self::Tune => Self::Overview,
         }
     }
 
     fn prev(self) -> Self {
         match self {
-            Self::Overview => Self::CoShaper,
+            Self::Overview => Self::Tune,
             Self::ClocksVolts => Self::Overview,
             Self::CoShaper => Self::ClocksVolts,
+            Self::Tune => Self::CoShaper,
         }
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FlashKind {
+    Info,
+    Success,
+    Warn,
+    Error,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TuneSection {
+    CurveOptimizer,
+    CurveShaper,
+    Pbo,
+    Apu,
+}
+
+impl TuneSection {
+    fn title(self) -> &'static str {
+        match self {
+            Self::CurveOptimizer => "Curve Optimizer",
+            Self::CurveShaper => "Curve Shaper (Zen 5)",
+            Self::Pbo => "PBO Limits & Boost",
+            Self::Apu => "APU DPTC Controls",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+enum TuneParam {
+    CoAll,
+    CoCore(u32),
+    CoIgpu,
+    Shaper { tier: FreqTier, band: TempBand },
+    PboPpt,
+    PboTdc,
+    PboEdc,
+    PboTctl,
+    PboScalar,
+    PboFmax,
+    ApuStapm,
+    ApuFast,
+    ApuSlow,
+    ApuApuSlow,
+    ApuSkinTemp,
+    ApuDgpuSkinTemp,
+    ApuPowerMode,
+}
+
+impl TuneParam {
+    fn section(self) -> TuneSection {
+        match self {
+            Self::CoAll | Self::CoCore(_) | Self::CoIgpu => TuneSection::CurveOptimizer,
+            Self::Shaper { .. } => TuneSection::CurveShaper,
+            Self::PboPpt
+            | Self::PboTdc
+            | Self::PboEdc
+            | Self::PboTctl
+            | Self::PboScalar
+            | Self::PboFmax => TuneSection::Pbo,
+            Self::ApuStapm
+            | Self::ApuFast
+            | Self::ApuSlow
+            | Self::ApuApuSlow
+            | Self::ApuSkinTemp
+            | Self::ApuDgpuSkinTemp
+            | Self::ApuPowerMode => TuneSection::Apu,
+        }
+    }
+
+    fn is_co_or_shaper(self) -> bool {
+        matches!(
+            self,
+            Self::CoAll | Self::CoCore(_) | Self::CoIgpu | Self::Shaper { .. }
+        )
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TuneValue {
+    Int(i32),
+    PowerMode(Option<ApuPowerMode>),
+}
+
+impl TuneValue {
+    fn as_int(self) -> Option<i32> {
+        match self {
+            Self::Int(v) => Some(v),
+            Self::PowerMode(_) => None,
+        }
+    }
+
+    fn as_power_mode(self) -> Option<ApuPowerMode> {
+        match self {
+            Self::PowerMode(m) => m,
+            Self::Int(_) => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+enum TuneRow {
+    SectionHeader(String),
+    InfoBanner(String, Color),
+    Param(TuneParam),
+}
+
+#[derive(Debug, Clone)]
+enum ConfirmAction {
+    ApplyStaged {
+        co_all: Option<i32>,
+        co_cores: Vec<(u32, i32)>,
+        co_igpu: Option<i32>,
+        shaper_tiers: Vec<(FreqTier, ShaperTierMargins)>,
+        pbo: Option<PboSetRequest>,
+        apu: Option<ApuSetRequest>,
+    },
+    Rollback(SmuStateSnapshot),
+    ResetBootBaseline(SmuStateSnapshot),
+    ResetCoZero,
+}
+
+#[derive(Debug, Clone)]
+struct ConfirmModal {
+    title: String,
+    subtitle: String,
+    action: ConfirmAction,
+    ops: Vec<PlannedOp>,
+    scroll: usize,
+    allow_extreme: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -367,6 +509,8 @@ struct App {
     interval_ms: u64,
     sample_count: u64,
     is_root: bool,
+    #[cfg(test)]
+    test_allow_writes: bool,
     telemetry: Option<TelemetrySnapshot>,
     telemetry_error: Option<String>,
     history: TelemetryHistory,
@@ -374,7 +518,13 @@ struct App {
     shaper_state: MailboxState<CurveShaperState>,
     pbo_state: MailboxState<PboStatus>,
     mailbox_note: Option<String>,
-    status_flash: Option<(String, Instant)>,
+    status_flash: Option<(String, FlashKind, Instant)>,
+    // Interactive Tune state (Tab 4)
+    tune_selected: usize,
+    staged: HashMap<TuneParam, TuneValue>,
+    allow_extreme: bool,
+    confirm_modal: Option<ConfirmModal>,
+    snapshot_store: SnapshotStore,
 }
 
 impl App {
@@ -388,6 +538,8 @@ impl App {
             interval_ms: clamped,
             sample_count: 0,
             is_root,
+            #[cfg(test)]
+            test_allow_writes: false,
             telemetry: None,
             telemetry_error: None,
             history: TelemetryHistory::new(HISTORY_CAPACITY),
@@ -396,20 +548,48 @@ impl App {
             pbo_state: MailboxState::Unsupported,
             mailbox_note: None,
             status_flash: None,
+            tune_selected: 0,
+            staged: HashMap::new(),
+            allow_extreme: false,
+            confirm_modal: None,
+            snapshot_store: SnapshotStore::default(),
+        }
+    }
+
+    fn can_write(&self) -> bool {
+        #[cfg(test)]
+        {
+            self.is_root || self.test_allow_writes
+        }
+        #[cfg(not(test))]
+        {
+            self.is_root
         }
     }
 
     fn set_flash(&mut self, msg: impl Into<String>) {
-        self.status_flash = Some((msg.into(), Instant::now()));
+        self.set_flash_kind(msg, FlashKind::Info);
     }
 
-    fn active_flash(&self) -> Option<&str> {
-        let (msg, ts) = self.status_flash.as_ref()?;
-        if ts.elapsed() < Duration::from_secs(3) {
-            Some(msg.as_str())
+    fn set_flash_kind(&mut self, msg: impl Into<String>, kind: FlashKind) {
+        self.status_flash = Some((msg.into(), kind, Instant::now()));
+    }
+
+    fn active_flash(&self) -> Option<(&str, FlashKind)> {
+        let (msg, kind, ts) = self.status_flash.as_ref()?;
+        let ttl = match kind {
+            FlashKind::Info => Duration::from_secs(3),
+            FlashKind::Success | FlashKind::Warn | FlashKind::Error => Duration::from_secs(6),
+        };
+        if ts.elapsed() < ttl {
+            Some((msg.as_str(), *kind))
         } else {
             None
         }
+    }
+
+    fn staged_count(&self) -> usize {
+        self.staged.len()
     }
 
     fn poll_telemetry(&mut self, transport: &dyn SmuTransport, hw: &HardwareContext) {
@@ -440,12 +620,1066 @@ impl App {
         } else {
             self.mailbox_note = None;
         }
+
+        // Remove any staged Curve Shaper points if firmware doesn't expose it
+        if matches!(self.shaper_state, MailboxState::FirmwareUnsupported(_)) {
+            self.staged
+                .retain(|p, _| !matches!(p, TuneParam::Shaper { .. }));
+        }
+
+        self.clamp_tune_selection(hw);
     }
 
     fn has_any_mailbox_data(&self) -> bool {
         self.co_state.as_loaded().is_some()
             || self.shaper_state.as_loaded().is_some()
             || self.pbo_state.as_loaded().is_some()
+    }
+
+    // -----------------------------------------------------------------------
+    // Tune parameter catalog, bounds, live values & stepping
+    // -----------------------------------------------------------------------
+
+    fn build_tune_rows(&self, hw: &HardwareContext) -> Vec<TuneRow> {
+        let caps = &hw.capabilities;
+        let mut rows = Vec::new();
+
+        // 1. Curve Optimizer
+        if caps.set_co_per_core.is_some() || caps.set_co_all_cores.is_some() {
+            let bounds_hint = caps
+                .co_bounds
+                .map(|b| format!("{}..={} (soft >= {})", b.min, b.max, b.soft_min))
+                .unwrap_or_default();
+            rows.push(TuneRow::SectionHeader(format!(
+                "{}  ·  {bounds_hint}",
+                TuneSection::CurveOptimizer.title()
+            )));
+            if caps.set_co_all_cores.is_some() {
+                rows.push(TuneRow::Param(TuneParam::CoAll));
+            }
+            if caps.set_co_per_core.is_some() {
+                for core in &hw.topology.cores {
+                    rows.push(TuneRow::Param(TuneParam::CoCore(core.index)));
+                }
+            }
+            if caps.set_igpu_co.is_some() {
+                rows.push(TuneRow::Param(TuneParam::CoIgpu));
+            }
+        }
+
+        // 2. Curve Shaper (Zen 5)
+        if caps.set_curve_shaper.is_some() {
+            rows.push(TuneRow::SectionHeader(format!(
+                "{}  ·  {}..=+{} (soft >= {})",
+                TuneSection::CurveShaper.title(),
+                shaper::SHAPER_MIN,
+                shaper::SHAPER_MAX,
+                shaper::SHAPER_SOFT_MIN
+            )));
+            if let MailboxState::FirmwareUnsupported(code) = &self.shaper_state {
+                rows.push(TuneRow::InfoBanner(
+                    format!(
+                        "Not exposed by SMU {} ({code}) — skipped",
+                        hw.driver.smu_version
+                    ),
+                    palette::YELLOW,
+                ));
+            } else {
+                for tier in FreqTier::ALL {
+                    for band in TempBand::ALL {
+                        rows.push(TuneRow::Param(TuneParam::Shaper { tier, band }));
+                    }
+                }
+            }
+        }
+
+        // 3. PBO Limits & Boost
+        let has_pbo = caps.set_ppt.is_some()
+            || caps.set_tdc.is_some()
+            || caps.set_edc.is_some()
+            || caps.set_tctl.is_some()
+            || caps.set_pbo_scalar.is_some()
+            || caps.set_fmax.is_some();
+        if has_pbo {
+            rows.push(TuneRow::SectionHeader(format!(
+                "{}  ·  Tctl hard max {}°C",
+                TuneSection::Pbo.title(),
+                pbo::TCTL_MAX_C
+            )));
+            if caps.set_ppt.is_some() {
+                rows.push(TuneRow::Param(TuneParam::PboPpt));
+            }
+            if caps.set_tdc.is_some() {
+                rows.push(TuneRow::Param(TuneParam::PboTdc));
+            }
+            if caps.set_edc.is_some() {
+                rows.push(TuneRow::Param(TuneParam::PboEdc));
+            }
+            if caps.set_tctl.is_some() {
+                rows.push(TuneRow::Param(TuneParam::PboTctl));
+            }
+            if caps.set_pbo_scalar.is_some() {
+                rows.push(TuneRow::Param(TuneParam::PboScalar));
+            }
+            if caps.set_fmax.is_some() {
+                rows.push(TuneRow::Param(TuneParam::PboFmax));
+            }
+        }
+
+        // 4. APU DPTC (automatically shown when set_stapm_limit is Some)
+        if caps.set_stapm_limit.is_some() {
+            rows.push(TuneRow::SectionHeader(format!(
+                "{}  ·  Mobile Power & Thermal",
+                TuneSection::Apu.title()
+            )));
+            rows.push(TuneRow::Param(TuneParam::ApuStapm));
+            if hw.codename.is_apu() && caps.set_ppt.is_some() {
+                rows.push(TuneRow::Param(TuneParam::ApuFast));
+            }
+            if caps.set_slow_limit.is_some() {
+                rows.push(TuneRow::Param(TuneParam::ApuSlow));
+            }
+            if caps.set_apu_slow_limit.is_some() {
+                rows.push(TuneRow::Param(TuneParam::ApuApuSlow));
+            }
+            if caps.set_apu_skin_temp.is_some() {
+                rows.push(TuneRow::Param(TuneParam::ApuSkinTemp));
+            }
+            if caps.set_dgpu_skin_temp.is_some() {
+                rows.push(TuneRow::Param(TuneParam::ApuDgpuSkinTemp));
+            }
+            if caps.set_max_performance.is_some() || caps.set_power_saving.is_some() {
+                rows.push(TuneRow::Param(TuneParam::ApuPowerMode));
+            }
+        }
+
+        rows
+    }
+
+    fn tune_params(&self, hw: &HardwareContext) -> Vec<TuneParam> {
+        self.build_tune_rows(hw)
+            .into_iter()
+            .filter_map(|r| match r {
+                TuneRow::Param(p) => Some(p),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn clamp_tune_selection(&mut self, hw: &HardwareContext) {
+        let count = self.tune_params(hw).len();
+        if count == 0 {
+            self.tune_selected = 0;
+        } else if self.tune_selected >= count {
+            self.tune_selected = count - 1;
+        }
+    }
+
+    fn selected_tune_param(&self, hw: &HardwareContext) -> Option<TuneParam> {
+        let params = self.tune_params(hw);
+        params.get(self.tune_selected).copied()
+    }
+
+    /// Returns the known live value of `param` from hardware telemetry / mailbox readback.
+    fn live_param_value(&self, param: TuneParam) -> Option<TuneValue> {
+        match param {
+            TuneParam::CoAll => {
+                let snap = self.co_state.as_loaded()?;
+                let first = snap.cores.first()?.margin;
+                if snap.cores.iter().all(|c| c.margin == first) {
+                    Some(TuneValue::Int(i32::from(first)))
+                } else {
+                    None
+                }
+            }
+            TuneParam::CoCore(idx) => self
+                .co_state
+                .as_loaded()
+                .and_then(|s| s.cores.iter().find(|c| c.core_index == idx))
+                .map(|c| TuneValue::Int(i32::from(c.margin))),
+            TuneParam::CoIgpu => self
+                .co_state
+                .as_loaded()
+                .and_then(|s| s.igpu)
+                .map(|v| TuneValue::Int(i32::from(v))),
+            TuneParam::Shaper { tier, band } => {
+                let cs = self.shaper_state.as_loaded()?;
+                let t = cs.tier(tier);
+                let v = match band {
+                    TempBand::Low => t.low,
+                    TempBand::Med => t.med,
+                    TempBand::High => t.high,
+                };
+                Some(TuneValue::Int(i32::from(v)))
+            }
+            TuneParam::PboPpt => self
+                .telemetry
+                .as_ref()
+                .and_then(|t| t.ppt_limit_w)
+                .filter(|v| v.is_finite())
+                .map(|v| TuneValue::Int(v.round() as i32))
+                .or_else(|| {
+                    self.pbo_state
+                        .as_loaded()
+                        .and_then(|p| p.fused.ppt_w)
+                        .map(|v| TuneValue::Int(v as i32))
+                }),
+            TuneParam::PboTdc => self
+                .telemetry
+                .as_ref()
+                .and_then(|t| t.tdc_limit_a)
+                .filter(|v| v.is_finite())
+                .map(|v| TuneValue::Int(v.round() as i32))
+                .or_else(|| {
+                    self.pbo_state
+                        .as_loaded()
+                        .and_then(|p| p.fused.vdd_tdc_a)
+                        .map(|v| TuneValue::Int(v as i32))
+                }),
+            TuneParam::PboEdc => self
+                .telemetry
+                .as_ref()
+                .and_then(|t| t.edc_limit_a)
+                .filter(|v| v.is_finite())
+                .map(|v| TuneValue::Int(v.round() as i32))
+                .or_else(|| {
+                    self.pbo_state
+                        .as_loaded()
+                        .and_then(|p| p.fused.edc_a)
+                        .map(|v| TuneValue::Int(v as i32))
+                }),
+            TuneParam::PboTctl => self
+                .telemetry
+                .as_ref()
+                .and_then(|t| t.tctl_limit_c)
+                .filter(|v| v.is_finite())
+                .map(|v| TuneValue::Int(v.round() as i32)),
+            TuneParam::PboScalar => self
+                .pbo_state
+                .as_loaded()
+                .and_then(|p| p.scalar)
+                .filter(|v| v.is_finite() && *v >= 1.0)
+                .map(|v| TuneValue::Int(v.round().clamp(1.0, 10.0) as i32)),
+            TuneParam::PboFmax => self
+                .pbo_state
+                .as_loaded()
+                .and_then(|p| p.fmax_mhz)
+                .map(|v| TuneValue::Int(v as i32)),
+            TuneParam::ApuStapm => self
+                .pbo_state
+                .as_loaded()
+                .and_then(|p| p.fused.slow_w)
+                .map(|v| TuneValue::Int(v as i32)),
+            TuneParam::ApuFast => self
+                .pbo_state
+                .as_loaded()
+                .and_then(|p| p.fused.fast_w)
+                .map(|v| TuneValue::Int(v as i32))
+                .or_else(|| {
+                    self.telemetry
+                        .as_ref()
+                        .and_then(|t| t.ppt_limit_w)
+                        .filter(|v| v.is_finite())
+                        .map(|v| TuneValue::Int(v.round() as i32))
+                }),
+            TuneParam::ApuSlow => self
+                .pbo_state
+                .as_loaded()
+                .and_then(|p| p.fused.slow_w)
+                .map(|v| TuneValue::Int(v as i32)),
+            TuneParam::ApuApuSlow => self
+                .pbo_state
+                .as_loaded()
+                .and_then(|p| p.fused.apu_slow_w)
+                .map(|v| TuneValue::Int(v as i32)),
+            TuneParam::ApuSkinTemp | TuneParam::ApuDgpuSkinTemp => None,
+            TuneParam::ApuPowerMode => Some(TuneValue::PowerMode(None)),
+        }
+    }
+
+    /// Fallback starting value when stepping a parameter whose live value is unknown.
+    fn default_step_base(&self, param: TuneParam) -> TuneValue {
+        match param {
+            TuneParam::CoAll
+            | TuneParam::CoCore(_)
+            | TuneParam::CoIgpu
+            | TuneParam::Shaper { .. } => TuneValue::Int(0),
+            TuneParam::PboPpt => TuneValue::Int(88),
+            TuneParam::PboTdc => TuneValue::Int(75),
+            TuneParam::PboEdc => TuneValue::Int(150),
+            TuneParam::PboTctl => TuneValue::Int(85),
+            TuneParam::PboScalar => TuneValue::Int(1),
+            TuneParam::PboFmax => TuneValue::Int(5000),
+            TuneParam::ApuStapm => TuneValue::Int(28),
+            TuneParam::ApuFast => TuneValue::Int(45),
+            TuneParam::ApuSlow => TuneValue::Int(35),
+            TuneParam::ApuApuSlow => TuneValue::Int(30),
+            TuneParam::ApuSkinTemp => TuneValue::Int(45),
+            TuneParam::ApuDgpuSkinTemp => TuneValue::Int(55),
+            TuneParam::ApuPowerMode => TuneValue::PowerMode(None),
+        }
+    }
+
+    fn param_int_bounds(&self, param: TuneParam, hw: &HardwareContext) -> (i32, i32) {
+        match param {
+            TuneParam::CoAll | TuneParam::CoCore(_) => hw
+                .capabilities
+                .co_bounds
+                .map(|b| (b.min, b.max))
+                .unwrap_or((-30, 30)),
+            TuneParam::CoIgpu => (co::IGPU_CO_MIN, co::IGPU_CO_MAX),
+            TuneParam::Shaper { .. } => (i32::from(shaper::SHAPER_MIN), i32::from(shaper::SHAPER_MAX)),
+            TuneParam::PboPpt => (pbo::PPT_MIN_W as i32, pbo::PPT_MAX_W as i32),
+            TuneParam::PboTdc => (pbo::TDC_MIN_A as i32, pbo::TDC_MAX_A as i32),
+            TuneParam::PboEdc => (pbo::EDC_MIN_A as i32, pbo::EDC_MAX_A as i32),
+            TuneParam::PboTctl => (pbo::TCTL_MIN_C as i32, pbo::TCTL_MAX_C as i32),
+            TuneParam::PboScalar => (pbo::SCALAR_MIN as i32, pbo::SCALAR_MAX as i32),
+            TuneParam::PboFmax => (pbo::FMAX_MIN_MHZ as i32, pbo::FMAX_MAX_MHZ as i32),
+            TuneParam::ApuStapm
+            | TuneParam::ApuFast
+            | TuneParam::ApuSlow
+            | TuneParam::ApuApuSlow => (apu::APU_POWER_MIN_W as i32, apu::APU_POWER_MAX_W as i32),
+            TuneParam::ApuSkinTemp | TuneParam::ApuDgpuSkinTemp => (
+                apu::APU_SKIN_TEMP_MIN_C as i32,
+                apu::APU_SKIN_TEMP_MAX_C as i32,
+            ),
+            TuneParam::ApuPowerMode => (0, 2),
+        }
+    }
+
+    fn param_steps(param: TuneParam) -> (i32, i32) {
+        match param {
+            TuneParam::CoAll
+            | TuneParam::CoCore(_)
+            | TuneParam::CoIgpu
+            | TuneParam::Shaper { .. } => (1, 5),
+            TuneParam::PboPpt => (5, 25),
+            TuneParam::PboTdc => (5, 20),
+            TuneParam::PboEdc => (5, 25),
+            TuneParam::PboTctl => (1, 5),
+            TuneParam::PboScalar => (1, 2),
+            TuneParam::PboFmax => (25, 100),
+            TuneParam::ApuStapm
+            | TuneParam::ApuFast
+            | TuneParam::ApuSlow
+            | TuneParam::ApuApuSlow => (1, 5),
+            TuneParam::ApuSkinTemp | TuneParam::ApuDgpuSkinTemp => (1, 5),
+            TuneParam::ApuPowerMode => (1, 1),
+        }
+    }
+
+    fn param_exceeds_soft_limit(
+        &self,
+        param: TuneParam,
+        val: TuneValue,
+        hw: &HardwareContext,
+    ) -> bool {
+        let Some(v) = val.as_int() else {
+            return false;
+        };
+        match param {
+            TuneParam::CoAll | TuneParam::CoCore(_) => hw
+                .capabilities
+                .co_bounds
+                .is_some_and(|b| v < b.soft_min),
+            TuneParam::CoIgpu => v < co::IGPU_CO_SOFT_MIN,
+            TuneParam::Shaper { .. } => v < i32::from(shaper::SHAPER_SOFT_MIN),
+            TuneParam::PboPpt => v > pbo::PPT_SOFT_MAX_W as i32,
+            TuneParam::PboTdc => v > pbo::TDC_SOFT_MAX_A as i32,
+            TuneParam::PboEdc => v > pbo::EDC_SOFT_MAX_A as i32,
+            TuneParam::PboTctl => false, // hard max 95 C always enforced
+            TuneParam::PboScalar => v > pbo::SCALAR_SOFT_MAX as i32,
+            TuneParam::PboFmax => self
+                .pbo_state
+                .as_loaded()
+                .and_then(|p| p.fmax_mhz)
+                .is_some_and(|cur| v > (cur.saturating_add(pbo::FMAX_SOFT_DELTA_MHZ)) as i32),
+            TuneParam::ApuStapm | TuneParam::ApuSlow | TuneParam::ApuApuSlow => {
+                v > apu::APU_POWER_SOFT_MAX_W as i32
+            }
+            TuneParam::ApuFast => v > apu::APU_FAST_POWER_SOFT_MAX_W as i32,
+            TuneParam::ApuSkinTemp | TuneParam::ApuDgpuSkinTemp => {
+                v > apu::APU_SKIN_TEMP_SOFT_MAX_C as i32
+            }
+            TuneParam::ApuPowerMode => false,
+        }
+    }
+
+    fn adjust_selected_param(&mut self, hw: &HardwareContext, delta_sign: i32, coarse: bool) {
+        let Some(param) = self.selected_tune_param(hw) else {
+            return;
+        };
+
+        let live = self.live_param_value(param);
+        let current = self
+            .staged
+            .get(&param)
+            .copied()
+            .or(live)
+            .unwrap_or_else(|| self.default_step_base(param));
+
+        let next = match (param, current) {
+            (TuneParam::ApuPowerMode, TuneValue::PowerMode(cur_mode)) => {
+                let idx = match cur_mode {
+                    None => 0i32,
+                    Some(ApuPowerMode::MaxPerformance) => 1,
+                    Some(ApuPowerMode::PowerSaving) => 2,
+                };
+                let next_idx = (idx + delta_sign).clamp(0, 2);
+                let next_mode = match next_idx {
+                    1 => Some(ApuPowerMode::MaxPerformance),
+                    2 => Some(ApuPowerMode::PowerSaving),
+                    _ => None,
+                };
+                TuneValue::PowerMode(next_mode)
+            }
+            (_, TuneValue::Int(cur_int)) => {
+                let (fine, big) = Self::param_steps(param);
+                let step = if coarse { big } else { fine };
+                let (min_v, max_v) = self.param_int_bounds(param, hw);
+                let next_v = cur_int.saturating_add(delta_sign * step).clamp(min_v, max_v);
+                TuneValue::Int(next_v)
+            }
+            _ => return,
+        };
+
+        if live == Some(next) || (param == TuneParam::ApuPowerMode && next == TuneValue::PowerMode(None)) {
+            self.staged.remove(&param);
+        } else {
+            self.staged.insert(param, next);
+        }
+    }
+
+    fn reset_selected_param(&mut self, hw: &HardwareContext, to_zero_if_co: bool) {
+        let Some(param) = self.selected_tune_param(hw) else {
+            return;
+        };
+        let live = self.live_param_value(param);
+        if to_zero_if_co && param.is_co_or_shaper() {
+            if live == Some(TuneValue::Int(0)) {
+                self.staged.remove(&param);
+            } else {
+                self.staged.insert(param, TuneValue::Int(0));
+            }
+        } else {
+            self.staged.remove(&param);
+        }
+    }
+
+    fn jump_tune_section(&mut self, hw: &HardwareContext, forward: bool) {
+        let params = self.tune_params(hw);
+        if params.is_empty() {
+            return;
+        }
+        let cur_idx = self.tune_selected.min(params.len() - 1);
+        let cur_sec = params[cur_idx].section();
+
+        // Collect first index of each distinct section in order
+        let mut starts: Vec<(TuneSection, usize)> = Vec::new();
+        for (i, p) in params.iter().enumerate() {
+            let s = p.section();
+            if starts.last().map(|(ls, _)| *ls) != Some(s) {
+                starts.push((s, i));
+            }
+        }
+        if starts.len() <= 1 {
+            return;
+        }
+        let sec_pos = starts
+            .iter()
+            .position(|(s, _)| *s == cur_sec)
+            .unwrap_or(0);
+        let next_pos = if forward {
+            (sec_pos + 1) % starts.len()
+        } else if sec_pos == 0 {
+            starts.len() - 1
+        } else {
+            sec_pos - 1
+        };
+        self.tune_selected = starts[next_pos].1;
+    }
+
+    // -----------------------------------------------------------------------
+    // Dry-run preview & safe execution (flocked transport + snapshot + verify)
+    // -----------------------------------------------------------------------
+
+    fn current_co_all_summary(&self) -> Option<String> {
+        let snap = self.co_state.as_loaded()?;
+        let first = snap.cores.first()?;
+        if snap.cores.iter().all(|c| c.margin == first.margin) {
+            Some(format_signed_margin(first.margin))
+        } else {
+            Some("mixed".to_string())
+        }
+    }
+
+    fn enrich_pbo_op_current(&self, op: &mut PlannedOp) {
+        if op.current.is_some() {
+            return;
+        }
+        if op.description.starts_with("Set PPT") {
+            op.current = self
+                .live_param_value(TuneParam::PboPpt)
+                .and_then(TuneValue::as_int)
+                .map(|v| format!("{v} W"));
+        } else if op.description.starts_with("Set TDC") {
+            op.current = self
+                .live_param_value(TuneParam::PboTdc)
+                .and_then(TuneValue::as_int)
+                .map(|v| format!("{v} A"));
+        } else if op.description.starts_with("Set EDC") {
+            op.current = self
+                .live_param_value(TuneParam::PboEdc)
+                .and_then(TuneValue::as_int)
+                .map(|v| format!("{v} A"));
+        } else if op.description.starts_with("Set Tctl") {
+            op.current = self
+                .live_param_value(TuneParam::PboTctl)
+                .and_then(TuneValue::as_int)
+                .map(|v| format!("{v} C"));
+        } else if op.description.starts_with("Set PBO scalar") {
+            op.current = self
+                .live_param_value(TuneParam::PboScalar)
+                .and_then(TuneValue::as_int)
+                .map(|v| format!("{v}x"));
+        } else if op.description.starts_with("Set Fmax") {
+            op.current = self
+                .live_param_value(TuneParam::PboFmax)
+                .and_then(TuneValue::as_int)
+                .map(|v| format!("{v} MHz"));
+        }
+    }
+
+    fn open_staged_dry_run_modal(
+        &mut self,
+        transport: &dyn SmuTransport,
+        hw: &HardwareContext,
+    ) {
+        if self.staged.is_empty() {
+            self.set_flash_kind("No staged changes to preview", FlashKind::Warn);
+            return;
+        }
+
+        let co_all = self.staged.get(&TuneParam::CoAll).and_then(|v| v.as_int());
+        let mut co_cores: Vec<(u32, i32)> = Vec::new();
+        for core in &hw.topology.cores {
+            if let Some(val) = self
+                .staged
+                .get(&TuneParam::CoCore(core.index))
+                .and_then(|v| v.as_int())
+            {
+                co_cores.push((core.index, val));
+            }
+        }
+        let co_igpu = self.staged.get(&TuneParam::CoIgpu).and_then(|v| v.as_int());
+
+        let mut shaper_tiers: Vec<(FreqTier, ShaperTierMargins)> = Vec::new();
+        if hw.capabilities.set_curve_shaper.is_some()
+            && !matches!(self.shaper_state, MailboxState::FirmwareUnsupported(_))
+        {
+            let live_cs = self.shaper_state.as_loaded().copied().unwrap_or_default();
+            for tier in FreqTier::ALL {
+                let s_low = self
+                    .staged
+                    .get(&TuneParam::Shaper {
+                        tier,
+                        band: TempBand::Low,
+                    })
+                    .and_then(|v| v.as_int());
+                let s_med = self
+                    .staged
+                    .get(&TuneParam::Shaper {
+                        tier,
+                        band: TempBand::Med,
+                    })
+                    .and_then(|v| v.as_int());
+                let s_high = self
+                    .staged
+                    .get(&TuneParam::Shaper {
+                        tier,
+                        band: TempBand::High,
+                    })
+                    .and_then(|v| v.as_int());
+                if s_low.is_some() || s_med.is_some() || s_high.is_some() {
+                    let base = live_cs.tier(tier);
+                    let margins = ShaperTierMargins {
+                        low: s_low.map(|v| v as i8).unwrap_or(base.low),
+                        med: s_med.map(|v| v as i8).unwrap_or(base.med),
+                        high: s_high.map(|v| v as i8).unwrap_or(base.high),
+                    };
+                    shaper_tiers.push((tier, margins));
+                }
+            }
+        }
+
+        let pbo_req = PboSetRequest {
+            ppt_w: self
+                .staged
+                .get(&TuneParam::PboPpt)
+                .and_then(|v| v.as_int())
+                .map(|v| v as u32),
+            tdc_a: self
+                .staged
+                .get(&TuneParam::PboTdc)
+                .and_then(|v| v.as_int())
+                .map(|v| v as u32),
+            edc_a: self
+                .staged
+                .get(&TuneParam::PboEdc)
+                .and_then(|v| v.as_int())
+                .map(|v| v as u32),
+            tctl_c: self
+                .staged
+                .get(&TuneParam::PboTctl)
+                .and_then(|v| v.as_int())
+                .map(|v| v as u32),
+            scalar: self
+                .staged
+                .get(&TuneParam::PboScalar)
+                .and_then(|v| v.as_int())
+                .map(|v| v as u32),
+            fmax_mhz: self
+                .staged
+                .get(&TuneParam::PboFmax)
+                .and_then(|v| v.as_int())
+                .map(|v| v as u32),
+        };
+        let has_pbo = pbo_req.ppt_w.is_some()
+            || pbo_req.tdc_a.is_some()
+            || pbo_req.edc_a.is_some()
+            || pbo_req.tctl_c.is_some()
+            || pbo_req.scalar.is_some()
+            || pbo_req.fmax_mhz.is_some();
+
+        let apu_req = ApuSetRequest {
+            stapm_w: self
+                .staged
+                .get(&TuneParam::ApuStapm)
+                .and_then(|v| v.as_int())
+                .map(|v| v as u32),
+            fast_w: self
+                .staged
+                .get(&TuneParam::ApuFast)
+                .and_then(|v| v.as_int())
+                .map(|v| v as u32),
+            slow_w: self
+                .staged
+                .get(&TuneParam::ApuSlow)
+                .and_then(|v| v.as_int())
+                .map(|v| v as u32),
+            apu_slow_w: self
+                .staged
+                .get(&TuneParam::ApuApuSlow)
+                .and_then(|v| v.as_int())
+                .map(|v| v as u32),
+            apu_skin_temp_c: self
+                .staged
+                .get(&TuneParam::ApuSkinTemp)
+                .and_then(|v| v.as_int())
+                .map(|v| v as u32),
+            dgpu_skin_temp_c: self
+                .staged
+                .get(&TuneParam::ApuDgpuSkinTemp)
+                .and_then(|v| v.as_int())
+                .map(|v| v as u32),
+            power_mode: self
+                .staged
+                .get(&TuneParam::ApuPowerMode)
+                .and_then(|v| v.as_power_mode()),
+            ..Default::default()
+        };
+        let has_apu = apu_req.stapm_w.is_some()
+            || apu_req.fast_w.is_some()
+            || apu_req.slow_w.is_some()
+            || apu_req.apu_slow_w.is_some()
+            || apu_req.apu_skin_temp_c.is_some()
+            || apu_req.dgpu_skin_temp_c.is_some()
+            || apu_req.power_mode.is_some();
+
+        // Check Fmax soft delta in dry-run (since pbo::set_pbo skips live get_fmax in dry_run)
+        if let Some(fmax) = pbo_req.fmax_mhz {
+            if !self.allow_extreme {
+                if let Some(cur) = self.pbo_state.as_loaded().and_then(|p| p.fmax_mhz) {
+                    if fmax > cur.saturating_add(pbo::FMAX_SOFT_DELTA_MHZ) {
+                        self.set_flash_kind(
+                            format!(
+                                "Extreme blocked: fmax {fmax} > {} MHz (press 'x' for Allow Extreme)",
+                                cur.saturating_add(pbo::FMAX_SOFT_DELTA_MHZ)
+                            ),
+                            FlashKind::Error,
+                        );
+                        return;
+                    }
+                }
+            }
+        }
+
+        let allow_extreme = self.allow_extreme;
+        let plan_res: zensmu_core::Result<Vec<PlannedOp>> = (|| {
+            let mut ops = Vec::new();
+            if let Some(m) = co_all {
+                let mut v = co::set_co_all(transport, hw, m, allow_extreme, true)?;
+                for op in &mut v {
+                    if op.current.is_none() {
+                        op.current = self.current_co_all_summary();
+                    }
+                }
+                ops.extend(v);
+            }
+            if !co_cores.is_empty() {
+                let mut v = co::set_co_cores(transport, hw, &co_cores, allow_extreme, true)?;
+                for (op, &(idx, _)) in v.iter_mut().zip(co_cores.iter()) {
+                    if op.current.is_none() {
+                        op.current = self
+                            .live_param_value(TuneParam::CoCore(idx))
+                            .and_then(TuneValue::as_int)
+                            .map(|m| format_signed_margin(m as i16));
+                    }
+                }
+                ops.extend(v);
+            }
+            if let Some(m) = co_igpu {
+                let mut op = co::set_igpu_co(transport, hw, m, allow_extreme, true)?;
+                if op.current.is_none() {
+                    op.current = self
+                        .live_param_value(TuneParam::CoIgpu)
+                        .and_then(TuneValue::as_int)
+                        .map(|v| format_signed_margin(v as i16));
+                }
+                ops.push(op);
+            }
+            for &(tier, margins) in &shaper_tiers {
+                let mut op =
+                    shaper::set_curve_shaper_tier(transport, hw, tier, margins, allow_extreme, true)?;
+                if op.current.is_none() {
+                    op.current = self.shaper_state.as_loaded().map(|cs| {
+                        let cur = cs.tier(tier);
+                        format!("low={},med={},high={}", cur.low, cur.med, cur.high)
+                    });
+                }
+                ops.push(op);
+            }
+            if has_pbo {
+                let mut v = pbo::set_pbo(transport, hw, &pbo_req, allow_extreme, true)?;
+                for op in &mut v {
+                    self.enrich_pbo_op_current(op);
+                }
+                ops.extend(v);
+            }
+            if has_apu {
+                let v = apu::set_apu(transport, hw, &apu_req, allow_extreme, true)?;
+                ops.extend(v);
+            }
+            Ok(ops)
+        })();
+
+        match plan_res {
+            Ok(ops) if ops.is_empty() => {
+                self.set_flash_kind("No SMU operations to apply", FlashKind::Warn);
+            }
+            Ok(ops) => {
+                self.confirm_modal = Some(ConfirmModal {
+                    title: " Dry-Run Preview — Apply Staged Tuning ".to_string(),
+                    subtitle: format!(
+                        "{} SMU operation(s) validated · dry-run passed · zero writes sent yet",
+                        ops.len()
+                    ),
+                    action: ConfirmAction::ApplyStaged {
+                        co_all,
+                        co_cores,
+                        co_igpu,
+                        shaper_tiers,
+                        pbo: has_pbo.then_some(pbo_req),
+                        apu: has_apu.then_some(apu_req),
+                    },
+                    ops,
+                    scroll: 0,
+                    allow_extreme,
+                });
+            }
+            Err(Error::ExtremeValueBlocked {
+                field,
+                value,
+                threshold,
+            }) => {
+                self.set_flash_kind(
+                    format!(
+                        "Blocked: {field}={value} violates soft limit {threshold} (press 'x' for Extreme)"
+                    ),
+                    FlashKind::Error,
+                );
+            }
+            Err(err) => {
+                self.set_flash_kind(format!("Dry-run failed: {err}"), FlashKind::Error);
+            }
+        }
+    }
+
+    fn open_snapshot_restore_modal(
+        &mut self,
+        transport: &dyn SmuTransport,
+        hw: &HardwareContext,
+        boot_baseline: bool,
+    ) {
+        let (label, loaded) = if boot_baseline {
+            (
+                "boot-baseline.json",
+                self.snapshot_store.load_boot_baseline(),
+            )
+        } else {
+            ("last-state.json", self.snapshot_store.load_last_state())
+        };
+
+        let snap = match loaded {
+            Ok(Some(s)) => s,
+            Ok(None) => {
+                self.set_flash_kind(format!("No {label} snapshot found"), FlashKind::Warn);
+                return;
+            }
+            Err(err) => {
+                self.set_flash_kind(format!("Failed to load {label}: {err}"), FlashKind::Error);
+                return;
+            }
+        };
+
+        match session::apply_snapshot(transport, hw, &snap, true, true) {
+            Ok(ops) if ops.is_empty() => {
+                self.set_flash_kind(
+                    format!("Hardware already matches {label}"),
+                    FlashKind::Info,
+                );
+            }
+            Ok(ops) => {
+                let (title, action) = if boot_baseline {
+                    (
+                        " Dry-Run Preview — Reset to Boot Baseline ".to_string(),
+                        ConfirmAction::ResetBootBaseline(snap),
+                    )
+                } else {
+                    (
+                        " Dry-Run Preview — Rollback to Last State ".to_string(),
+                        ConfirmAction::Rollback(snap),
+                    )
+                };
+                self.confirm_modal = Some(ConfirmModal {
+                    title,
+                    subtitle: format!(
+                        "Restoring {label} · {} SMU operation(s) planned",
+                        ops.len()
+                    ),
+                    action,
+                    ops,
+                    scroll: 0,
+                    allow_extreme: true,
+                });
+            }
+            Err(err) => {
+                self.set_flash_kind(
+                    format!("Snapshot dry-run failed: {err}"),
+                    FlashKind::Error,
+                );
+            }
+        }
+    }
+
+    fn open_reset_co_zero_modal(
+        &mut self,
+        transport: &dyn SmuTransport,
+        hw: &HardwareContext,
+    ) {
+        let plan_res: zensmu_core::Result<Vec<PlannedOp>> = (|| {
+            let mut ops = Vec::new();
+            if hw.capabilities.set_co_all_cores.is_some() {
+                let mut v = co::set_co_all(transport, hw, 0, false, true)?;
+                for op in &mut v {
+                    if op.current.is_none() {
+                        op.current = self.current_co_all_summary();
+                    }
+                }
+                ops.extend(v);
+            } else if hw.capabilities.set_co_per_core.is_some() {
+                let pairs: Vec<(u32, i32)> = hw.topology.cores.iter().map(|c| (c.index, 0)).collect();
+                let mut v = co::set_co_cores(transport, hw, &pairs, false, true)?;
+                for (op, &(idx, _)) in v.iter_mut().zip(pairs.iter()) {
+                    if op.current.is_none() {
+                        op.current = self
+                            .live_param_value(TuneParam::CoCore(idx))
+                            .and_then(TuneValue::as_int)
+                            .map(|m| format_signed_margin(m as i16));
+                    }
+                }
+                ops.extend(v);
+            } else {
+                return Err(Error::UnsupportedCapability {
+                    capability: "curve_optimizer",
+                    codename: hw.codename.display_name().to_string(),
+                });
+            }
+
+            if hw.capabilities.set_igpu_co.is_some() {
+                let mut op = co::set_igpu_co(transport, hw, 0, false, true)?;
+                if op.current.is_none() {
+                    op.current = self
+                        .live_param_value(TuneParam::CoIgpu)
+                        .and_then(TuneValue::as_int)
+                        .map(|v| format_signed_margin(v as i16));
+                }
+                ops.push(op);
+            }
+            Ok(ops)
+        })();
+
+        match plan_res {
+            Ok(ops) => {
+                self.confirm_modal = Some(ConfirmModal {
+                    title: " Dry-Run Preview — Reset Curve Optimizer to 0 ".to_string(),
+                    subtitle: format!(
+                        "{} SMU operation(s) to reset CO margins to 0",
+                        ops.len()
+                    ),
+                    action: ConfirmAction::ResetCoZero,
+                    ops,
+                    scroll: 0,
+                    allow_extreme: false,
+                });
+            }
+            Err(err) => {
+                self.set_flash_kind(format!("CO reset unavailable: {err}"), FlashKind::Error);
+            }
+        }
+    }
+
+    fn execute_confirmed_modal(
+        &mut self,
+        transport: &dyn SmuTransport,
+        hw: &HardwareContext,
+    ) {
+        let Some(modal) = self.confirm_modal.take() else {
+            return;
+        };
+
+        if !self.can_write() {
+            self.set_flash_kind(
+                "Refused: root required to write SMU (relaunch with sudo zensmu top)",
+                FlashKind::Error,
+            );
+            return;
+        }
+
+        // Capture pre-change snapshot and persist boot-baseline + last-state best-effort
+        if let Ok(pre) = session::capture_snapshot(transport, hw) {
+            let _ = self.snapshot_store.ensure_boot_baseline(&pre);
+            let _ = self.snapshot_store.save_last_state(&pre);
+        }
+
+        let exec_res: zensmu_core::Result<usize> = match &modal.action {
+            ConfirmAction::ApplyStaged {
+                co_all,
+                co_cores,
+                co_igpu,
+                shaper_tiers,
+                pbo,
+                apu,
+            } => (|| {
+                let mut applied = 0usize;
+                if let Some(m) = *co_all {
+                    applied += co::set_co_all(transport, hw, m, modal.allow_extreme, false)?.len();
+                }
+                if !co_cores.is_empty() {
+                    applied +=
+                        co::set_co_cores(transport, hw, co_cores, modal.allow_extreme, false)?
+                            .len();
+                }
+                if let Some(m) = *co_igpu {
+                    co::set_igpu_co(transport, hw, m, modal.allow_extreme, false)?;
+                    applied += 1;
+                }
+                for &(tier, margins) in shaper_tiers {
+                    shaper::set_curve_shaper_tier(
+                        transport,
+                        hw,
+                        tier,
+                        margins,
+                        modal.allow_extreme,
+                        false,
+                    )?;
+                    applied += 1;
+                }
+                if let Some(req) = pbo {
+                    applied += pbo::set_pbo(transport, hw, req, modal.allow_extreme, false)?.len();
+                }
+                if let Some(req) = apu {
+                    applied += apu::set_apu(transport, hw, req, modal.allow_extreme, false)?.len();
+                }
+                Ok(applied)
+            })(),
+            ConfirmAction::Rollback(snap) | ConfirmAction::ResetBootBaseline(snap) => {
+                session::apply_snapshot(transport, hw, snap, true, false).map(|ops| ops.len())
+            }
+            ConfirmAction::ResetCoZero => (|| {
+                let mut applied = 0usize;
+                if hw.capabilities.set_co_all_cores.is_some() {
+                    applied += co::set_co_all(transport, hw, 0, false, false)?.len();
+                } else if hw.capabilities.set_co_per_core.is_some() {
+                    let pairs: Vec<(u32, i32)> =
+                        hw.topology.cores.iter().map(|c| (c.index, 0)).collect();
+                    applied += co::set_co_cores(transport, hw, &pairs, false, false)?.len();
+                }
+                if hw.capabilities.set_igpu_co.is_some() {
+                    co::set_igpu_co(transport, hw, 0, false, false)?;
+                    applied += 1;
+                }
+                Ok(applied)
+            })(),
+        };
+
+        // Always refresh live mailbox + telemetry right after write attempts
+        self.refresh_mailbox(transport, hw);
+        self.poll_telemetry(transport, hw);
+
+        match exec_res {
+            Ok(n) => {
+                match modal.action {
+                    ConfirmAction::ResetCoZero => {
+                        self.staged.retain(|p, _| {
+                            !matches!(p, TuneParam::CoAll | TuneParam::CoCore(_) | TuneParam::CoIgpu)
+                        });
+                    }
+                    _ => {
+                        self.staged.clear();
+                    }
+                }
+                self.set_flash_kind(
+                    format!("Applied {n} SMU operation(s) & verified"),
+                    FlashKind::Success,
+                );
+            }
+            Err(err) => {
+                self.set_flash_kind(format!("SMU apply failed: {err}"), FlashKind::Error);
+            }
+        }
+    }
+
+    fn save_live_profile(&mut self, transport: &dyn SmuTransport, hw: &HardwareContext) {
+        let path = if self.is_root {
+            PathBuf::from("/etc/zensmu/top-saved.toml")
+        } else {
+            PathBuf::from("/tmp/zensmu-top-profile.toml")
+        };
+
+        match session::capture_snapshot(transport, hw)
+            .and_then(|snap| Profile::from_snapshot(&snap).save(&path))
+        {
+            Ok(()) => {
+                self.set_flash_kind(
+                    format!("Saved profile: {}", path.display()),
+                    FlashKind::Success,
+                );
+            }
+            Err(err) => {
+                self.set_flash_kind(format!("Save failed: {err}"), FlashKind::Error);
+            }
+        }
     }
 
     /// Handle a key press. Returns `true` when the application should exit.
@@ -463,35 +1697,75 @@ impl App {
             return true;
         }
 
+        // Modal key handling takes highest precedence (live telemetry keeps ticking in run_tui!)
+        if self.confirm_modal.is_some() {
+            match key.code {
+                KeyCode::Char('y') | KeyCode::Char('Y') | KeyCode::Enter => {
+                    self.execute_confirmed_modal(transport, hw);
+                }
+                KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => {
+                    self.confirm_modal = None;
+                    self.set_flash("Dry-run cancelled (no SMU writes sent)");
+                }
+                KeyCode::Up | KeyCode::Char('k') => {
+                    if let Some(m) = self.confirm_modal.as_mut() {
+                        m.scroll = m.scroll.saturating_sub(1);
+                    }
+                }
+                KeyCode::Down | KeyCode::Char('j') => {
+                    if let Some(m) = self.confirm_modal.as_mut() {
+                        let max_scroll = m.ops.len().saturating_sub(1);
+                        m.scroll = (m.scroll + 1).min(max_scroll);
+                    }
+                }
+                _ => {}
+            }
+            return false;
+        }
+
+        // Global keys
         match key.code {
             KeyCode::Char('q') | KeyCode::Char('Q') => return true,
             KeyCode::Char('?') => {
                 self.show_help = !self.show_help;
+                return false;
             }
             KeyCode::Esc => {
                 if self.show_help {
                     self.show_help = false;
                 }
+                return false;
             }
-            KeyCode::Tab | KeyCode::Right | KeyCode::Char('l') => {
+            KeyCode::Tab => {
                 self.show_help = false;
                 self.active_tab = self.active_tab.next();
+                return false;
             }
-            KeyCode::BackTab | KeyCode::Left | KeyCode::Char('h') => {
+            KeyCode::BackTab => {
                 self.show_help = false;
                 self.active_tab = self.active_tab.prev();
+                return false;
             }
             KeyCode::Char('1') => {
                 self.show_help = false;
                 self.active_tab = ViewTab::Overview;
+                return false;
             }
             KeyCode::Char('2') => {
                 self.show_help = false;
                 self.active_tab = ViewTab::ClocksVolts;
+                return false;
             }
             KeyCode::Char('3') => {
                 self.show_help = false;
                 self.active_tab = ViewTab::CoShaper;
+                return false;
+            }
+            KeyCode::Char('4') | KeyCode::Char('t') => {
+                self.show_help = false;
+                self.active_tab = ViewTab::Tune;
+                self.clamp_tune_selection(hw);
+                return false;
             }
             KeyCode::Char('p') | KeyCode::Char('P') | KeyCode::Char(' ') => {
                 self.paused = !self.paused;
@@ -500,8 +1774,9 @@ impl App {
                 } else {
                     "Telemetry resumed"
                 });
+                return false;
             }
-            KeyCode::Char('r') | KeyCode::Char('R') => {
+            KeyCode::Char('r') => {
                 self.poll_telemetry(transport, hw);
                 self.refresh_mailbox(transport, hw);
                 if self.mailbox_note.is_some() {
@@ -509,17 +1784,126 @@ impl App {
                 } else {
                     self.set_flash("SMU mailbox & telemetry refreshed");
                 }
+                return false;
             }
             KeyCode::Char('+') | KeyCode::Char('=') => {
                 self.interval_ms = adjust_interval_ms(self.interval_ms, true);
                 self.set_flash(format!("Interval: {}ms", self.interval_ms));
+                return false;
             }
             KeyCode::Char('-') | KeyCode::Char('_') => {
                 self.interval_ms = adjust_interval_ms(self.interval_ms, false);
                 self.set_flash(format!("Interval: {}ms", self.interval_ms));
+                return false;
             }
             _ => {}
         }
+
+        if self.show_help {
+            return false;
+        }
+
+        // Tab-specific controls
+        if self.active_tab == ViewTab::Tune {
+            let shifted = key.modifiers.contains(KeyModifiers::SHIFT);
+            match key.code {
+                KeyCode::Up | KeyCode::Char('k') => {
+                    self.tune_selected = self.tune_selected.saturating_sub(1);
+                }
+                KeyCode::Down | KeyCode::Char('j') => {
+                    let count = self.tune_params(hw).len();
+                    if count > 0 {
+                        self.tune_selected = (self.tune_selected + 1).min(count - 1);
+                    }
+                }
+                KeyCode::Char('[') => {
+                    self.jump_tune_section(hw, false);
+                }
+                KeyCode::Char(']') => {
+                    self.jump_tune_section(hw, true);
+                }
+                KeyCode::Char('H') | KeyCode::PageDown => {
+                    self.adjust_selected_param(hw, -1, true);
+                }
+                KeyCode::Char('L') | KeyCode::PageUp => {
+                    self.adjust_selected_param(hw, 1, true);
+                }
+                KeyCode::Left => {
+                    self.adjust_selected_param(hw, -1, shifted);
+                }
+                KeyCode::Right => {
+                    self.adjust_selected_param(hw, 1, shifted);
+                }
+                KeyCode::Char('h') => {
+                    self.adjust_selected_param(hw, -1, false);
+                }
+                KeyCode::Char('l') => {
+                    self.adjust_selected_param(hw, 1, false);
+                }
+                KeyCode::Backspace => {
+                    self.reset_selected_param(hw, false);
+                }
+                KeyCode::Char('0') => {
+                    self.reset_selected_param(hw, true);
+                }
+                KeyCode::Char('u') => {
+                    let n = self.staged.len();
+                    self.staged.clear();
+                    if n > 0 {
+                        self.set_flash(format!("Discarded {n} staged change(s)"));
+                    } else {
+                        self.set_flash("No staged changes to discard");
+                    }
+                }
+                KeyCode::Char('x') => {
+                    self.allow_extreme = !self.allow_extreme;
+                    if self.allow_extreme {
+                        self.set_flash_kind(
+                            "Allow Extreme ON (hard bounds & 95°C Tctl still enforced)",
+                            FlashKind::Warn,
+                        );
+                    } else {
+                        self.set_flash("Allow Extreme OFF (soft safety thresholds active)");
+                    }
+                }
+                KeyCode::Char('a') | KeyCode::Enter => {
+                    self.open_staged_dry_run_modal(transport, hw);
+                }
+                KeyCode::Char('R') => {
+                    self.open_snapshot_restore_modal(transport, hw, false);
+                }
+                KeyCode::Char('B') => {
+                    self.open_snapshot_restore_modal(transport, hw, true);
+                }
+                KeyCode::Char('Z') => {
+                    self.open_reset_co_zero_modal(transport, hw);
+                }
+                KeyCode::Char('s') => {
+                    self.save_live_profile(transport, hw);
+                }
+                _ => {}
+            }
+        } else {
+            match key.code {
+                KeyCode::Right | KeyCode::Char('l') => {
+                    self.active_tab = self.active_tab.next();
+                }
+                KeyCode::Left | KeyCode::Char('h') => {
+                    self.active_tab = self.active_tab.prev();
+                }
+                KeyCode::Char('R') => {
+                    self.poll_telemetry(transport, hw);
+                    self.refresh_mailbox(transport, hw);
+                    if self.mailbox_note.is_some() {
+                        self.set_flash("Telemetry refreshed (SMU mailbox requires sudo)");
+                    } else {
+                        self.set_flash("SMU mailbox & telemetry refreshed");
+                    }
+                }
+                _ => {}
+            }
+        }
+
         false
     }
 }
@@ -813,11 +2197,14 @@ fn draw_ui(frame: &mut Frame, app: &App, hw: &HardwareContext) {
         ViewTab::Overview => draw_overview_tab(frame, chunks[1], app, hw),
         ViewTab::ClocksVolts => draw_clocks_volts_tab(frame, chunks[1], app, hw),
         ViewTab::CoShaper => draw_co_shaper_tab(frame, chunks[1], app, hw),
+        ViewTab::Tune => draw_tune_tab(frame, chunks[1], app, hw),
     }
 
     draw_footer(frame, chunks[2], app);
 
-    if app.show_help {
+    if let Some(ref modal) = app.confirm_modal {
+        draw_confirm_modal(frame, root, app, modal);
+    } else if app.show_help {
         draw_help_popup(frame, root);
     }
 }
@@ -879,6 +2266,17 @@ fn draw_header(frame: &mut Frame, area: Rect, app: &App, hw: &HardwareContext) {
         Span::raw(" "),
     ];
 
+    if app.allow_extreme {
+        right_spans.push(Span::styled(
+            " EXTREME ",
+            Style::default()
+                .fg(palette::BADGE_FG)
+                .bg(palette::ORANGE)
+                .add_modifier(Modifier::BOLD),
+        ));
+        right_spans.push(Span::raw(" "));
+    }
+
     if app.paused {
         right_spans.push(Span::styled(
             " PAUSED ",
@@ -905,9 +2303,10 @@ fn draw_header(frame: &mut Frame, area: Rect, app: &App, hw: &HardwareContext) {
             .add_modifier(Modifier::BOLD),
     ));
 
+    let right_w = if inner.width < 92 { 44 } else { 62 };
     let row1_split = Layout::default()
         .direction(Direction::Horizontal)
-        .constraints([Constraint::Min(20), Constraint::Length(56)])
+        .constraints([Constraint::Min(18), Constraint::Length(right_w)])
         .split(rows[0]);
 
     // Trim left spans gracefully via Paragraph truncation
@@ -938,15 +2337,55 @@ fn draw_header(frame: &mut Frame, area: Rect, app: &App, hw: &HardwareContext) {
         }
     };
 
-    let tabs_line = Line::from(vec![
-        tab_span("[1:Overview]", app.active_tab == ViewTab::Overview),
+    let compact = inner.width < 100;
+    let staged_n = app.staged_count();
+    let tune_active = app.active_tab == ViewTab::Tune;
+    let mut tabs_spans = vec![
+        tab_span(
+            if compact { "[1:Over]" } else { "[1:Overview]" },
+            app.active_tab == ViewTab::Overview,
+        ),
         Span::raw(" "),
-        tab_span("[2:Clocks & Volts]", app.active_tab == ViewTab::ClocksVolts),
+        tab_span(
+            if compact { "[2:Clocks]" } else { "[2:Clocks & Volts]" },
+            app.active_tab == ViewTab::ClocksVolts,
+        ),
         Span::raw(" "),
-        tab_span("[3:CO & Shaper]", app.active_tab == ViewTab::CoShaper),
+        tab_span(
+            if compact { "[3:CO/Shp]" } else { "[3:CO & Shaper]" },
+            app.active_tab == ViewTab::CoShaper,
+        ),
         Span::raw(" "),
-        tab_span("[?:Help]", app.show_help),
-    ]);
+    ];
+
+    if tune_active {
+        tabs_spans.push(Span::styled(
+            " [4:Tune] ",
+            Style::default()
+                .fg(palette::BADGE_FG)
+                .bg(palette::TEAL)
+                .add_modifier(Modifier::BOLD),
+        ));
+    } else {
+        tabs_spans.push(Span::styled(
+            " [4:Tune] ",
+            Style::default().fg(palette::MUTED),
+        ));
+    }
+    if staged_n > 0 {
+        tabs_spans.push(Span::styled(
+            format!(" *{staged_n} "),
+            Style::default()
+                .fg(palette::BADGE_FG)
+                .bg(palette::ORANGE)
+                .add_modifier(Modifier::BOLD),
+        ));
+    }
+
+    tabs_spans.push(Span::raw(" "));
+    tabs_spans.push(tab_span("[?:Help]", app.show_help));
+
+    let tabs_line = Line::from(tabs_spans);
 
     let row2_right = if let Some(ref err) = app.telemetry_error {
         Line::from(vec![Span::styled(
@@ -955,7 +2394,11 @@ fn draw_header(frame: &mut Frame, area: Rect, app: &App, hw: &HardwareContext) {
         )])
     } else if app.mailbox_note.is_some() {
         Line::from(vec![Span::styled(
-            "PM telemetry live · sudo for mailbox",
+            if compact {
+                "sudo for SMU"
+            } else {
+                "PM telemetry live · sudo for mailbox"
+            },
             Style::default().fg(palette::YELLOW),
         )])
     } else {
@@ -968,9 +2411,10 @@ fn draw_header(frame: &mut Frame, area: Rect, app: &App, hw: &HardwareContext) {
         ])
     };
 
+    let row2_right_w = if compact { 16 } else { 36 };
     let row2_split = Layout::default()
         .direction(Direction::Horizontal)
-        .constraints([Constraint::Min(40), Constraint::Length(38)])
+        .constraints([Constraint::Min(46), Constraint::Length(row2_right_w)])
         .split(rows[1]);
 
     frame.render_widget(
@@ -994,40 +2438,78 @@ fn draw_footer(frame: &mut Frame, area: Rect, app: &App) {
                     .fg(palette::CYAN)
                     .add_modifier(Modifier::BOLD),
             ),
-            Span::styled(format!(":{desc}  "), Style::default().fg(palette::MUTED)),
+            Span::styled(format!(":{desc} "), Style::default().fg(palette::MUTED)),
         ]
     };
 
     let mut left = vec![Span::raw(" ")];
-    left.extend(keycap("q", "Quit"));
-    left.extend(keycap("Tab/1-3", "Views"));
-    left.extend(keycap("p", "Pause"));
-    left.extend(keycap("r", "Refresh SMU"));
-    left.extend(keycap("+/-", "Interval"));
-    left.extend(keycap("?", "Help"));
+    if app.confirm_modal.is_some() {
+        left.extend(keycap("y/Enter", "Confirm & Apply"));
+        left.extend(keycap("n/Esc", "Cancel"));
+        left.extend(keycap("↑↓", "Scroll"));
+    } else if app.active_tab == ViewTab::Tune {
+        left.extend(keycap("↑↓", "Sel"));
+        left.extend(keycap("←→/hl", "Step"));
+        left.extend(keycap("H/L", "Coarse"));
+        left.extend(keycap("a/Enter", "DryRun"));
+        left.extend(keycap("u", "Undo"));
+        left.extend(keycap("x", "Ext"));
+        left.extend(keycap("R/B/Z", "Reset"));
+        left.extend(keycap("s", "Save"));
+    } else {
+        left.extend(keycap("q", "Quit"));
+        left.extend(keycap("Tab/1-4", "Views"));
+        left.extend(keycap("t", "Tune"));
+        left.extend(keycap("p", "Pause"));
+        left.extend(keycap("r", "Refresh"));
+        left.extend(keycap("+/-", "Int"));
+        left.extend(keycap("?", "Help"));
+    }
 
-    let right_text = if let Some(flash) = app.active_flash() {
+    let right_text = if let Some((flash, kind)) = app.active_flash() {
+        let color = match kind {
+            FlashKind::Info => palette::TEAL,
+            FlashKind::Success => palette::GREEN,
+            FlashKind::Warn => palette::YELLOW,
+            FlashKind::Error => palette::RED,
+        };
         Line::from(vec![
             Span::styled(
                 flash,
-                Style::default()
-                    .fg(palette::TEAL)
-                    .add_modifier(Modifier::BOLD),
+                Style::default().fg(color).add_modifier(Modifier::BOLD),
             ),
             Span::raw(" "),
         ])
-    } else {
-        Line::from(vec![
-            Span::styled(
+    } else if app.active_tab == ViewTab::Tune {
+        let staged_n = app.staged_count();
+        if staged_n > 0 {
+            Line::from(vec![Span::styled(
+                format!("{staged_n} staged · Enter to preview "),
+                Style::default()
+                    .fg(palette::ORANGE)
+                    .add_modifier(Modifier::BOLD),
+            )])
+        } else {
+            Line::from(vec![Span::styled(
                 format!("hist {}s ", app.history.ppt_w.samples.len()),
                 Style::default().fg(palette::DIM),
-            ),
-        ])
+            )])
+        }
+    } else {
+        Line::from(vec![Span::styled(
+            format!("hist {}s ", app.history.ppt_w.samples.len()),
+            Style::default().fg(palette::DIM),
+        )])
     };
 
+    let right_w = if app.active_flash().is_some() {
+        (area.width / 2).clamp(24, 58)
+    } else {
+        28
+    };
     let cols = Layout::default()
         .direction(Direction::Horizontal)
-        .constraints([Constraint::Min(40), Constraint::Length(38)])
+        .constraints([Constraint::Min(30), Constraint::Length(right_w)])
         .split(area);
 
     frame.render_widget(
@@ -2211,11 +3693,897 @@ fn fmt_bool_opt(b: Option<bool>) -> &'static str {
 }
 
 // ---------------------------------------------------------------------------
+// Tab 4: Interactive Tune (with always-live telemetry strip)
+// ---------------------------------------------------------------------------
+
+fn format_tune_param_label(param: TuneParam, hw: &HardwareContext) -> String {
+    match param {
+        TuneParam::CoAll => "CO All-Core".to_string(),
+        TuneParam::CoCore(idx) => {
+            if let Some(c) = hw.topology.core(idx) {
+                format!("CO Core {idx} (CCD{}·L{})", c.ccd, c.core_in_ccd)
+            } else {
+                format!("CO Core {idx}")
+            }
+        }
+        TuneParam::CoIgpu => "CO iGPU".to_string(),
+        TuneParam::Shaper { tier, band } => {
+            format!(
+                "Shaper {:<4} / {:<4} °C",
+                tier.label().to_ascii_uppercase(),
+                band.label()
+            )
+        }
+        TuneParam::PboPpt => "PPT Limit (W)".to_string(),
+        TuneParam::PboTdc => "TDC Limit (A)".to_string(),
+        TuneParam::PboEdc => "EDC Limit (A)".to_string(),
+        TuneParam::PboTctl => "Tctl Max (°C)".to_string(),
+        TuneParam::PboScalar => "PBO Scalar (x)".to_string(),
+        TuneParam::PboFmax => "Fmax Boost (MHz)".to_string(),
+        TuneParam::ApuStapm => "STAPM Limit (W)".to_string(),
+        TuneParam::ApuFast => "Fast Limit (W)".to_string(),
+        TuneParam::ApuSlow => "Slow Limit (W)".to_string(),
+        TuneParam::ApuApuSlow => "APU Slow (W)".to_string(),
+        TuneParam::ApuSkinTemp => "APU Skin Temp (°C)".to_string(),
+        TuneParam::ApuDgpuSkinTemp => "dGPU Skin Temp (°C)".to_string(),
+        TuneParam::ApuPowerMode => "Power Mode".to_string(),
+    }
+}
+
+fn format_tune_value(param: TuneParam, val: TuneValue) -> String {
+    match (param, val) {
+        (
+            TuneParam::CoAll
+            | TuneParam::CoCore(_)
+            | TuneParam::CoIgpu
+            | TuneParam::Shaper { .. },
+            TuneValue::Int(v),
+        ) => format_signed_margin(v as i16),
+        (
+            TuneParam::PboPpt
+            | TuneParam::ApuStapm
+            | TuneParam::ApuFast
+            | TuneParam::ApuSlow
+            | TuneParam::ApuApuSlow,
+            TuneValue::Int(v),
+        ) => format!("{v} W"),
+        (TuneParam::PboTdc | TuneParam::PboEdc, TuneValue::Int(v)) => format!("{v} A"),
+        (
+            TuneParam::PboTctl | TuneParam::ApuSkinTemp | TuneParam::ApuDgpuSkinTemp,
+            TuneValue::Int(v),
+        ) => format!("{v} °C"),
+        (TuneParam::PboScalar, TuneValue::Int(v)) => format!("{v}x"),
+        (TuneParam::PboFmax, TuneValue::Int(v)) => format!("{v} MHz"),
+        (TuneParam::ApuPowerMode, TuneValue::PowerMode(mode)) => match mode {
+            None => "auto".to_string(),
+            Some(ApuPowerMode::MaxPerformance) => "max-performance".to_string(),
+            Some(ApuPowerMode::PowerSaving) => "power-saving".to_string(),
+        },
+        (_, TuneValue::Int(v)) => v.to_string(),
+        (_, TuneValue::PowerMode(_)) => "—".to_string(),
+    }
+}
+
+fn format_live_param_display(app: &App, param: TuneParam) -> String {
+    if param == TuneParam::CoAll {
+        if let Some(snap) = app.co_state.as_loaded() {
+            if let Some(first) = snap.cores.first() {
+                if snap.cores.iter().all(|c| c.margin == first.margin) {
+                    return format_signed_margin(first.margin);
+                }
+                return "mixed".to_string();
+            }
+        }
+        return "—".to_string();
+    }
+    app.live_param_value(param)
+        .map(|v| format_tune_value(param, v))
+        .unwrap_or_else(|| "—".to_string())
+}
+
+fn param_bounds_summary(app: &App, param: TuneParam, hw: &HardwareContext) -> String {
+    match param {
+        TuneParam::CoAll | TuneParam::CoCore(_) => hw
+            .capabilities
+            .co_bounds
+            .map(|b| format!("{}..={} (soft >= {})", b.min, b.max, b.soft_min))
+            .unwrap_or_else(|| "—".to_string()),
+        TuneParam::CoIgpu => format!(
+            "{}..={} (soft >= {})",
+            co::IGPU_CO_MIN,
+            co::IGPU_CO_MAX,
+            co::IGPU_CO_SOFT_MIN
+        ),
+        TuneParam::Shaper { .. } => format!(
+            "{}..=+{} (soft >= {})",
+            shaper::SHAPER_MIN,
+            shaper::SHAPER_MAX,
+            shaper::SHAPER_SOFT_MIN
+        ),
+        TuneParam::PboPpt => format!(
+            "{}..={} W (soft <= {} W)",
+            pbo::PPT_MIN_W,
+            pbo::PPT_MAX_W,
+            pbo::PPT_SOFT_MAX_W
+        ),
+        TuneParam::PboTdc => format!(
+            "{}..={} A (soft <= {} A)",
+            pbo::TDC_MIN_A,
+            pbo::TDC_MAX_A,
+            pbo::TDC_SOFT_MAX_A
+        ),
+        TuneParam::PboEdc => format!(
+            "{}..={} A (soft <= {} A)",
+            pbo::EDC_MIN_A,
+            pbo::EDC_MAX_A,
+            pbo::EDC_SOFT_MAX_A
+        ),
+        TuneParam::PboTctl => format!(
+            "{}..={} °C (hard ceiling)",
+            pbo::TCTL_MIN_C,
+            pbo::TCTL_MAX_C
+        ),
+        TuneParam::PboScalar => format!(
+            "{}..={}x (soft <= {}x)",
+            pbo::SCALAR_MIN,
+            pbo::SCALAR_MAX,
+            pbo::SCALAR_SOFT_MAX
+        ),
+        TuneParam::PboFmax => {
+            if let Some(cur) = app.pbo_state.as_loaded().and_then(|p| p.fmax_mhz) {
+                format!(
+                    "{}..={} MHz (soft <= {})",
+                    pbo::FMAX_MIN_MHZ,
+                    pbo::FMAX_MAX_MHZ,
+                    cur.saturating_add(pbo::FMAX_SOFT_DELTA_MHZ)
+                )
+            } else {
+                format!("{}..={} MHz", pbo::FMAX_MIN_MHZ, pbo::FMAX_MAX_MHZ)
+            }
+        }
+        TuneParam::ApuStapm | TuneParam::ApuSlow | TuneParam::ApuApuSlow => format!(
+            "{}..={} W (soft <= {} W)",
+            apu::APU_POWER_MIN_W,
+            apu::APU_POWER_MAX_W,
+            apu::APU_POWER_SOFT_MAX_W
+        ),
+        TuneParam::ApuFast => format!(
+            "{}..={} W (soft <= {} W)",
+            apu::APU_POWER_MIN_W,
+            apu::APU_POWER_MAX_W,
+            apu::APU_FAST_POWER_SOFT_MAX_W
+        ),
+        TuneParam::ApuSkinTemp | TuneParam::ApuDgpuSkinTemp => format!(
+            "{}..={} °C (soft <= {} °C)",
+            apu::APU_SKIN_TEMP_MIN_C,
+            apu::APU_SKIN_TEMP_MAX_C,
+            apu::APU_SKIN_TEMP_SOFT_MAX_C
+        ),
+        TuneParam::ApuPowerMode => "auto / max-performance / power-saving".to_string(),
+    }
+}
+
+fn draw_tune_tab(frame: &mut Frame, area: Rect, app: &App, hw: &HardwareContext) {
+    let rows = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Length(4), Constraint::Min(8)])
+        .split(area);
+
+    draw_tune_telemetry_strip(frame, rows[0], app);
+
+    if rows[1].width >= 94 {
+        let cols = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([Constraint::Percentage(62), Constraint::Percentage(38)])
+            .split(rows[1]);
+        draw_tune_param_list(frame, cols[0], app, hw);
+        draw_tune_inspector_pane(frame, cols[1], app, hw);
+    } else {
+        let split = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Min(6), Constraint::Length(4)])
+            .split(rows[1]);
+        draw_tune_param_list(frame, split[0], app, hw);
+        draw_tune_compact_bar(frame, split[1], app, hw);
+    }
+}
+
+fn draw_tune_telemetry_strip(frame: &mut Frame, area: Rect, app: &App) {
+    let mut title_spans = vec![Span::styled(
+        " Live Telemetry ",
+        Style::default()
+            .fg(palette::CYAN)
+            .add_modifier(Modifier::BOLD),
+    )];
+    if app.paused {
+        title_spans.push(Span::styled(
+            "[PAUSED] ",
+            Style::default()
+                .fg(palette::YELLOW)
+                .add_modifier(Modifier::BOLD),
+        ));
+    }
+    if app.allow_extreme {
+        title_spans.push(Span::styled(
+            "[EXTREME ON] ",
+            Style::default()
+                .fg(palette::ORANGE)
+                .add_modifier(Modifier::BOLD),
+        ));
+    }
+    let staged_n = app.staged_count();
+    if staged_n > 0 {
+        title_spans.push(Span::styled(
+            format!("[*{staged_n} STAGED] "),
+            Style::default()
+                .fg(palette::BADGE_FG)
+                .bg(palette::ORANGE)
+                .add_modifier(Modifier::BOLD),
+        ));
+    }
+    if !app.can_write() {
+        title_spans.push(Span::styled(
+            "[READ-ONLY · sudo to write] ",
+            Style::default().fg(palette::YELLOW),
+        ));
+    }
+
+    let block = styled_block(Line::from(title_spans), palette::CYAN).padding(Padding::horizontal(1));
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+
+    if inner.height == 0 || inner.width == 0 {
+        return;
+    }
+
+    let snap = app.telemetry.as_ref();
+    let ppt_v = snap.and_then(|s| s.ppt_value_w);
+    let ppt_l = snap.and_then(|s| s.ppt_limit_w);
+    let tdc_v = snap.and_then(|s| s.tdc_value_a);
+    let tdc_l = snap.and_then(|s| s.tdc_limit_a);
+    let edc_v = snap.and_then(|s| s.edc_value_a);
+    let edc_l = snap.and_then(|s| s.edc_limit_a);
+    let tctl_v = snap.and_then(|s| s.tctl_value_c);
+    let tctl_l = snap.and_then(|s| s.tctl_limit_c);
+    let fclk = snap.and_then(|s| s.fclk_mhz);
+    let uclk = snap.and_then(|s| s.uclk_mhz);
+    let mclk = snap.and_then(|s| s.mclk_mhz);
+    let soc = snap.and_then(|s| s.vddcr_soc_v);
+
+    let fmt_pair = |val: Option<f32>, lim: Option<f32>, unit: &str| -> String {
+        match (val, lim) {
+            (Some(v), Some(l)) if v.is_finite() && l.is_finite() => {
+                format!("{v:.1}/{l:.0}{unit}")
+            }
+            (Some(v), _) if v.is_finite() => format!("{v:.1}/—{unit}"),
+            _ => format!("—/—{unit}"),
+        }
+    };
+
+    let line1 = Line::from(vec![
+        Span::styled("PPT ", Style::default().fg(palette::MUTED)),
+        Span::styled(
+            fmt_pair(ppt_v, ppt_l, "W"),
+            Style::default()
+                .fg(ratio_color(gauge_ratio(ppt_v, ppt_l)))
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(" · TDC ", Style::default().fg(palette::MUTED)),
+        Span::styled(
+            fmt_pair(tdc_v, tdc_l, "A"),
+            Style::default()
+                .fg(ratio_color(gauge_ratio(tdc_v, tdc_l)))
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(" · EDC ", Style::default().fg(palette::MUTED)),
+        Span::styled(
+            fmt_pair(edc_v, edc_l, "A"),
+            Style::default()
+                .fg(ratio_color(gauge_ratio(edc_v, edc_l)))
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(" · Tctl ", Style::default().fg(palette::MUTED)),
+        Span::styled(
+            fmt_pair(tctl_v, tctl_l, "°C"),
+            Style::default()
+                .fg(thermal_color(tctl_v, tctl_l))
+                .add_modifier(Modifier::BOLD),
+        ),
+    ]);
+
+    let line2 = Line::from(vec![
+        Span::styled("FCLK ", Style::default().fg(palette::MUTED)),
+        Span::styled(
+            format_opt_f32(fclk, 0, ""),
+            Style::default().fg(palette::TEAL).add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(" · UCLK ", Style::default().fg(palette::MUTED)),
+        Span::styled(
+            format_opt_f32(uclk, 0, ""),
+            Style::default().fg(palette::CYAN).add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(" · MCLK ", Style::default().fg(palette::MUTED)),
+        Span::styled(
+            format_opt_f32(mclk, 0, "MHz"),
+            Style::default()
+                .fg(palette::PURPLE)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(" · SOC ", Style::default().fg(palette::MUTED)),
+        Span::styled(
+            format_opt_f32(soc, 3, "V"),
+            Style::default()
+                .fg(soc_voltage_color(soc))
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(
+            format!(" · #{}", app.sample_count),
+            Style::default().fg(palette::DIM),
+        ),
+    ]);
+
+    let lines = if inner.height >= 2 {
+        vec![line1, line2]
+    } else {
+        vec![line1]
+    };
+    frame.render_widget(Paragraph::new(lines), inner);
+}
+
+fn draw_tune_param_list(frame: &mut Frame, area: Rect, app: &App, hw: &HardwareContext) {
+    let tune_rows = app.build_tune_rows(hw);
+    let param_count = tune_rows
+        .iter()
+        .filter(|r| matches!(r, TuneRow::Param(_)))
+        .count();
+
+    let title = format!(
+        " Interactive SMU Controls ({} params · [/] Section · ←→/h/l Step) ",
+        param_count
+    );
+    let block = styled_block(title, palette::TEAL);
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+
+    if inner.height == 0 || inner.width == 0 {
+        return;
+    }
+
+    if tune_rows.is_empty() {
+        frame.render_widget(
+            Paragraph::new(Span::styled(
+                " No writable SMU capabilities detected on this CPU.",
+                Style::default().fg(palette::MUTED),
+            )),
+            inner,
+        );
+        return;
+    }
+
+    // Reserve 1 line for table header
+    let visible_rows = inner.height.saturating_sub(1).max(1) as usize;
+
+    // Locate which row index corresponds to app.tune_selected
+    let clamped_sel = if param_count == 0 {
+        0
+    } else {
+        app.tune_selected.min(param_count - 1)
+    };
+    let mut selected_row_idx = 0usize;
+    let mut seen_params = 0usize;
+    for (row_idx, row) in tune_rows.iter().enumerate() {
+        if matches!(row, TuneRow::Param(_)) {
+            if seen_params == clamped_sel {
+                selected_row_idx = row_idx;
+                break;
+            }
+            seen_params += 1;
+        }
+    }
+
+    // Compute scroll window keeping the selected row (and its immediate section header) visible
+    let scroll_top = if tune_rows.len() <= visible_rows {
+        0
+    } else {
+        let half = visible_rows / 2;
+        let desired = selected_row_idx.saturating_sub(half);
+        desired.min(tune_rows.len().saturating_sub(visible_rows))
+    };
+
+    let mut table_rows: Vec<Row<'_>> = Vec::with_capacity(visible_rows);
+    let mut param_ordinal = 0usize;
+    for (row_idx, row) in tune_rows.iter().enumerate() {
+        let is_selected = match row {
+            TuneRow::Param(_) => {
+                let matched = param_ordinal == clamped_sel;
+                param_ordinal += 1;
+                matched
+            }
+            _ => false,
+        };
+
+        if row_idx < scroll_top || table_rows.len() >= visible_rows {
+            continue;
+        }
+
+        match row {
+            TuneRow::SectionHeader(header_text) => {
+                table_rows.push(
+                    Row::new(vec![
+                        Cell::from(format!("── {header_text}")).style(
+                            Style::default()
+                                .fg(palette::TEAL)
+                                .add_modifier(Modifier::BOLD),
+                        ),
+                        Cell::from(""),
+                        Cell::from(""),
+                    ])
+                    .style(Style::default().bg(palette::BAR_BG)),
+                );
+            }
+            TuneRow::InfoBanner(msg, color) => {
+                table_rows.push(Row::new(vec![
+                    Cell::from(format!("  ! {msg}")).style(Style::default().fg(*color)),
+                    Cell::from("skipped").style(Style::default().fg(palette::DIM)),
+                    Cell::from(""),
+                ]));
+            }
+            TuneRow::Param(param) => {
+                let label = format_tune_param_label(*param, hw);
+                let live_str = format_live_param_display(app, *param);
+                let staged_val = app.staged.get(param).copied();
+
+                let prefix = if is_selected { "▸ " } else { "  " };
+                let label_style = if is_selected {
+                    Style::default()
+                        .fg(palette::CYAN)
+                        .add_modifier(Modifier::BOLD)
+                } else if staged_val.is_some() {
+                    Style::default()
+                        .fg(palette::FG)
+                        .add_modifier(Modifier::BOLD)
+                } else {
+                    Style::default().fg(palette::FG)
+                };
+
+                let live_style = match (*param, app.live_param_value(*param)) {
+                    (
+                        TuneParam::CoAll
+                        | TuneParam::CoCore(_)
+                        | TuneParam::CoIgpu
+                        | TuneParam::Shaper { .. },
+                        Some(TuneValue::Int(v)),
+                    ) => Style::default().fg(margin_color(v as i16)),
+                    _ => Style::default().fg(palette::MUTED),
+                };
+
+                let staged_cell = if let Some(sv) = staged_val {
+                    let exceeds = app.param_exceeds_soft_limit(*param, sv, hw);
+                    let suffix = if exceeds && !app.allow_extreme {
+                        " [!soft]"
+                    } else if exceeds {
+                        " [EXT]"
+                    } else {
+                        " *"
+                    };
+                    let col = if exceeds && !app.allow_extreme {
+                        palette::RED
+                    } else {
+                        palette::ORANGE
+                    };
+                    Cell::from(format!("→ {}{suffix}", format_tune_value(*param, sv)))
+                        .style(Style::default().fg(col).add_modifier(Modifier::BOLD))
+                } else {
+                    Cell::from("—").style(Style::default().fg(palette::DIM))
+                };
+
+                let mut r = Row::new(vec![
+                    Cell::from(format!("{prefix}{label}")).style(label_style),
+                    Cell::from(format!("{live_str:>10}")).style(live_style),
+                    staged_cell,
+                ]);
+                if is_selected {
+                    r = r.style(Style::default().bg(palette::ROW_HL));
+                }
+                table_rows.push(r);
+            }
+        }
+    }
+
+    let header = Row::new(vec!["  Parameter", "      Live", "Staged Target"]).style(
+        Style::default()
+            .fg(palette::MUTED)
+            .add_modifier(Modifier::BOLD),
+    );
+
+    let widths = [
+        Constraint::Min(24),
+        Constraint::Length(11),
+        Constraint::Length(22),
+    ];
+
+    let table = Table::new(table_rows, widths)
+        .header(header)
+        .column_spacing(1);
+    frame.render_widget(table, inner);
+}
+
+fn draw_tune_inspector_pane(frame: &mut Frame, area: Rect, app: &App, hw: &HardwareContext) {
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Percentage(46), Constraint::Percentage(54)])
+        .split(area);
+
+    // Top: Selected parameter inspector
+    let insp_block =
+        styled_block(" Selected Parameter ", palette::CYAN).padding(Padding::horizontal(1));
+    let insp_inner = insp_block.inner(chunks[0]);
+    frame.render_widget(insp_block, chunks[0]);
+
+    if let Some(param) = app.selected_tune_param(hw) {
+        let label = format_tune_param_label(param, hw);
+        let live = format_live_param_display(app, param);
+        let staged = app
+            .staged
+            .get(&param)
+            .map(|v| format_tune_value(param, *v))
+            .unwrap_or_else(|| "(unchanged)".to_string());
+        let (fine, coarse) = App::param_steps(param);
+        let bounds = param_bounds_summary(app, param, hw);
+
+        let mut lines = vec![
+            Line::from(Span::styled(
+                label,
+                Style::default()
+                    .fg(palette::CYAN)
+                    .add_modifier(Modifier::BOLD),
+            )),
+            Line::from(vec![
+                Span::styled("Section: ", Style::default().fg(palette::MUTED)),
+                Span::styled(param.section().title(), Style::default().fg(palette::TEAL)),
+            ]),
+            Line::from(vec![
+                Span::styled("Live:    ", Style::default().fg(palette::MUTED)),
+                Span::styled(live, Style::default().fg(palette::FG).add_modifier(Modifier::BOLD)),
+            ]),
+            Line::from(vec![
+                Span::styled("Staged:  ", Style::default().fg(palette::MUTED)),
+                Span::styled(
+                    staged,
+                    Style::default().fg(if app.staged.contains_key(&param) {
+                        palette::ORANGE
+                    } else {
+                        palette::DIM
+                    }),
+                ),
+            ]),
+            Line::from(vec![
+                Span::styled("Bounds:  ", Style::default().fg(palette::MUTED)),
+                Span::styled(bounds, Style::default().fg(palette::FG)),
+            ]),
+            Line::from(vec![
+                Span::styled("Step:    ", Style::default().fg(palette::MUTED)),
+                Span::styled(
+                    format!("±{fine} (Shift/H/L/PgUp/Dn: ±{coarse})"),
+                    Style::default().fg(palette::MUTED),
+                ),
+            ]),
+        ];
+
+        if let Some(sv) = app.staged.get(&param).copied() {
+            if app.param_exceeds_soft_limit(param, sv, hw) && !app.allow_extreme {
+                lines.push(Line::from(Span::styled(
+                    "! Exceeds soft limit — press 'x' for Allow Extreme",
+                    Style::default()
+                        .fg(palette::YELLOW)
+                        .add_modifier(Modifier::BOLD),
+                )));
+            }
+        }
+
+        frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: true }), insp_inner);
+    }
+
+    // Bottom: Safety & Quick Actions
+    let act_block =
+        styled_block(" Safety & Quick Actions ", palette::PURPLE).padding(Padding::horizontal(1));
+    let act_inner = act_block.inner(chunks[1]);
+    frame.render_widget(act_block, chunks[1]);
+
+    let extreme_span = if app.allow_extreme {
+        Span::styled(
+            " ON (hard bounds & 95°C Tctl active) ",
+            Style::default()
+                .fg(palette::BADGE_FG)
+                .bg(palette::ORANGE)
+                .add_modifier(Modifier::BOLD),
+        )
+    } else {
+        Span::styled(" OFF (conservative soft bounds)", Style::default().fg(palette::GREEN))
+    };
+
+    let write_span = if app.can_write() {
+        Span::styled("READY (root)", Style::default().fg(palette::GREEN).add_modifier(Modifier::BOLD))
+    } else {
+        Span::styled("LOCKED (run with sudo)", Style::default().fg(palette::YELLOW))
+    };
+
+    let action_lines = vec![
+        Line::from(vec![
+            Span::styled("Writes:  ", Style::default().fg(palette::MUTED)),
+            write_span,
+        ]),
+        Line::from(vec![
+            Span::styled("Extreme: ", Style::default().fg(palette::MUTED)),
+            extreme_span,
+        ]),
+        Line::from(vec![
+            Span::styled("Staged:  ", Style::default().fg(palette::MUTED)),
+            Span::styled(
+                format!("{} pending change(s)", app.staged_count()),
+                Style::default()
+                    .fg(if app.staged_count() > 0 {
+                        palette::ORANGE
+                    } else {
+                        palette::DIM
+                    })
+                    .add_modifier(Modifier::BOLD),
+            ),
+        ]),
+        Line::from(""),
+        tune_key_line("a / Enter", "Dry-run preview & confirm apply"),
+        tune_key_line("0 / Bksp", "Reset param to 0 (CO/Shp) / live"),
+        tune_key_line("u", "Undo / discard all staged changes"),
+        tune_key_line("x", "Toggle Allow Extreme"),
+        tune_key_line("R", "Preview Rollback (last-state.json)"),
+        tune_key_line("B", "Preview Boot Baseline reset"),
+        tune_key_line("Z", "Preview Reset CO to 0"),
+        tune_key_line("s", "Save live state to TOML profile"),
+    ];
+
+    frame.render_widget(Paragraph::new(action_lines).wrap(Wrap { trim: true }), act_inner);
+}
+
+fn draw_tune_compact_bar(frame: &mut Frame, area: Rect, app: &App, hw: &HardwareContext) {
+    let block = styled_block(" Inspector & Quick Actions ", palette::PURPLE)
+        .padding(Padding::horizontal(1));
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+
+    let sel_info = if let Some(p) = app.selected_tune_param(hw) {
+        format!(
+            "{} · {}",
+            format_tune_param_label(p, hw),
+            param_bounds_summary(app, p, hw)
+        )
+    } else {
+        "No parameter selected".to_string()
+    };
+
+    let lines = vec![
+        Line::from(Span::styled(sel_info, Style::default().fg(palette::CYAN))),
+        Line::from(vec![
+            Span::styled("a/Ent", Style::default().fg(palette::GREEN).add_modifier(Modifier::BOLD)),
+            Span::styled(":DryRun ", Style::default().fg(palette::MUTED)),
+            Span::styled("u", Style::default().fg(palette::CYAN).add_modifier(Modifier::BOLD)),
+            Span::styled(":Undo ", Style::default().fg(palette::MUTED)),
+            Span::styled("x", Style::default().fg(palette::ORANGE).add_modifier(Modifier::BOLD)),
+            Span::styled(
+                if app.allow_extreme { ":Ext[ON] " } else { ":Ext " },
+                Style::default().fg(if app.allow_extreme { palette::ORANGE } else { palette::MUTED }),
+            ),
+            Span::styled("R/B/Z", Style::default().fg(palette::YELLOW).add_modifier(Modifier::BOLD)),
+            Span::styled(":Roll/Boot/CO=0 ", Style::default().fg(palette::MUTED)),
+            Span::styled("s", Style::default().fg(palette::TEAL).add_modifier(Modifier::BOLD)),
+            Span::styled(":Save", Style::default().fg(palette::MUTED)),
+        ]),
+    ];
+
+    frame.render_widget(Paragraph::new(lines), inner);
+}
+
+fn tune_key_line<'a>(key: &'a str, desc: &'a str) -> Line<'a> {
+    Line::from(vec![
+        Span::styled(
+            format!("{key:<10}"),
+            Style::default()
+                .fg(palette::CYAN)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(desc, Style::default().fg(palette::FG)),
+    ])
+}
+
+// ---------------------------------------------------------------------------
+// Dry-Run Confirmation Modal Overlay
+// ---------------------------------------------------------------------------
+
+fn draw_confirm_modal(frame: &mut Frame, root: Rect, app: &App, modal: &ConfirmModal) {
+    let pct_x = if root.width < 92 { 94 } else { 84 };
+    let pct_y = if root.height < 28 { 86 } else { 76 };
+    let popup = centered_rect(pct_x, pct_y, root);
+    frame.render_widget(Clear, popup);
+
+    let border_color = if !app.can_write() {
+        palette::YELLOW
+    } else if modal.allow_extreme {
+        palette::ORANGE
+    } else {
+        palette::CYAN
+    };
+
+    let block = Block::default()
+        .title(modal.title.as_str())
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(border_color))
+        .title_style(
+            Style::default()
+                .fg(border_color)
+                .add_modifier(Modifier::BOLD),
+        )
+        .style(Style::default().bg(palette::POPUP_BG))
+        .padding(Padding::horizontal(1));
+    let inner = block.inner(popup);
+    frame.render_widget(block, popup);
+
+    if inner.height < 5 || inner.width < 20 {
+        return;
+    }
+
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(2),
+            Constraint::Min(3),
+            Constraint::Length(2),
+        ])
+        .split(inner);
+
+    // Subtitle + warning badges
+    let mut sub_spans = vec![Span::styled(
+        modal.subtitle.as_str(),
+        Style::default().fg(palette::FG),
+    )];
+    if modal.allow_extreme {
+        sub_spans.push(Span::raw(" "));
+        sub_spans.push(Span::styled(
+            " EXTREME ",
+            Style::default()
+                .fg(palette::BADGE_FG)
+                .bg(palette::ORANGE)
+                .add_modifier(Modifier::BOLD),
+        ));
+    }
+    if !app.can_write() {
+        sub_spans.push(Span::raw(" "));
+        sub_spans.push(Span::styled(
+            " UNPRIVILEGED ",
+            Style::default()
+                .fg(palette::BADGE_FG)
+                .bg(palette::YELLOW)
+                .add_modifier(Modifier::BOLD),
+        ));
+    }
+
+    let sub_lines = vec![
+        Line::from(sub_spans),
+        Line::from(Span::styled(
+            "Pre-change snapshot saved before writes · flock + SMN RSP + readback verification",
+            Style::default().fg(palette::DIM),
+        )),
+    ];
+    frame.render_widget(Paragraph::new(sub_lines), chunks[0]);
+
+    // PlannedOps table (scrollable)
+    let visible_ops = chunks[1].height.saturating_sub(1).max(1) as usize;
+    let start = modal
+        .scroll
+        .min(modal.ops.len().saturating_sub(1));
+
+    let op_rows: Vec<Row<'_>> = modal
+        .ops
+        .iter()
+        .enumerate()
+        .skip(start)
+        .take(visible_ops)
+        .map(|(idx, op)| {
+            let cur = op.current.as_deref().unwrap_or("—");
+            let change = format!("{cur} → {}", op.target);
+            Row::new(vec![
+                Cell::from(format!("{}", idx + 1)).style(Style::default().fg(palette::DIM)),
+                Cell::from(op.mailbox.as_str()).style(Style::default().fg(palette::TEAL)),
+                Cell::from(format!("0x{:02X}", op.opcode))
+                    .style(Style::default().fg(palette::CYAN).add_modifier(Modifier::BOLD)),
+                Cell::from(format!("0x{:08X}", op.args[0])).style(Style::default().fg(palette::MUTED)),
+                Cell::from(change)
+                    .style(Style::default().fg(palette::ORANGE).add_modifier(Modifier::BOLD)),
+                Cell::from(op.description.as_str()).style(Style::default().fg(palette::FG)),
+            ])
+        })
+        .collect();
+
+    let header = Row::new(vec!["#", "MB", "Opcode", "Arg0", "Current → Target", "Description"])
+        .style(
+            Style::default()
+                .fg(palette::MUTED)
+                .add_modifier(Modifier::BOLD),
+        );
+
+    let widths = if chunks[1].width < 72 {
+        [
+            Constraint::Length(2),
+            Constraint::Length(4),
+            Constraint::Length(6),
+            Constraint::Length(10),
+            Constraint::Length(15),
+            Constraint::Min(12),
+        ]
+    } else {
+        [
+            Constraint::Length(3),
+            Constraint::Length(5),
+            Constraint::Length(7),
+            Constraint::Length(11),
+            Constraint::Length(22),
+            Constraint::Min(20),
+        ]
+    };
+
+    let table = Table::new(op_rows, widths).header(header).column_spacing(1);
+    frame.render_widget(table, chunks[1]);
+
+    // Footer action prompts
+    let scroll_hint = if modal.ops.len() > visible_ops {
+        format!(
+            "  [{}-{}/{} · ↑/↓ Scroll]",
+            start + 1,
+            (start + visible_ops).min(modal.ops.len()),
+            modal.ops.len()
+        )
+    } else {
+        String::new()
+    };
+
+    let actions = vec![
+        Line::from(""),
+        Line::from(vec![
+            Span::styled(
+                " [y / Enter] Confirm & Apply ",
+                Style::default()
+                    .fg(palette::BADGE_FG)
+                    .bg(if app.can_write() {
+                        palette::GREEN
+                    } else {
+                        palette::YELLOW
+                    })
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::raw("   "),
+            Span::styled(
+                " [n / Esc] Cancel ",
+                Style::default()
+                    .fg(palette::FG)
+                    .bg(palette::ROW_HL)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(scroll_hint, Style::default().fg(palette::DIM)),
+        ]),
+    ];
+    frame.render_widget(
+        Paragraph::new(actions).alignment(Alignment::Center),
+        chunks[2],
+    );
+}
+
+// ---------------------------------------------------------------------------
 // Help Modal Overlay
 // ---------------------------------------------------------------------------
 
 fn draw_help_popup(frame: &mut Frame, root: Rect) {
-    let popup = centered_rect(68, 72, root);
+    let pct_x = if root.width < 92 { 92 } else { 74 };
+    let pct_y = if root.height < 28 { 90 } else { 82 };
+    let popup = centered_rect(pct_x, pct_y, root);
     frame.render_widget(Clear, popup);
 
     let block = Block::default()
@@ -2229,16 +4597,17 @@ fn draw_help_popup(frame: &mut Frame, root: Rect) {
                 .add_modifier(Modifier::BOLD),
         )
         .style(Style::default().bg(palette::POPUP_BG))
-        .padding(Padding::uniform(1));
+        .padding(Padding::horizontal(1));
 
     let help_lines = vec![
         Line::from(Span::styled(
-            "Navigation & Controls",
+            "Navigation & Telemetry",
             Style::default()
                 .fg(palette::TEAL)
                 .add_modifier(Modifier::BOLD),
         )),
-        help_entry("1 / 2 / 3", "Switch directly to Overview, Clocks & Volts, or CO & Shaper"),
+        help_entry("1 / 2 / 3 / 4", "Switch to Overview, Clocks & Volts, CO & Shaper, or Tune"),
+        help_entry("t", "Jump straight to [4:Tune] from any tab"),
         help_entry("Tab / Shift+Tab", "Cycle forward / backward through views"),
         help_entry("p / Space", "Pause or resume live PM table polling"),
         help_entry("r", "Force refresh of PM telemetry and SMU mailbox readback"),
@@ -2247,42 +4616,34 @@ fn draw_help_popup(frame: &mut Frame, root: Rect) {
         help_entry("q / Ctrl+C", "Quit and cleanly restore terminal state"),
         Line::from(""),
         Line::from(Span::styled(
-            "Color Legend",
+            "Interactive Tuning ([4:Tune] · Live Telemetry Always Active)",
             Style::default()
                 .fg(palette::TEAL)
                 .add_modifier(Modifier::BOLD),
         )),
-        Line::from(vec![
-            Span::styled("  Gauges:  ", Style::default().fg(palette::MUTED)),
-            Span::styled("Green <65%", Style::default().fg(palette::GREEN)),
-            Span::raw("  ·  "),
-            Span::styled("Yellow 65-85%", Style::default().fg(palette::YELLOW)),
-            Span::raw("  ·  "),
-            Span::styled("Red >=85%", Style::default().fg(palette::RED)),
-        ]),
-        Line::from(vec![
-            Span::styled("  CO/Shp:  ", Style::default().fg(palette::MUTED)),
-            Span::styled("Cyan <=-35", Style::default().fg(palette::CYAN)),
-            Span::raw("  ·  "),
-            Span::styled("Green <0", Style::default().fg(palette::GREEN)),
-            Span::raw("  ·  "),
-            Span::styled("Dim 0", Style::default().fg(palette::DIM)),
-            Span::raw("  ·  "),
-            Span::styled("Yellow/Red >0", Style::default().fg(palette::YELLOW)),
-        ]),
+        help_entry("↑↓ / j / k", "Move parameter selection up / down"),
+        help_entry("[ / ]", "Jump to previous / next capability section"),
+        help_entry("←→ / h / l", "Decrement / increment selected parameter"),
+        help_entry("H / L / Shift+←→", "Coarse step decrement / increment (or PgDn / PgUp)"),
+        help_entry("0 / Backspace", "Reset selected param to 0 (CO/Shaper) or live value"),
+        help_entry("u", "Undo / discard all staged changes"),
+        help_entry("x", "Toggle Allow Extreme (hard bounds & 95°C Tctl always enforced)"),
+        help_entry("a / Enter", "Run dry-run validation & open Confirmation Modal"),
+        help_entry("R / B / Z", "Preview Rollback (last-state), Boot Baseline reset, or CO=0"),
+        help_entry("s", "Save live SMU state to TOML profile"),
         Line::from(""),
         Line::from(Span::styled(
-            "Privilege Model",
+            "Safety & Privileges",
             Style::default()
                 .fg(palette::TEAL)
                 .add_modifier(Modifier::BOLD),
         )),
         Line::from(Span::styled(
-            "  PM table power, thermal, clock, and voltage telemetry works unprivileged.",
-            Style::default().fg(palette::FG),
+            "  PM table telemetry works unprivileged. Run with sudo to read/write SMU mailboxes.",
+            Style::default().fg(palette::MUTED),
         )),
         Line::from(Span::styled(
-            "  Run with sudo for Curve Optimizer, Curve Shaper, and PBO mailbox readback.",
+            "  Every write previews exact opcodes first, snapshots state, and verifies readback.",
             Style::default().fg(palette::MUTED),
         )),
     ];
@@ -2298,7 +4659,7 @@ fn draw_help_popup(frame: &mut Frame, root: Rect) {
 fn help_entry<'a>(key: &'a str, desc: &'a str) -> Line<'a> {
     Line::from(vec![
         Span::styled(
-            format!("  {key:<16}"),
+            format!("  {key:<18}"),
             Style::default()
                 .fg(palette::CYAN)
                 .add_modifier(Modifier::BOLD),
@@ -2351,6 +4712,18 @@ mod tests {
             capabilities: capabilities_for(Codename::GraniteRidge).unwrap(),
         };
         (transport, hw)
+    }
+
+    fn buffer_text(terminal: &Terminal<TestBackend>) -> String {
+        let buf = terminal.backend().buffer();
+        let mut out = String::new();
+        for y in 0..buf.area.height {
+            for x in 0..buf.area.width {
+                out.push_str(buf[(x, y)].symbol());
+            }
+            out.push('\n');
+        }
+        out
     }
 
     #[test]
@@ -2454,7 +4827,12 @@ mod tests {
             let backend = TestBackend::new(w, h);
             let mut terminal = Terminal::new(backend).unwrap();
 
-            for tab in [ViewTab::Overview, ViewTab::ClocksVolts, ViewTab::CoShaper] {
+            for tab in [
+                ViewTab::Overview,
+                ViewTab::ClocksVolts,
+                ViewTab::CoShaper,
+                ViewTab::Tune,
+            ] {
                 app.active_tab = tab;
                 app.show_help = false;
                 terminal.draw(|f| draw_ui(f, &app, &hw)).unwrap();
@@ -2480,7 +4858,12 @@ mod tests {
 
         let backend = TestBackend::new(100, 30);
         let mut terminal = Terminal::new(backend).unwrap();
-        for tab in [ViewTab::Overview, ViewTab::ClocksVolts, ViewTab::CoShaper] {
+        for tab in [
+            ViewTab::Overview,
+            ViewTab::ClocksVolts,
+            ViewTab::CoShaper,
+            ViewTab::Tune,
+        ] {
             app.active_tab = tab;
             terminal.draw(|f| draw_ui(f, &app, &hw)).unwrap();
         }
@@ -2499,6 +4882,10 @@ mod tests {
         assert_eq!(app.active_tab, ViewTab::CoShaper);
         assert!(!app.handle_key(press(KeyCode::BackTab), &transport, &hw));
         assert_eq!(app.active_tab, ViewTab::ClocksVolts);
+        assert!(!app.handle_key(press(KeyCode::Char('1')), &transport, &hw));
+        assert_eq!(app.active_tab, ViewTab::Overview);
+        assert!(!app.handle_key(press(KeyCode::Char('t')), &transport, &hw));
+        assert_eq!(app.active_tab, ViewTab::Tune);
         assert!(!app.handle_key(press(KeyCode::Char('1')), &transport, &hw));
         assert_eq!(app.active_tab, ViewTab::Overview);
 
@@ -2526,5 +4913,274 @@ mod tests {
             &transport,
             &hw
         ));
+    }
+
+    #[test]
+    fn tune_stage_dry_run_apply_and_rollback_co_and_pbo() {
+        let (transport, hw) = mock_9700x();
+        let tmp = tempfile::tempdir().unwrap();
+
+        let mut app = App::new(500);
+        app.test_allow_writes = true;
+        app.snapshot_store = SnapshotStore::new(tmp.path().join("state"));
+        app.poll_telemetry(&transport, &hw);
+        app.refresh_mailbox(&transport, &hw);
+
+        let press = |code| KeyEvent::new(code, KeyModifiers::NONE);
+
+        // Jump straight to Tune tab via 't'
+        assert!(!app.handle_key(press(KeyCode::Char('t')), &transport, &hw));
+        assert_eq!(app.active_tab, ViewTab::Tune);
+        assert_eq!(app.selected_tune_param(&hw), Some(TuneParam::CoAll));
+
+        // Stage CO All-Core = -20 via 4 coarse decrements ('H' = -5 each)
+        for _ in 0..4 {
+            app.handle_key(press(KeyCode::Char('H')), &transport, &hw);
+        }
+        assert_eq!(app.staged.get(&TuneParam::CoAll), Some(&TuneValue::Int(-20)));
+
+        // Jump sections twice: CurveOptimizer -> CurveShaper -> PBO
+        app.handle_key(press(KeyCode::Char(']')), &transport, &hw);
+        assert_eq!(
+            app.selected_tune_param(&hw).map(TuneParam::section),
+            Some(TuneSection::CurveShaper)
+        );
+        app.handle_key(press(KeyCode::Char(']')), &transport, &hw);
+        assert_eq!(app.selected_tune_param(&hw), Some(TuneParam::PboPpt));
+
+        // Live PPT on mock 9700X is 88 W; step +25 W twice -> 138 W
+        app.handle_key(press(KeyCode::Char('L')), &transport, &hw);
+        app.handle_key(press(KeyCode::Char('L')), &transport, &hw);
+        assert_eq!(app.staged.get(&TuneParam::PboPpt), Some(&TuneValue::Int(138)));
+        assert_eq!(app.staged_count(), 2);
+
+        // Press 'a' to open Dry-Run Confirmation Modal (must NOT write to hardware yet)
+        app.handle_key(press(KeyCode::Char('a')), &transport, &hw);
+        let modal = app.confirm_modal.as_ref().expect("confirm modal should open");
+        assert_eq!(modal.ops.len(), 2);
+        assert_eq!(modal.ops[0].target, "-20");
+        assert_eq!(modal.ops[0].current.as_deref(), Some("0"));
+        assert_eq!(modal.ops[1].target, "138 W");
+        assert_eq!(modal.ops[1].current.as_deref(), Some("88 W"));
+
+        // Verify hardware is still untouched before confirmation
+        assert_eq!(co::get_co(&transport, &hw).unwrap().cores[0].margin, 0);
+        assert_eq!(
+            pm_table::read_telemetry(&transport, &hw)
+                .unwrap()
+                .ppt_limit_w,
+            Some(88.0)
+        );
+
+        // Press 'y' to Confirm & Apply
+        app.handle_key(press(KeyCode::Char('y')), &transport, &hw);
+        assert!(app.confirm_modal.is_none());
+        assert!(app.staged.is_empty());
+        let (flash_msg, flash_kind) = app.active_flash().expect("success flash");
+        assert_eq!(flash_kind, FlashKind::Success);
+        assert!(flash_msg.contains("Applied 2 SMU operation(s) & verified"));
+
+        // Verify real hardware state in MockTransport updated and verified!
+        let co_after = co::get_co(&transport, &hw).unwrap();
+        assert!(co_after.cores.iter().all(|c| c.margin == -20));
+        let telem_after = pm_table::read_telemetry(&transport, &hw).unwrap();
+        assert_eq!(telem_after.ppt_limit_w, Some(138.0));
+
+        // Snapshots were saved before mutation
+        assert!(app.snapshot_store.load_boot_baseline().unwrap().is_some());
+        assert!(app.snapshot_store.load_last_state().unwrap().is_some());
+
+        // Press 'R' (uppercase) to preview Rollback, then confirm with Enter
+        app.handle_key(press(KeyCode::Char('R')), &transport, &hw);
+        assert!(app.confirm_modal.is_some());
+        app.handle_key(press(KeyCode::Enter), &transport, &hw);
+        assert!(app.confirm_modal.is_none());
+
+        // Hardware rolled back cleanly to 0 CO and 88 W PPT
+        assert!(co::get_co(&transport, &hw)
+            .unwrap()
+            .cores
+            .iter()
+            .all(|c| c.margin == 0));
+        assert_eq!(
+            pm_table::read_telemetry(&transport, &hw)
+                .unwrap()
+                .ppt_limit_w,
+            Some(88.0)
+        );
+    }
+
+    #[test]
+    fn tune_refuses_unprivileged_write_and_guards_extreme_values() {
+        let (transport, hw) = mock_9700x();
+        let mut app = App::new(500);
+        app.is_root = false;
+        app.test_allow_writes = false;
+        app.poll_telemetry(&transport, &hw);
+        app.refresh_mailbox(&transport, &hw);
+
+        let press = |code| KeyEvent::new(code, KeyModifiers::NONE);
+        app.handle_key(press(KeyCode::Char('t')), &transport, &hw);
+
+        // Stage CO = -10, open modal, attempt confirm while unprivileged -> must refuse
+        app.handle_key(press(KeyCode::Char('H')), &transport, &hw);
+        app.handle_key(press(KeyCode::Char('H')), &transport, &hw);
+        app.handle_key(press(KeyCode::Enter), &transport, &hw);
+        assert!(app.confirm_modal.is_some());
+        app.handle_key(press(KeyCode::Char('y')), &transport, &hw);
+        assert!(app.confirm_modal.is_none());
+        let (msg, kind) = app.active_flash().unwrap();
+        assert_eq!(kind, FlashKind::Error);
+        assert!(msg.contains("root required"));
+        assert_eq!(co::get_co(&transport, &hw).unwrap().cores[0].margin, 0);
+
+        // Now test extreme guard: CO = -40 (below soft_min -35) blocked when allow_extreme = false
+        app.test_allow_writes = true;
+        for _ in 0..6 {
+            app.handle_key(press(KeyCode::Char('H')), &transport, &hw);
+        }
+        assert_eq!(app.staged.get(&TuneParam::CoAll), Some(&TuneValue::Int(-40)));
+        app.handle_key(press(KeyCode::Char('a')), &transport, &hw);
+        assert!(app.confirm_modal.is_none());
+        let (msg, kind) = app.active_flash().unwrap();
+        assert_eq!(kind, FlashKind::Error);
+        assert!(msg.contains("soft limit"));
+
+        // Toggle Allow Extreme ('x'), now dry-run preview succeeds
+        app.handle_key(press(KeyCode::Char('x')), &transport, &hw);
+        assert!(app.allow_extreme);
+        app.handle_key(press(KeyCode::Char('a')), &transport, &hw);
+        assert!(app.confirm_modal.is_some());
+
+        // Cancel with Esc, then 'u' discards all staged changes
+        app.handle_key(press(KeyCode::Esc), &transport, &hw);
+        assert!(app.confirm_modal.is_none());
+        app.handle_key(press(KeyCode::Char('u')), &transport, &hw);
+        assert!(app.staged.is_empty());
+    }
+
+    #[test]
+    fn renders_tune_tab_and_confirm_modal_without_tty() {
+        let (transport, hw) = mock_9700x();
+        let mut app = App::new(500);
+        app.test_allow_writes = true;
+        app.poll_telemetry(&transport, &hw);
+        app.refresh_mailbox(&transport, &hw);
+
+        let press = |code| KeyEvent::new(code, KeyModifiers::NONE);
+        app.handle_key(press(KeyCode::Char('4')), &transport, &hw);
+        app.handle_key(press(KeyCode::Char('H')), &transport, &hw);
+        app.handle_key(press(KeyCode::Char(']')), &transport, &hw);
+        app.handle_key(press(KeyCode::Char(']')), &transport, &hw);
+        app.handle_key(press(KeyCode::Char('L')), &transport, &hw);
+
+        for (w, h) in [(120u16, 36u16), (80, 24)] {
+            let backend = TestBackend::new(w, h);
+            let mut terminal = Terminal::new(backend).unwrap();
+
+            // Render Tab 4 (Tune) with staged changes
+            app.confirm_modal = None;
+            terminal.draw(|f| draw_ui(f, &app, &hw)).unwrap();
+            let text = buffer_text(&terminal);
+            assert!(text.contains("4:Tune"), "expected 4:Tune tab at {w}x{h}");
+            assert!(text.contains("*2"), "expected *2 staged badge at {w}x{h}");
+            assert!(
+                text.contains("Live Telemetry"),
+                "expected Live Telemetry strip at {w}x{h}"
+            );
+            assert!(text.contains("PPT"), "expected PPT telemetry at {w}x{h}");
+
+            // Open Dry-Run Confirmation Modal and render cleanly
+            app.handle_key(press(KeyCode::Char('a')), &transport, &hw);
+            assert!(app.confirm_modal.is_some());
+            terminal.draw(|f| draw_ui(f, &app, &hw)).unwrap();
+            let modal_text = buffer_text(&terminal);
+            assert!(
+                modal_text.contains("Dry-Run Preview"),
+                "expected modal title at {w}x{h}"
+            );
+            assert!(
+                modal_text.contains("Confirm & Apply"),
+                "expected confirm button at {w}x{h}"
+            );
+            assert!(modal_text.contains("0x"), "expected hex opcode at {w}x{h}");
+            assert!(modal_text.contains("→"), "expected current→target arrow at {w}x{h}");
+        }
+    }
+
+    #[test]
+    fn tune_hides_curve_shaper_when_firmware_unsupported() {
+        let (transport, hw) = mock_9700x();
+        let mut app = App::new(500);
+        app.poll_telemetry(&transport, &hw);
+        app.refresh_mailbox(&transport, &hw);
+        app.shaper_state = MailboxState::FirmwareUnsupported("0xFE".to_string());
+        app.active_tab = ViewTab::Tune;
+
+        // No Shaper params should be exposed as interactive controls
+        let params = app.tune_params(&hw);
+        assert!(
+            !params
+                .iter()
+                .any(|p| matches!(p, TuneParam::Shaper { .. })),
+            "Curve Shaper controls must be hidden when FirmwareUnsupported"
+        );
+
+        // Navigate down near the Curve Shaper banner so it's scrolled into view, and render
+        app.tune_selected = params
+            .iter()
+            .position(|p| matches!(p, TuneParam::PboPpt))
+            .unwrap_or(0);
+
+        for (w, h) in [(120u16, 36u16), (80, 24)] {
+            let backend = TestBackend::new(w, h);
+            let mut terminal = Terminal::new(backend).unwrap();
+            terminal.draw(|f| draw_ui(f, &app, &hw)).unwrap();
+            let text = buffer_text(&terminal);
+            assert!(
+                text.contains("Not exposed by SMU") && text.contains("0xFE"),
+                "expected FirmwareUnsupported banner at {w}x{h}, got:\n{text}"
+            );
+        }
+    }
+
+    #[test]
+    fn tune_exposes_apu_dptc_controls_on_apu() {
+        let transport = MockTransport::granite_ridge_9700x();
+        let mut driver = transport.read_info().unwrap();
+        driver.codename_id = Codename::Phoenix as u32;
+        let hw = HardwareContext {
+            driver,
+            codename: Codename::Phoenix,
+            cpuid: None,
+            topology: CpuTopology::synthetic(1, 8, 2),
+            capabilities: capabilities_for(Codename::Phoenix).unwrap(),
+        };
+
+        let mut app = App::new(500);
+        app.active_tab = ViewTab::Tune;
+        let params = app.tune_params(&hw);
+        for expected in [
+            TuneParam::ApuStapm,
+            TuneParam::ApuFast,
+            TuneParam::ApuSlow,
+            TuneParam::ApuApuSlow,
+            TuneParam::ApuSkinTemp,
+            TuneParam::ApuDgpuSkinTemp,
+            TuneParam::ApuPowerMode,
+        ] {
+            assert!(params.contains(&expected), "missing APU control {expected:?}");
+        }
+
+        // Jump to APU section and render at both sizes
+        app.tune_selected = params
+            .iter()
+            .position(|p| *p == TuneParam::ApuStapm)
+            .unwrap();
+        for (w, h) in [(120u16, 36u16), (80, 24)] {
+            let backend = TestBackend::new(w, h);
+            let mut terminal = Terminal::new(backend).unwrap();
+            terminal.draw(|f| draw_ui(f, &app, &hw)).unwrap();
+        }
     }
 }
