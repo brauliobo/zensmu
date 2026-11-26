@@ -21,6 +21,29 @@ pub const RYZEN_SMU_UPSTREAM_REPO: &str = "https://github.com/amkillam/ryzen_smu
 pub const RYZEN_SMU_UPSTREAM_GIT: &str = "https://github.com/amkillam/ryzen_smu.git";
 pub const RYZEN_SMU_CHECKSUMS_ASSET: &str = "ryzen-smu-dkms.SHA256SUMS.txt";
 
+/// EFI variable path exposing UEFI Secure Boot state (5th byte: 1 = enabled, 0 = disabled).
+pub const SECURE_BOOT_EFIVAR_PATH: &str =
+    "/sys/firmware/efi/efivars/SecureBoot-8be4df61-93ca-11d2-aa0d-00e098032b8c";
+
+/// Linux Security Module kernel lockdown mode path (bracketed token is active).
+pub const KERNEL_LOCKDOWN_PATH: &str = "/sys/kernel/security/lockdown";
+
+/// UEFI Secure Boot and Linux kernel lockdown inspection state.
+///
+/// Out-of-tree DKMS modules such as `ryzen_smu` cannot be loaded unsigned when
+/// Secure Boot is enabled or kernel lockdown is in `integrity`/`confidentiality` mode.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SecureBootStatus {
+    #[serde(default)]
+    pub secure_boot_enabled: Option<bool>,
+    #[serde(default)]
+    pub lockdown_mode: Option<String>,
+    #[serde(default)]
+    pub blocks_unsigned_modules: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hint: Option<String>,
+}
+
 /// Detected Linux distribution family for `ryzen_smu` installation guidance and packaging.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -108,6 +131,8 @@ pub struct DriverStatus {
     pub summary: String,
     pub recommended_command: String,
     pub manual_commands: Vec<String>,
+    #[serde(default)]
+    pub secure_boot: SecureBootStatus,
 }
 
 /// Options controlling `zensmu driver install`.
@@ -316,6 +341,111 @@ pub fn recommended_driver_command(
     }
 }
 
+/// Parse raw bytes from `/sys/firmware/efi/efivars/SecureBoot-8be4df61-93ca-11d2-aa0d-00e098032b8c`.
+///
+/// EFI efivars begin with a 4-byte little-endian attribute header followed by the payload;
+/// the 5th byte (`bytes[4]`) is `1` when Secure Boot is enabled and `0` when disabled.
+pub fn parse_secure_boot_efivar(bytes: &[u8]) -> Option<bool> {
+    match bytes.get(4) {
+        Some(1) => Some(true),
+        Some(0) => Some(false),
+        _ => None,
+    }
+}
+
+/// Parse stdout from `mokutil --sb-state` as a fallback when the efivar cannot be read.
+pub fn parse_mokutil_sb_state(output: &str) -> Option<bool> {
+    for line in output.lines() {
+        let lower = line.trim().to_ascii_lowercase();
+        if lower.contains("secureboot enabled") {
+            return Some(true);
+        }
+        if lower.contains("secureboot disabled") {
+            return Some(false);
+        }
+    }
+    None
+}
+
+/// Parse `/sys/kernel/security/lockdown` and return the bracketed active mode
+/// (e.g. `"none"`, `"integrity"`, or `"confidentiality"`).
+pub fn parse_lockdown_mode(content: &str) -> Option<String> {
+    let start = content.find('[')?;
+    let rest = content.get(start + 1..)?;
+    let end = rest.find(']')?;
+    let mode = rest.get(..end)?.trim();
+    if mode.is_empty() {
+        None
+    } else {
+        Some(mode.to_ascii_lowercase())
+    }
+}
+
+/// Build a [`SecureBootStatus`] from already-parsed Secure Boot and lockdown signals.
+pub fn secure_boot_status_from(
+    secure_boot_enabled: Option<bool>,
+    lockdown_mode: Option<String>,
+) -> SecureBootStatus {
+    let lockdown_blocks = matches!(
+        lockdown_mode.as_deref(),
+        Some("integrity" | "confidentiality")
+    );
+    let blocks_unsigned_modules = secure_boot_enabled == Some(true) || lockdown_blocks;
+
+    let hint = if blocks_unsigned_modules {
+        match (secure_boot_enabled, lockdown_mode.as_deref()) {
+            (Some(true), Some(mode @ ("integrity" | "confidentiality"))) => Some(format!(
+                "UEFI Secure Boot is enabled (kernel lockdown: {mode}), which blocks unsigned out-of-tree modules like ryzen_smu. Sign the DKMS module with a Machine Owner Key (enroll via `sudo mokutil --import /var/lib/dkms/mok.pub` and reboot) or disable Secure Boot in UEFI firmware."
+            )),
+            (Some(true), _) => Some(
+                "UEFI Secure Boot is enabled, which blocks unsigned out-of-tree modules like ryzen_smu. Sign the DKMS module with a Machine Owner Key (enroll via `sudo mokutil --import /var/lib/dkms/mok.pub` and reboot) or disable Secure Boot in UEFI firmware.".to_string(),
+            ),
+            (_, Some(mode)) => Some(format!(
+                "Kernel lockdown mode is `{mode}`, which blocks unsigned out-of-tree modules like ryzen_smu. Sign the DKMS module with an enrolled MOK (`sudo mokutil --import /var/lib/dkms/mok.pub`) or disable Secure Boot / kernel lockdown."
+            )),
+            _ => None,
+        }
+    } else {
+        None
+    };
+
+    SecureBootStatus {
+        secure_boot_enabled,
+        lockdown_mode,
+        blocks_unsigned_modules,
+        hint,
+    }
+}
+
+fn run_mokutil_sb_state() -> Option<bool> {
+    for bin in ["mokutil", "/usr/bin/mokutil", "/sbin/mokutil"] {
+        if let Ok(out) = Command::new(bin).arg("--sb-state").output() {
+            if out.status.success() {
+                let stdout = String::from_utf8_lossy(&out.stdout);
+                if let Some(state) = parse_mokutil_sb_state(&stdout) {
+                    return Some(state);
+                }
+            }
+            return None;
+        }
+    }
+    None
+}
+
+/// Detect UEFI Secure Boot and Linux kernel lockdown status without requiring root.
+pub fn detect_secure_boot() -> SecureBootStatus {
+    let secure_boot_enabled = fs::read(SECURE_BOOT_EFIVAR_PATH)
+        .ok()
+        .and_then(|bytes| parse_secure_boot_efivar(&bytes))
+        .or_else(run_mokutil_sb_state);
+
+    let lockdown_mode = fs::read_to_string(KERNEL_LOCKDOWN_PATH)
+        .ok()
+        .and_then(|content| parse_lockdown_mode(&content));
+
+    secure_boot_status_from(secure_boot_enabled, lockdown_mode)
+}
+
 /// Unprivileged inspection of `ryzen_smu` kernel module, DKMS, autoload, and distro state.
 pub fn inspect_driver_status(sysfs_path: &Path) -> DriverStatus {
     let loaded = sysfs_path.exists();
@@ -342,6 +472,7 @@ pub fn inspect_driver_status(sysfs_path: &Path) -> DriverStatus {
     let (distro_family, distro_name) = detect_distro();
     let recommended_command = recommended_driver_command(loaded, module_installed, distro_family);
     let manual_commands = manual_install_commands(distro_family);
+    let secure_boot = detect_secure_boot();
 
     let summary = if loaded {
         match &drv_version {
@@ -349,9 +480,15 @@ pub fn inspect_driver_status(sysfs_path: &Path) -> DriverStatus {
             None => format!("ryzen_smu is loaded at {}", sysfs_path.display()),
         }
     } else if module_installed {
-        format!(
-            "ryzen_smu kernel module is installed for kernel {kernel_release} but not currently loaded"
-        )
+        if secure_boot.blocks_unsigned_modules {
+            format!(
+                "ryzen_smu kernel module is installed for kernel {kernel_release} but not currently loaded (Secure Boot / kernel lockdown may block unsigned modules)"
+            )
+        } else {
+            format!(
+                "ryzen_smu kernel module is installed for kernel {kernel_release} but not currently loaded"
+            )
+        }
     } else if dkms_installed {
         format!(
             "ryzen_smu DKMS source is present but no compiled module was found for kernel {kernel_release}"
@@ -377,32 +514,50 @@ pub fn inspect_driver_status(sysfs_path: &Path) -> DriverStatus {
         summary,
         recommended_command,
         manual_commands,
+        secure_boot,
     }
+}
+
+/// Format a concise, distro- and Secure-Boot-aware remediation hint from a [`DriverStatus`].
+pub fn format_driver_remediation_hint(st: &DriverStatus) -> String {
+    if st.loaded {
+        return format!("ryzen_smu is loaded at {}", st.sysfs_path);
+    }
+    let base = if st.module_installed {
+        "ryzen_smu is installed but not loaded — run: sudo modprobe ryzen_smu (or: sudo zensmu driver load)".to_string()
+    } else {
+        match st.distro_family {
+            DistroFamily::Arch => {
+                "ryzen_smu is not installed — install from AUR: paru -S ryzen_smu-dkms-git (or inspect with: zensmu driver status)".to_string()
+            }
+            DistroFamily::Debian | DistroFamily::Fedora | DistroFamily::OpenSuse => {
+                format!(
+                    "ryzen_smu is not installed ({}) — run: sudo zensmu driver install (or see: zensmu driver status)",
+                    st.distro_name
+                )
+            }
+            DistroFamily::Other => {
+                "ryzen_smu is not installed — run: sudo zensmu driver install --method source (or see: zensmu driver status)".to_string()
+            }
+        }
+    };
+
+    if st.secure_boot.blocks_unsigned_modules {
+        if let Some(ref sb_hint) = st.secure_boot.hint {
+            return format!("{base} — Secure Boot / MOK signing required: {sb_hint}");
+        }
+        return format!(
+            "{base} — Secure Boot / kernel lockdown is active; sign ryzen_smu with an enrolled MOK (`sudo mokutil --import /var/lib/dkms/mok.pub`) or disable Secure Boot"
+        );
+    }
+
+    base
 }
 
 /// Concise, distro-aware remediation hint when `Error::DriverNotLoaded` occurs.
 pub fn driver_remediation_hint(sysfs_path: &Path) -> String {
     let st = inspect_driver_status(sysfs_path);
-    if st.loaded {
-        return format!("ryzen_smu is loaded at {}", st.sysfs_path);
-    }
-    if st.module_installed {
-        return "ryzen_smu is installed but not loaded — run: sudo modprobe ryzen_smu (or: sudo zensmu driver load)".to_string();
-    }
-    match st.distro_family {
-        DistroFamily::Arch => {
-            "ryzen_smu is not installed — install from AUR: paru -S ryzen_smu-dkms-git (or inspect with: zensmu driver status)".to_string()
-        }
-        DistroFamily::Debian | DistroFamily::Fedora | DistroFamily::OpenSuse => {
-            format!(
-                "ryzen_smu is not installed ({}) — run: sudo zensmu driver install (or see: zensmu driver status)",
-                st.distro_name
-            )
-        }
-        DistroFamily::Other => {
-            "ryzen_smu is not installed — run: sudo zensmu driver install --method source (or see: zensmu driver status)".to_string()
-        }
-    }
+    format_driver_remediation_hint(&st)
 }
 
 /// Load `ryzen_smu` via `modprobe` and optionally configure `/etc/modules-load.d/ryzen_smu.conf`.
@@ -417,6 +572,11 @@ pub fn load_driver(
 
     if !before.loaded {
         steps.push("modprobe ryzen_smu".to_string());
+        if before.secure_boot.blocks_unsigned_modules {
+            if let Some(ref hint) = before.secure_boot.hint {
+                notes.push(hint.clone());
+            }
+        }
     } else {
         notes.push(format!(
             "ryzen_smu already loaded at {}",
@@ -448,11 +608,17 @@ pub fn load_driver(
         let out = run_cmd("modprobe", &["ryzen_smu"], &[])?;
         if !out.status.success() {
             let stderr = String::from_utf8_lossy(&out.stderr).trim().to_string();
-            let detail = if stderr.is_empty() {
+            let mut detail = if stderr.is_empty() {
                 "modprobe ryzen_smu failed".to_string()
             } else {
                 format!("modprobe ryzen_smu failed: {stderr}")
             };
+            if before.secure_boot.blocks_unsigned_modules {
+                if let Some(ref hint) = before.secure_boot.hint {
+                    detail.push_str("; ");
+                    detail.push_str(hint);
+                }
+            }
             return Err(Error::DriverNotLoaded {
                 path: format!("{} ({detail})", sysfs_path.display()),
             });
@@ -590,6 +756,15 @@ fn install_via_release_package(
     steps.push("modprobe ryzen_smu".to_string());
 
     if opts.dry_run {
+        let mut dry_notes = vec![
+            "Dry-run only: no network download, package install, or module load executed."
+                .to_string(),
+        ];
+        if !before.loaded && before.secure_boot.blocks_unsigned_modules {
+            if let Some(ref hint) = before.secure_boot.hint {
+                dry_notes.push(hint.clone());
+            }
+        }
         return Ok(DriverActionOutput {
             action: "install".to_string(),
             dry_run: true,
@@ -598,10 +773,7 @@ fn install_via_release_package(
             loaded: before.loaded,
             autoload_configured: before.autoload_configured,
             steps,
-            notes: vec![
-                "Dry-run only: no network download, package install, or module load executed."
-                    .to_string(),
-            ],
+            notes: dry_notes,
             status: before.clone(),
         });
     }
@@ -738,9 +910,16 @@ fn install_via_release_package(
         }
         let mod_out = run_cmd("modprobe", &["ryzen_smu"], &[])?;
         if !mod_out.status.success() {
+            let extra = if before.secure_boot.blocks_unsigned_modules {
+                before.secure_boot.hint.as_deref().unwrap_or(
+                    "Secure Boot / kernel lockdown blocks unsigned modules; sign with MOK",
+                )
+            } else {
+                "check Secure Boot / kernel headers / dkms status"
+            };
             return Err(Error::DriverNotLoaded {
                 path: format!(
-                    "{} (package installed, but `modprobe ryzen_smu` failed: {}; check Secure Boot / kernel headers / dkms status)",
+                    "{} (package installed, but `modprobe ryzen_smu` failed: {}; {extra})",
                     sysfs_path.display(),
                     String::from_utf8_lossy(&mod_out.stderr).trim()
                 ),
@@ -753,6 +932,11 @@ fn install_via_release_package(
     result?;
 
     let after = inspect_driver_status(sysfs_path);
+    if !after.loaded && after.secure_boot.blocks_unsigned_modules {
+        if let Some(ref hint) = after.secure_boot.hint {
+            notes.push(hint.clone());
+        }
+    }
     Ok(DriverActionOutput {
         action: "install".to_string(),
         dry_run: false,
@@ -781,6 +965,15 @@ fn install_via_dkms_source(
     steps.push("modprobe ryzen_smu".to_string());
 
     if opts.dry_run {
+        let mut dry_notes = vec![
+            "Dry-run only: requires `git`, `make`, `gcc`, `dkms`, and kernel headers for the running kernel."
+                .to_string(),
+        ];
+        if !before.loaded && before.secure_boot.blocks_unsigned_modules {
+            if let Some(ref hint) = before.secure_boot.hint {
+                dry_notes.push(hint.clone());
+            }
+        }
         return Ok(DriverActionOutput {
             action: "install".to_string(),
             dry_run: true,
@@ -789,10 +982,7 @@ fn install_via_dkms_source(
             loaded: before.loaded,
             autoload_configured: before.autoload_configured,
             steps,
-            notes: vec![
-                "Dry-run only: requires `git`, `make`, `gcc`, `dkms`, and kernel headers for the running kernel."
-                    .to_string(),
-            ],
+            notes: dry_notes,
             status: before.clone(),
         });
     }
@@ -839,9 +1029,16 @@ fn install_via_dkms_source(
 
         let mod_out = run_cmd("modprobe", &["ryzen_smu"], &[])?;
         if !mod_out.status.success() {
+            let extra = if before.secure_boot.blocks_unsigned_modules {
+                before.secure_boot.hint.as_deref().unwrap_or(
+                    "Secure Boot / kernel lockdown blocks unsigned modules; sign with MOK",
+                )
+            } else {
+                "check Secure Boot / dmesg"
+            };
             return Err(Error::DriverNotLoaded {
                 path: format!(
-                    "{} (DKMS built, but `modprobe ryzen_smu` failed: {}; check Secure Boot / dmesg)",
+                    "{} (DKMS built, but `modprobe ryzen_smu` failed: {}; {extra})",
                     sysfs_path.display(),
                     String::from_utf8_lossy(&mod_out.stderr).trim()
                 ),
@@ -854,6 +1051,14 @@ fn install_via_dkms_source(
     result?;
 
     let after = inspect_driver_status(sysfs_path);
+    let mut notes = vec![format!(
+        "Built and installed via DKMS from {RYZEN_SMU_UPSTREAM_REPO}"
+    )];
+    if !after.loaded && after.secure_boot.blocks_unsigned_modules {
+        if let Some(ref hint) = after.secure_boot.hint {
+            notes.push(hint.clone());
+        }
+    }
     Ok(DriverActionOutput {
         action: "install".to_string(),
         dry_run: false,
@@ -862,9 +1067,7 @@ fn install_via_dkms_source(
         loaded: after.loaded,
         autoload_configured: after.autoload_configured,
         steps,
-        notes: vec![format!(
-            "Built and installed via DKMS from {RYZEN_SMU_UPSTREAM_REPO}"
-        )],
+        notes,
         status: after,
     })
 }
@@ -1113,5 +1316,119 @@ mod tests {
             recommended_driver_command(false, false, DistroFamily::Other),
             "sudo zensmu driver install --method source"
         );
+    }
+
+    #[test]
+    fn parses_secure_boot_efivar_and_mokutil_output() {
+        // 4-byte EFI attribute header + payload byte
+        assert_eq!(
+            parse_secure_boot_efivar(&[0x06, 0x00, 0x00, 0x00, 0x01]),
+            Some(true)
+        );
+        assert_eq!(
+            parse_secure_boot_efivar(&[0x06, 0x00, 0x00, 0x00, 0x00]),
+            Some(false)
+        );
+        assert_eq!(
+            parse_secure_boot_efivar(&[0x06, 0x00, 0x00, 0x00, 0x02]),
+            None
+        );
+        assert_eq!(parse_secure_boot_efivar(&[0x06, 0x00, 0x00, 0x00]), None);
+        assert_eq!(parse_secure_boot_efivar(&[]), None);
+
+        assert_eq!(parse_mokutil_sb_state("SecureBoot enabled\n"), Some(true));
+        assert_eq!(
+            parse_mokutil_sb_state("SecureBoot disabled\nPlatform is in Setup Mode\n"),
+            Some(false)
+        );
+        assert_eq!(
+            parse_mokutil_sb_state("EFI variables are not supported on this system\n"),
+            None
+        );
+    }
+
+    #[test]
+    fn parses_kernel_lockdown_modes() {
+        assert_eq!(
+            parse_lockdown_mode("[none] integrity confidentiality\n").as_deref(),
+            Some("none")
+        );
+        assert_eq!(
+            parse_lockdown_mode("none [integrity] confidentiality\n").as_deref(),
+            Some("integrity")
+        );
+        assert_eq!(
+            parse_lockdown_mode("none integrity [confidentiality]").as_deref(),
+            Some("confidentiality")
+        );
+        assert_eq!(parse_lockdown_mode("none integrity confidentiality"), None);
+        assert_eq!(parse_lockdown_mode("[]"), None);
+        assert_eq!(parse_lockdown_mode("[unclosed"), None);
+        assert_eq!(parse_lockdown_mode(""), None);
+    }
+
+    #[test]
+    fn computes_blocks_unsigned_modules_and_remediation_hint() {
+        let disabled = secure_boot_status_from(Some(false), Some("none".into()));
+        assert!(!disabled.blocks_unsigned_modules);
+        assert!(disabled.hint.is_none());
+
+        let unknown = secure_boot_status_from(None, None);
+        assert!(!unknown.blocks_unsigned_modules);
+        assert!(unknown.hint.is_none());
+
+        let sb_only = secure_boot_status_from(Some(true), Some("none".into()));
+        assert!(sb_only.blocks_unsigned_modules);
+        assert!(sb_only
+            .hint
+            .as_deref()
+            .unwrap()
+            .contains("mokutil --import"));
+
+        let integrity_only = secure_boot_status_from(Some(false), Some("integrity".into()));
+        assert!(integrity_only.blocks_unsigned_modules);
+        assert!(integrity_only
+            .hint
+            .as_deref()
+            .unwrap()
+            .contains("integrity"));
+
+        let confidentiality = secure_boot_status_from(None, Some("confidentiality".into()));
+        assert!(confidentiality.blocks_unsigned_modules);
+        assert!(confidentiality
+            .hint
+            .as_deref()
+            .unwrap()
+            .contains("confidentiality"));
+
+        let both = secure_boot_status_from(Some(true), Some("integrity".into()));
+        assert!(both.blocks_unsigned_modules);
+        let hint = both.hint.as_deref().unwrap();
+        assert!(hint.contains("Secure Boot"));
+        assert!(hint.contains("integrity"));
+        assert!(hint.contains("mokutil --import"));
+
+        // Verify DriverStatus JSON backwards compatibility when `secure_boot` is omitted
+        let legacy_json = r#"{
+            "sysfs_path": "/sys/kernel/ryzen_smu_drv",
+            "loaded": false,
+            "module_installed": true,
+            "dkms_installed": true,
+            "autoload_configured": false,
+            "kernel_release": "6.12.0",
+            "distro_family": "fedora",
+            "distro_name": "Fedora Linux 41",
+            "summary": "not loaded",
+            "recommended_command": "sudo zensmu driver load",
+            "manual_commands": []
+        }"#;
+        let mut parsed: DriverStatus = serde_json::from_str(legacy_json).unwrap();
+        assert_eq!(parsed.secure_boot, SecureBootStatus::default());
+        assert!(!format_driver_remediation_hint(&parsed).contains("mokutil"));
+
+        parsed.secure_boot = both;
+        let rem = format_driver_remediation_hint(&parsed);
+        assert!(rem.contains("Secure Boot"));
+        assert!(rem.contains("mokutil --import"));
     }
 }

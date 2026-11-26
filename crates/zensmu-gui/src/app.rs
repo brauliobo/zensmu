@@ -14,10 +14,15 @@ use std::sync::mpsc::{self, Receiver};
 use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
+use zensmu_core::bench::{run_core_cycler, BenchConfig, BenchProgress, BenchReport, BenchWorkload};
 use zensmu_core::config::profile::{Profile, ProfileDiffEntry, PROFILE_SCHEMA_VERSION};
 use zensmu_core::driver::{inspect_driver_status, DriverStatus};
 use zensmu_core::hw::identity::{detect_hardware, HardwareContext};
 use zensmu_core::hw::profiles::CpuCapabilities;
+use zensmu_core::metrics::{
+    read_exporter_service_status, set_exporter_service_enabled, ExporterServiceStatus,
+    USER_EXPORTER_SERVICE_NAME,
+};
 use zensmu_core::ops::apu::{
     ApuSetRequest, APU_FAST_POWER_SOFT_MAX_W, APU_POWER_MAX_W, APU_POWER_MIN_W,
     APU_POWER_SOFT_MAX_W, APU_SKIN_TEMP_MAX_C, APU_SKIN_TEMP_MIN_C, APU_SKIN_TEMP_SOFT_MAX_C,
@@ -738,6 +743,43 @@ impl RecorderUiState {
     }
 }
 
+/// Message sent from the unprivileged Core-Cycler background thread to the UI.
+pub enum BenchUiMsg {
+    Progress(BenchProgress),
+    Finished(Result<BenchReport, String>),
+}
+
+/// Unprivileged per-core Curve Optimizer stability tester / Core-Cycler UI state.
+pub struct BenchUiState {
+    pub running: bool,
+    pub duration_per_core_secs: u64,
+    pub passes: u32,
+    pub workload: BenchWorkload,
+    pub stop_on_error: bool,
+    pub progress: Option<BenchProgress>,
+    pub last_report: Option<BenchReport>,
+    pub error: Option<String>,
+    pub stop_flag: Arc<AtomicBool>,
+    pub rx: Option<Receiver<BenchUiMsg>>,
+}
+
+impl Default for BenchUiState {
+    fn default() -> Self {
+        Self {
+            running: false,
+            duration_per_core_secs: 15,
+            passes: 1,
+            workload: BenchWorkload::Mixed,
+            stop_on_error: true,
+            progress: None,
+            last_report: None,
+            error: None,
+            stop_flag: Arc::new(AtomicBool::new(false)),
+            rx: None,
+        }
+    }
+}
+
 /// Top-level `eframe` application state.
 pub struct ZensmuApp {
     pub is_root: bool,
@@ -779,8 +821,10 @@ pub struct ZensmuApp {
     pub apu_editor: ApuEditorState,
     pub profile_editor: ProfileEditorState,
 
-    // Unprivileged telemetry recording & user-level background daemon
+    // Unprivileged telemetry recording, Prometheus exporter & Core-Cycler tester
     pub recorder: RecorderUiState,
+    pub exporter_status: ExporterServiceStatus,
+    pub bench: BenchUiState,
 
     // Unprivileged boot/resume persistence status & confirmation modal
     pub persist_status: PersistStatus,
@@ -838,6 +882,8 @@ impl ZensmuApp {
             apu_editor: ApuEditorState::default(),
             profile_editor: ProfileEditorState::default(),
             recorder: RecorderUiState::with_detected_daemon_status(),
+            exporter_status: read_exporter_service_status(),
+            bench: BenchUiState::default(),
             persist_status: read_persist_status(&PersistPaths::default(), None, None),
             persist_confirm: None,
             staging_persist_path: None,
@@ -1044,6 +1090,190 @@ impl ZensmuApp {
     /// Refresh unprivileged `zensmu-record.service` status via `systemctl --user`.
     pub fn refresh_record_daemon_status(&mut self) {
         self.recorder.daemon_status = read_record_service_status();
+    }
+
+    /// Enable or disable the unprivileged user-level `zensmu-exporter.service` daemon (no `pkexec`).
+    pub fn toggle_exporter_daemon(&mut self) {
+        let target_enable = !self.exporter_status.enabled;
+        match set_exporter_service_enabled(target_enable) {
+            Ok(status) => {
+                self.exporter_status = status;
+                let msg = if target_enable {
+                    format!("Enabled Prometheus exporter daemon ({USER_EXPORTER_SERVICE_NAME}).")
+                } else {
+                    format!("Disabled Prometheus exporter daemon ({USER_EXPORTER_SERVICE_NAME}).")
+                };
+                self.set_toast(ToastLevel::Info, msg);
+            }
+            Err(err) => {
+                self.exporter_status = read_exporter_service_status();
+                self.set_toast(
+                    ToastLevel::Error,
+                    format!("Prometheus exporter toggle failed: {err}"),
+                );
+            }
+        }
+    }
+
+    /// Refresh unprivileged `zensmu-exporter.service` status via `systemctl --user`.
+    pub fn refresh_exporter_daemon_status(&mut self) {
+        self.exporter_status = read_exporter_service_status();
+    }
+
+    /// Start the unprivileged per-core Curve Optimizer stability tester / Core-Cycler on a background thread.
+    pub fn start_bench(&mut self, ctx: &egui::Context) {
+        if self.bench.running {
+            return;
+        }
+        let Some(hw) = self.hw.clone() else {
+            let msg = "Cannot start Core-Cycler: no Ryzen SMU hardware detected.".to_string();
+            self.bench.error = Some(msg.clone());
+            self.set_toast(ToastLevel::Warning, msg);
+            return;
+        };
+
+        let cfg = BenchConfig {
+            cores: Vec::new(),
+            duration_per_core_secs: self.bench.duration_per_core_secs,
+            passes: self.bench.passes,
+            workload: self.bench.workload,
+            sample_interval_ms: 500,
+            stop_on_error: self.bench.stop_on_error,
+        };
+
+        let stop_flag = Arc::new(AtomicBool::new(false));
+        let (tx, rx) = mpsc::channel();
+        let stop_bg = Arc::clone(&stop_flag);
+        let ctx_bg = ctx.clone();
+
+        let spawn_res = thread::Builder::new()
+            .name("zensmu-gui-bench".into())
+            .spawn(move || {
+                let transport = SysfsTransport::default();
+                let tx_prog = tx.clone();
+                let ctx_prog = ctx_bg.clone();
+                let res = run_core_cycler(&transport, &hw, &cfg, &stop_bg, |progress| {
+                    let _ = tx_prog.send(BenchUiMsg::Progress(progress.clone()));
+                    ctx_prog.request_repaint();
+                })
+                .map_err(|e| e.to_string());
+                let _ = tx.send(BenchUiMsg::Finished(res));
+                ctx_bg.request_repaint();
+            });
+
+        match spawn_res {
+            Ok(_) => {
+                self.bench.running = true;
+                self.bench.progress = None;
+                self.bench.last_report = None;
+                self.bench.error = None;
+                self.bench.stop_flag = stop_flag;
+                self.bench.rx = Some(rx);
+                self.set_toast(
+                    ToastLevel::Info,
+                    format!(
+                        "Started unprivileged Core-Cycler ({}, {}s/core, {} pass{}).",
+                        self.bench.workload,
+                        self.bench.duration_per_core_secs,
+                        self.bench.passes,
+                        if self.bench.passes == 1 { "" } else { "es" }
+                    ),
+                );
+            }
+            Err(err) => {
+                let msg = format!("Failed to start Core-Cycler thread: {err}");
+                self.bench.running = false;
+                self.bench.rx = None;
+                self.bench.error = Some(msg.clone());
+                self.set_toast(ToastLevel::Error, msg);
+            }
+        }
+    }
+
+    /// Signal the running Core-Cycler background thread to stop cleanly.
+    pub fn stop_bench(&mut self) {
+        if self.bench.running {
+            self.bench.stop_flag.store(true, Ordering::Relaxed);
+            self.set_toast(ToastLevel::Info, "Stopping Core-Cycler stability test…");
+        }
+    }
+
+    /// Drain progress and completion messages from the Core-Cycler background thread.
+    pub fn drain_bench(&mut self) {
+        let mut drained = Vec::new();
+        let mut disconnected = false;
+        if let Some(rx) = &self.bench.rx {
+            loop {
+                match rx.try_recv() {
+                    Ok(msg) => drained.push(msg),
+                    Err(mpsc::TryRecvError::Empty) => break,
+                    Err(mpsc::TryRecvError::Disconnected) => {
+                        disconnected = true;
+                        break;
+                    }
+                }
+            }
+        }
+
+        for msg in drained {
+            match msg {
+                BenchUiMsg::Progress(progress) => {
+                    self.bench.progress = Some(progress);
+                }
+                BenchUiMsg::Finished(Ok(report)) => {
+                    self.bench.running = false;
+                    self.bench.progress = None;
+                    self.bench.rx = None;
+                    self.bench.error = None;
+                    let (level, toast) = if report.cancelled {
+                        (
+                            ToastLevel::Warning,
+                            format!(
+                                "Core-Cycler stopped ({} core result(s) recorded).",
+                                report.results.len()
+                            ),
+                        )
+                    } else if report.passed {
+                        (
+                            ToastLevel::Success,
+                            format!(
+                                "Core-Cycler PASSED ({} pass(es), {:.1}s total).",
+                                report.passes_completed, report.total_duration_secs
+                            ),
+                        )
+                    } else {
+                        let failed = report
+                            .failed_cores
+                            .iter()
+                            .map(|c| format!("C{c}"))
+                            .collect::<Vec<_>>()
+                            .join(", ");
+                        (
+                            ToastLevel::Error,
+                            format!("Core-Cycler FAILED on {failed} — relax CO margin."),
+                        )
+                    };
+                    self.bench.last_report = Some(report);
+                    self.set_toast(level, toast);
+                }
+                BenchUiMsg::Finished(Err(err)) => {
+                    self.bench.running = false;
+                    self.bench.progress = None;
+                    self.bench.rx = None;
+                    self.bench.error = Some(err.clone());
+                    self.set_toast(ToastLevel::Error, format!("Core-Cycler error: {err}"));
+                }
+            }
+        }
+
+        if disconnected && self.bench.running {
+            self.bench.running = false;
+            self.bench.progress = None;
+            self.bench.rx = None;
+            let msg = "Core-Cycler worker exited unexpectedly.".to_string();
+            self.bench.error = Some(msg.clone());
+            self.set_toast(ToastLevel::Error, msg);
+        }
     }
 
     /// Ensure the default telemetry recordings folder exists and open it via `xdg-open` (no shell).
@@ -1732,6 +1962,7 @@ impl Drop for ZensmuApp {
     fn drop(&mut self) {
         let _ = self.recorder.stop();
         self.telemetry_stop.store(true, Ordering::Relaxed);
+        self.bench.stop_flag.store(true, Ordering::Relaxed);
         self.cleanup_staging_persist();
         self.cleanup_staging_profile();
     }
@@ -1741,10 +1972,14 @@ impl eframe::App for ZensmuApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.handle_zoom_shortcuts(ctx);
         self.drain_telemetry();
+        self.drain_bench();
         self.drain_cli_results(ctx);
 
         if self.recorder.is_recording() {
             ctx.request_repaint_after(Duration::from_millis(500));
+        }
+        if self.bench.running {
+            ctx.request_repaint_after(Duration::from_millis(250));
         }
 
         views::render_top_bar(self, ctx);
@@ -2805,5 +3040,20 @@ mod tests {
         assert!(xml.contains("<Identifier>zensmu/tctl</Identifier>"));
         assert!(xml.contains("88.50:102.00"));
         assert!(xml.contains("</PhoronixTestSuite>"));
+    }
+
+    #[test]
+    fn bench_ui_state_defaults_match_spec() {
+        let state = BenchUiState::default();
+        assert!(!state.running);
+        assert_eq!(state.duration_per_core_secs, 15);
+        assert_eq!(state.passes, 1);
+        assert_eq!(state.workload, BenchWorkload::Mixed);
+        assert!(state.stop_on_error);
+        assert!(state.progress.is_none());
+        assert!(state.last_report.is_none());
+        assert!(state.error.is_none());
+        assert!(!state.stop_flag.load(Ordering::Relaxed));
+        assert!(state.rx.is_none());
     }
 }

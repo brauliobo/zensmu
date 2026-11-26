@@ -8,18 +8,20 @@ mod tui;
 use clap::{CommandFactory, Parser};
 use clap_complete::Shell;
 use commands::{
-    ApuAction, Cli, CoAction, Command, DriverAction, PboAction, PersistAction, PersistCommand,
-    ProfileAction, RecordAction, RecordCommand, RecordFormatArg, RecordServiceAction, ShaperAction,
-    TelemetryAction,
+    ApuAction, Cli, CoAction, Command, DriverAction, ExportAction, ExportCommand,
+    ExportServiceAction, PboAction, PersistAction, PersistCommand, ProfileAction, RecordAction,
+    RecordCommand, RecordFormatArg, RecordServiceAction, ShaperAction, TelemetryAction,
+    TestCommand,
 };
 use doctor::{is_effective_root, run_doctor};
 use output::{
-    print_co_table, print_doctor, print_driver_action, print_driver_status, print_error,
-    print_info, print_json, print_json_compact, print_mutation, print_pbo_status,
-    print_persist_action, print_persist_status, print_planned_ops, print_profile_diff,
-    print_profile_list, print_record_export_pts, print_record_service_action,
-    print_record_service_status, print_record_stats, print_report_footer, print_shaper_matrix,
-    print_status, print_telemetry, ActivePboLimits, ClearGuardOutput, CoGetOutput, InfoOutput,
+    print_bench_report, print_co_table, print_doctor, print_driver_action, print_driver_status,
+    print_error, print_exporter_service_action, print_exporter_service_status, print_info,
+    print_json, print_json_compact, print_mutation, print_pbo_status, print_persist_action,
+    print_persist_status, print_planned_ops, print_profile_diff, print_profile_list,
+    print_record_export_pts, print_record_service_action, print_record_service_status,
+    print_record_stats, print_report_footer, print_shaper_matrix, print_status, print_telemetry,
+    ActivePboLimits, ClearGuardOutput, CoGetOutput, ExporterServiceActionOutput, InfoOutput,
     MutationOutput, PboGetOutput, PersistActionOutput, ProfileDiffOutput, ProfileListItem,
     ProfileListOutput, ProfileSaveOutput, ProfileValidateOutput, RecordExportPtsOutput,
     RecordServiceActionOutput, ReportOutput, ShaperGetOutput, StatusOutput, TelemetryDumpOutput,
@@ -29,12 +31,15 @@ use std::io::{self, IsTerminal, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command as ProcessCommand, ExitCode, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
+use zensmu_core::bench::{self, BenchConfig};
 use zensmu_core::config::profile::Profile;
 use zensmu_core::driver::{self, DriverInstallOptions};
 use zensmu_core::error::{Error, Result};
 use zensmu_core::hw::identity::{detect_hardware, HardwareContext};
+use zensmu_core::metrics::{self, MetricsServerConfig};
 use zensmu_core::ops::apu::{self, ApuSetRequest};
 use zensmu_core::ops::co;
 use zensmu_core::ops::pbo::{self, PboSetRequest};
@@ -71,6 +76,54 @@ fn install_stop_signal_handlers() {
     unsafe {
         libc::signal(libc::SIGINT, handle_sigint as *const () as usize);
         libc::signal(libc::SIGTERM, handle_sigint as *const () as usize);
+    }
+}
+
+/// Bridges the async-signal-safe `INTERRUPTED` flag to a shared `Arc<AtomicBool>`
+/// stop flag consumed by core library loops (`bench::run_core_cycler`, `metrics::serve_metrics`).
+struct SignalStopBridge {
+    stop_flag: Arc<AtomicBool>,
+    done: Arc<AtomicBool>,
+    handle: Option<thread::JoinHandle<()>>,
+}
+
+impl SignalStopBridge {
+    fn install() -> Self {
+        install_stop_signal_handlers();
+        let stop_flag = Arc::new(AtomicBool::new(false));
+        let done = Arc::new(AtomicBool::new(false));
+        let t_stop = Arc::clone(&stop_flag);
+        let t_done = Arc::clone(&done);
+        let handle = thread::Builder::new()
+            .name("zensmu-sig-bridge".into())
+            .spawn(move || {
+                while !t_done.load(Ordering::Acquire) {
+                    if INTERRUPTED.load(Ordering::SeqCst) {
+                        t_stop.store(true, Ordering::Release);
+                        break;
+                    }
+                    thread::sleep(Duration::from_millis(25));
+                }
+            })
+            .ok();
+        Self {
+            stop_flag,
+            done,
+            handle,
+        }
+    }
+
+    fn stop_flag(&self) -> &Arc<AtomicBool> {
+        &self.stop_flag
+    }
+}
+
+impl Drop for SignalStopBridge {
+    fn drop(&mut self) {
+        self.done.store(true, Ordering::Release);
+        if let Some(handle) = self.handle.take() {
+            let _ = handle.join();
+        }
     }
 }
 
@@ -280,6 +333,7 @@ fn run(cli: &Cli) -> Result<CliOutcome> {
 
     match &cli.command {
         Command::Completions { shell } => cmd_completions(*shell),
+        Command::Manpage => cmd_manpage(),
         Command::Doctor => cmd_doctor(cli, &transport),
         Command::Driver { action } => cmd_driver(cli, action.as_ref()),
         Command::Report {
@@ -307,6 +361,8 @@ fn run(cli: &Cli) -> Result<CliOutcome> {
         Command::Apu { action } => cmd_apu(cli, &transport, action),
         Command::Telemetry { action } => cmd_telemetry(cli, &transport, action.as_ref()),
         Command::Record(rec_cmd) => cmd_record(cli, &transport, rec_cmd),
+        Command::Test(test_cmd) => cmd_test(cli, &transport, test_cmd),
+        Command::Export(export_cmd) => cmd_export(cli, &transport, export_cmd),
         Command::Top { interval } => cmd_top(cli, &transport, interval),
         Command::Profile { action } => cmd_profile(cli, &transport, action),
         Command::Persist(persist_cmd) => cmd_persist(cli, &transport, persist_cmd),
@@ -320,6 +376,31 @@ fn cmd_completions(shell: commands::CompletionShell) -> Result<CliOutcome> {
     let gen_shell: Shell = shell.into();
     let mut buf = Vec::new();
     clap_complete::generate(gen_shell, &mut cmd, "zensmu", &mut buf);
+    if let Err(err) = io::stdout().write_all(&buf) {
+        if err.kind() != io::ErrorKind::BrokenPipe {
+            return Err(Error::Io {
+                path: "stdout".into(),
+                source: err,
+            });
+        }
+    }
+    Ok(CliOutcome::Success)
+}
+
+fn render_manpage_bytes() -> Result<Vec<u8>> {
+    let cmd = Cli::command();
+    let mut buf = Vec::new();
+    clap_mangen::Man::new(cmd)
+        .render(&mut buf)
+        .map_err(|source| Error::Io {
+            path: "manpage".into(),
+            source,
+        })?;
+    Ok(buf)
+}
+
+fn cmd_manpage() -> Result<CliOutcome> {
+    let buf = render_manpage_bytes()?;
     if let Err(err) = io::stdout().write_all(&buf) {
         if err.kind() != io::ErrorKind::BrokenPipe {
             return Err(Error::Io {
@@ -1421,6 +1502,372 @@ fn cmd_record_live(
 }
 
 // ============================================================================
+// Per-Core CO Stability Tester / Core-Cycler (`test`, alias `bench`)
+// ============================================================================
+
+fn parse_core_selection(spec: &str, max_cores: usize) -> Result<Vec<u32>> {
+    let trimmed = spec.trim();
+    if trimmed.is_empty() {
+        return Err(Error::InvalidInput(
+            "core selection specification cannot be empty".into(),
+        ));
+    }
+    if max_cores == 0 {
+        return Err(Error::InvalidInput(
+            "no physical cores detected in CPU topology".into(),
+        ));
+    }
+
+    let mut cores = Vec::new();
+    for raw_item in trimmed.split(',') {
+        let item = raw_item.trim();
+        if item.is_empty() {
+            return Err(Error::InvalidInput(format!(
+                "empty item in core selection '{spec}'"
+            )));
+        }
+
+        let range_parts = if let Some((a, b)) = item.split_once("..=") {
+            Some((a, b))
+        } else if let Some((a, b)) = item.split_once("..") {
+            Some((a, b))
+        } else {
+            item.split_once('-')
+        };
+
+        if let Some((start_s, end_s)) = range_parts {
+            let start = parse_core_selection_index(start_s, max_cores)?;
+            let end = parse_core_selection_index(end_s, max_cores)?;
+            if start > end {
+                return Err(Error::InvalidInput(format!(
+                    "invalid core range '{item}': start {start} > end {end}"
+                )));
+            }
+            for idx in start..=end {
+                if !cores.contains(&idx) {
+                    cores.push(idx);
+                }
+            }
+        } else {
+            let idx = parse_core_selection_index(item, max_cores)?;
+            if !cores.contains(&idx) {
+                cores.push(idx);
+            }
+        }
+    }
+
+    if cores.is_empty() {
+        return Err(Error::InvalidInput(format!(
+            "no core indices found in '{spec}'"
+        )));
+    }
+
+    Ok(cores)
+}
+
+fn parse_core_selection_index(s: &str, max_cores: usize) -> Result<u32> {
+    let trimmed = s.trim();
+    if trimmed.is_empty() || !trimmed.bytes().all(|b| b.is_ascii_digit()) {
+        return Err(Error::InvalidInput(format!(
+            "invalid core index '{s}': expected non-negative integer"
+        )));
+    }
+    let idx: u32 = trimmed
+        .parse()
+        .map_err(|_| Error::InvalidInput(format!("invalid core index '{s}': numeric overflow")))?;
+    if (idx as usize) >= max_cores {
+        return Err(Error::OutOfBounds {
+            field: "core_index".into(),
+            value: idx.to_string(),
+            bounds: format!("0..{max_cores}"),
+        });
+    }
+    Ok(idx)
+}
+
+fn cmd_test(cli: &Cli, transport: &dyn SmuTransport, test: &TestCommand) -> Result<CliOutcome> {
+    let duration_per_core_secs = bounds::parse_duration_secs(&test.duration)?;
+    let sample_interval_ms = bounds::parse_duration_ms(&test.interval)?;
+    let hw = probe_hw(cli, transport)?;
+
+    let cores = match test.cores.as_deref() {
+        Some(spec) => parse_core_selection(spec, hw.topology.physical_cores)?,
+        None => Vec::new(),
+    };
+
+    let config = BenchConfig {
+        cores,
+        duration_per_core_secs,
+        passes: test.passes,
+        workload: test.workload.into(),
+        sample_interval_ms,
+        stop_on_error: !test.continue_on_error,
+    };
+
+    let targets = bench::validate_bench_config(&config, &hw)?;
+
+    let is_root = is_effective_root();
+    if test.rollback_on_fail && !is_root && !cli.json && !cli.quiet {
+        eprintln!(
+            "note: --rollback-on-fail requires root privileges (re-run with sudo to enable automatic rollback on failure)"
+        );
+    }
+
+    let show_progress = !cli.json && !cli.quiet;
+    let stderr_is_tty = io::stderr().is_terminal();
+    if show_progress {
+        eprintln!(
+            "Testing {} ({} core(s), {} pass(es), {}s/core, workload={}) — Ctrl-C to stop...",
+            hw.codename.display_name(),
+            targets.len(),
+            config.passes,
+            config.duration_per_core_secs,
+            config.workload
+        );
+    }
+
+    let sig_bridge = SignalStopBridge::install();
+    let stop_flag = sig_bridge.stop_flag();
+    let mut saw_progress = false;
+    let mut last_logged_core: Option<(u32, u32)> = None;
+
+    let report = bench::run_core_cycler(transport, &hw, &config, stop_flag, |p| {
+        if INTERRUPTED.load(Ordering::SeqCst) {
+            stop_flag.store(true, Ordering::Release);
+        }
+        if !show_progress {
+            return;
+        }
+        saw_progress = true;
+        let freq = p
+            .latest_freq_mhz
+            .map(|m| format!("{m:.0} MHz"))
+            .unwrap_or_else(|| "n/a".into());
+        let temp = p
+            .latest_temp_c
+            .map(|t| format!("{t:.1}°C"))
+            .unwrap_or_else(|| "n/a".into());
+        if stderr_is_tty {
+            eprint!(
+                "\rPass {}/{} | Core {} ({}/{}) | {:>5.1}/{}s | {} | {}   ",
+                p.pass,
+                p.total_passes,
+                p.core_index,
+                p.core_pos + 1,
+                p.total_cores,
+                p.elapsed_secs,
+                p.target_secs,
+                freq,
+                temp
+            );
+            let _ = io::stderr().flush();
+        } else if last_logged_core != Some((p.pass, p.core_index)) {
+            last_logged_core = Some((p.pass, p.core_index));
+            eprintln!(
+                "Pass {}/{} | Core {} ({}/{}) | target {}s | {} | {}",
+                p.pass,
+                p.total_passes,
+                p.core_index,
+                p.core_pos + 1,
+                p.total_cores,
+                p.target_secs,
+                freq,
+                temp
+            );
+        }
+    })?;
+
+    drop(sig_bridge);
+
+    if show_progress && saw_progress && stderr_is_tty {
+        eprintln!();
+    }
+
+    let mut rollback_note: Option<String> = None;
+    if test.rollback_on_fail && !report.failed_cores.is_empty() {
+        if !is_root {
+            rollback_note = Some(
+                "--rollback-on-fail skipped: requires root privileges (re-run with sudo)".into(),
+            );
+        } else {
+            let store = SnapshotStore::new(state_dir(cli));
+            let path = store.last_state_path();
+            match store.load_last_state() {
+                Ok(Some(snap)) => {
+                    match session::apply_snapshot(transport, &hw, &snap, true, cli.dry_run) {
+                        Ok(ops) => {
+                            let prefix = if cli.dry_run {
+                                "[DRY-RUN] would roll back"
+                            } else {
+                                "automatically rolled back"
+                            };
+                            rollback_note = Some(format!(
+                                "{prefix} SMU state from {} ({} operation(s))",
+                                path.display(),
+                                ops.len()
+                            ));
+                        }
+                        Err(err) => {
+                            rollback_note = Some(format!(
+                                "automatic rollback from {} failed: {err}",
+                                path.display()
+                            ));
+                        }
+                    }
+                }
+                Ok(None) => {
+                    rollback_note = Some(format!(
+                        "--rollback-on-fail skipped: no last-state snapshot found at {}",
+                        path.display()
+                    ));
+                }
+                Err(err) => {
+                    rollback_note = Some(format!(
+                        "--rollback-on-fail failed to load {}: {err}",
+                        path.display()
+                    ));
+                }
+            }
+        }
+    }
+
+    if cli.json {
+        print_json(&report);
+        if let Some(ref note) = rollback_note {
+            if !cli.quiet {
+                eprintln!("rollback: {note}");
+            }
+        }
+    } else {
+        print_bench_report(&report);
+        if let Some(ref note) = rollback_note {
+            println!();
+            println!("Rollback : {note}");
+        }
+    }
+
+    if report.passed {
+        Ok(CliOutcome::Success)
+    } else {
+        Ok(CliOutcome::ExitWithCode(1))
+    }
+}
+
+// ============================================================================
+// Prometheus / OpenMetrics Telemetry Exporter (`export`) — Zero Root Required
+// ============================================================================
+
+fn emit_exporter_service_action(
+    cli: &Cli,
+    action: &str,
+    dry_run: bool,
+    status: metrics::ExporterServiceStatus,
+    note: String,
+) {
+    let out = ExporterServiceActionOutput {
+        action: action.to_string(),
+        dry_run,
+        status,
+        note: Some(note),
+    };
+    if cli.json {
+        print_json(&out);
+    } else if dry_run || !cli.quiet {
+        print_exporter_service_action(&out);
+    }
+}
+
+fn cmd_export(
+    cli: &Cli,
+    transport: &dyn SmuTransport,
+    export: &ExportCommand,
+) -> Result<CliOutcome> {
+    match &export.action {
+        Some(ExportAction::Service { action }) => match action {
+            ExportServiceAction::Status => {
+                let status = metrics::read_exporter_service_status();
+                if cli.json {
+                    print_json(&status);
+                } else {
+                    print_exporter_service_status(&status);
+                }
+                Ok(CliOutcome::Success)
+            }
+            ExportServiceAction::Enable => {
+                if cli.dry_run {
+                    let status = metrics::read_exporter_service_status();
+                    emit_exporter_service_action(
+                        cli,
+                        "export service enable",
+                        true,
+                        status,
+                        format!(
+                            "would run `systemctl --user enable --now {}`",
+                            metrics::USER_EXPORTER_SERVICE_NAME
+                        ),
+                    );
+                    return Ok(CliOutcome::Success);
+                }
+                let status = metrics::set_exporter_service_enabled(true)?;
+                emit_exporter_service_action(
+                    cli,
+                    "export service enable",
+                    false,
+                    status,
+                    format!(
+                        "enabled and started {}",
+                        metrics::USER_EXPORTER_SERVICE_NAME
+                    ),
+                );
+                Ok(CliOutcome::Success)
+            }
+            ExportServiceAction::Disable => {
+                if cli.dry_run {
+                    let status = metrics::read_exporter_service_status();
+                    emit_exporter_service_action(
+                        cli,
+                        "export service disable",
+                        true,
+                        status,
+                        format!(
+                            "would run `systemctl --user disable --now {}`",
+                            metrics::USER_EXPORTER_SERVICE_NAME
+                        ),
+                    );
+                    return Ok(CliOutcome::Success);
+                }
+                let status = metrics::set_exporter_service_enabled(false)?;
+                emit_exporter_service_action(
+                    cli,
+                    "export service disable",
+                    false,
+                    status,
+                    format!(
+                        "disabled and stopped {}",
+                        metrics::USER_EXPORTER_SERVICE_NAME
+                    ),
+                );
+                Ok(CliOutcome::Success)
+            }
+        },
+        None => {
+            let hw = probe_hw(cli, transport)?;
+            let cfg = MetricsServerConfig {
+                listen_addr: export.listen.clone(),
+                include_per_core: !export.no_per_core,
+            };
+            let sig_bridge = SignalStopBridge::install();
+            metrics::serve_metrics(transport, &hw, &cfg, sig_bridge.stop_flag(), |addr| {
+                if !cli.json && !cli.quiet {
+                    eprintln!("Listening on http://{addr}/metrics (Ctrl-C to stop)");
+                }
+            })?;
+            Ok(CliOutcome::Success)
+        }
+    }
+}
+
+// ============================================================================
 // Profiles (`profile`)
 // ============================================================================
 
@@ -2262,5 +2709,54 @@ fn wait_for_confirmation_or_rollback(
             emit_mutation(cli, &out, false);
             Ok(CliOutcome::ExitWithCode(1))
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_core_selection_supports_lists_ranges_and_deduplication() {
+        assert_eq!(
+            parse_core_selection("0,1,4..7", 8).unwrap(),
+            vec![0, 1, 4, 5, 6, 7]
+        );
+        assert_eq!(
+            parse_core_selection("2..=4,3,0-1", 8).unwrap(),
+            vec![2, 3, 4, 0, 1]
+        );
+        assert_eq!(parse_core_selection(" 5 ", 8).unwrap(), vec![5]);
+
+        assert!(matches!(
+            parse_core_selection("8", 8),
+            Err(Error::OutOfBounds { .. })
+        ));
+        assert!(matches!(
+            parse_core_selection("4..2", 8),
+            Err(Error::InvalidInput(_))
+        ));
+        assert!(matches!(
+            parse_core_selection("", 8),
+            Err(Error::InvalidInput(_))
+        ));
+        assert!(matches!(
+            parse_core_selection("0,,2", 8),
+            Err(Error::InvalidInput(_))
+        ));
+        assert!(matches!(
+            parse_core_selection("abc", 8),
+            Err(Error::InvalidInput(_))
+        ));
+    }
+
+    #[test]
+    fn render_manpage_produces_valid_roff_output() {
+        let bytes = render_manpage_bytes().unwrap();
+        let text = String::from_utf8(bytes).unwrap();
+        assert!(text.contains(".TH zensmu 1"), "{text}");
+        assert!(text.contains("test"), "{text}");
+        assert!(text.contains("export"), "{text}");
+        assert!(text.contains("manpage"), "{text}");
     }
 }

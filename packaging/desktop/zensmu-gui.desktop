@@ -1,0 +1,13 @@
+[Desktop Entry]
+Version=1.0
+Type=Application
+Name=zensmu
+GenericName=AMD Ryzen SMU Monitor & Tuner
+Comment=Safety-first AMD Ryzen SMU telemetry, Curve Optimizer, and PBO/APU control
+Exec=/usr/bin/zensmu-gui
+Icon=zensmu
+Terminal=false
+Categories=System;HardwareSettings;Monitor;Utility;
+Keywords=amd;ryzen;smu;undervolt;curve-optimizer;pbo;telemetry;
+StartupWMClass=zensmu-gui
+StartupNotify=true

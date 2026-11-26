@@ -1,9 +1,11 @@
 //! `zensmu-core`: Safety-first library for AMD Ryzen SMU control and telemetry.
 
+pub mod bench;
 pub mod config;
 pub mod driver;
 pub mod error;
 pub mod hw;
+pub mod metrics;
 pub mod ops;
 pub mod recorder;
 pub mod report;

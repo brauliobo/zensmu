@@ -1,0 +1,67 @@
+name: CPU / PM Table Support Request
+description: Request support for a new or untested AMD Ryzen CPU, APU, or PM table version
+title: "[CPU Support]: "
+labels:
+  - cpu-support
+  - triage
+body:
+  - type: markdown
+    attributes:
+      value: |
+        ### Quickest way to submit a CPU / PM table report
+
+        Run the built-in privacy-safe report generator (it strips hostnames, usernames, and serial numbers):
+
+        ```bash
+        sudo zensmu report --raw-pm-table --open
+        ```
+
+        (Or run `zensmu report --raw-pm-table` without `--open` and paste the output below.)
+
+        Including `--raw-pm-table` captures the CPUID, `ryzen_smu` codename, SMU firmware version, mailbox probes, and raw PM table floats required to safely map your processor.
+
+  - type: input
+    id: cpu_model
+    attributes:
+      label: CPU Model & Codename
+      description: Exact AMD Ryzen model name and codename (if known)
+      placeholder: "e.g., AMD Ryzen 9 9950X3D (Granite Ridge) or Ryzen AI 9 HX 370 (Strix Point)"
+    validations:
+      required: true
+
+  - type: input
+    id: motherboard_bios
+    attributes:
+      label: Motherboard / Laptop & BIOS / AGESA Version
+      description: Board or laptop model along with BIOS and AGESA version
+      placeholder: "e.g., ASUS ROG Crosshair X870E Hero — BIOS 1203 (AGESA 1.2.0.3a)"
+    validations:
+      required: true
+
+  - type: input
+    id: distro_kernel
+    attributes:
+      label: Linux Distribution & Kernel Version
+      description: Output of `uname -r` and your distribution
+      placeholder: "e.g., Fedora 42 — Linux 6.14.2"
+    validations:
+      required: true
+
+  - type: textarea
+    id: report_output
+    attributes:
+      label: Output of `zensmu report --raw-pm-table`
+      description: Paste the full output of `sudo zensmu report --raw-pm-table` (or `zensmu report --raw-pm-table`)
+      placeholder: "Paste full `zensmu report --raw-pm-table` output here..."
+      render: markdown
+    validations:
+      required: true
+
+  - type: textarea
+    id: additional_context
+    attributes:
+      label: Additional Context
+      description: Optional notes (e.g., `ryzen_smu` fork/version, known BIOS PBO/CO values for cross-checking PM table offsets)
+      placeholder: "Optional: BIOS PBO/CO settings or observed sensor values (e.g., k10temp/hwmon)..."
+    validations:
+      required: false

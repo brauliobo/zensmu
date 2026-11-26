@@ -3,12 +3,14 @@
 use crate::doctor::{CheckStatus, DoctorReport};
 use serde::Serialize;
 use std::sync::OnceLock;
+use zensmu_core::bench::{BenchReport, CoreBenchStatus};
 use zensmu_core::config::profile::ProfileDiffEntry;
 use zensmu_core::driver::{DriverActionOutput, DriverStatus};
 use zensmu_core::error::Error;
 use zensmu_core::hw::identity::{driver_has_false_ok_bug, CpuidInfo, HardwareContext};
 use zensmu_core::hw::profiles::CoBounds;
 use zensmu_core::hw::topology::CpuTopology;
+use zensmu_core::metrics::ExporterServiceStatus;
 use zensmu_core::ops::co::{CoSnapshot, CoreCoMargin};
 use zensmu_core::ops::pbo::PboStatus;
 use zensmu_core::ops::pm_table::TelemetrySnapshot;
@@ -138,6 +140,15 @@ pub struct RecordServiceActionOutput {
     pub action: String,
     pub dry_run: bool,
     pub status: RecordServiceStatus,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub note: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct ExporterServiceActionOutput {
+    pub action: String,
+    pub dry_run: bool,
+    pub status: ExporterServiceStatus,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub note: Option<String>,
 }
@@ -1001,20 +1012,25 @@ pub fn print_persist_action(out: &PersistActionOutput) {
     print_persist_status(&out.status);
 }
 
-pub fn print_driver_status(status: &DriverStatus) {
-    println!("ryzen_smu Kernel Driver");
-    println!("=======================");
-    println!("Summary          : {}", status.summary);
-    println!(
-        "Loaded           : {}",
+pub fn format_driver_status(status: &DriverStatus) -> String {
+    use std::fmt::Write as _;
+
+    let mut out = String::new();
+    let _ = writeln!(out, "ryzen_smu Kernel Driver");
+    let _ = writeln!(out, "=======================");
+    let _ = writeln!(out, "Summary                : {}", status.summary);
+    let _ = writeln!(
+        out,
+        "Loaded                 : {}",
         if status.loaded { "yes" } else { "no" }
     );
     if let Some(ref v) = status.drv_version {
-        println!("Driver Version   : {v}");
+        let _ = writeln!(out, "Driver Version         : {v}");
     }
-    println!("Sysfs Path       : {}", status.sysfs_path);
-    println!(
-        "Module Installed : {}{}",
+    let _ = writeln!(out, "Sysfs Path             : {}", status.sysfs_path);
+    let _ = writeln!(
+        out,
+        "Module Installed       : {}{}",
         if status.module_installed { "yes" } else { "no" },
         status
             .module_path
@@ -1022,8 +1038,9 @@ pub fn print_driver_status(status: &DriverStatus) {
             .map(|p| format!(" ({p})"))
             .unwrap_or_default()
     );
-    println!(
-        "DKMS Registered  : {}{}",
+    let _ = writeln!(
+        out,
+        "DKMS Registered        : {}{}",
         if status.dkms_installed { "yes" } else { "no" },
         status
             .dkms_status
@@ -1031,31 +1048,63 @@ pub fn print_driver_status(status: &DriverStatus) {
             .map(|s| format!(" ({})", s.replace('\n', "; ")))
             .unwrap_or_default()
     );
-    println!(
-        "Boot Autoload    : {}",
+    let _ = writeln!(
+        out,
+        "Boot Autoload          : {}",
         if status.autoload_configured {
             "configured (/etc/modules-load.d/ryzen_smu.conf)"
         } else {
             "not configured"
         }
     );
-    println!("Kernel           : {}", status.kernel_release);
-    println!(
-        "Distribution     : {} ({})",
+    let sb = &status.secure_boot;
+    let sb_state = match sb.secure_boot_enabled {
+        Some(true) => "enabled",
+        Some(false) => "disabled",
+        None => "unknown",
+    };
+    let lockdown = sb.lockdown_mode.as_deref().unwrap_or("none");
+    let sb_note = if sb.blocks_unsigned_modules {
+        if status.loaded {
+            " (blocks unsigned modules; ryzen_smu loaded)"
+        } else {
+            " (blocks unsigned modules)"
+        }
+    } else {
+        ""
+    };
+    let _ = writeln!(
+        out,
+        "Secure Boot / Lockdown : Secure Boot {sb_state}, lockdown={lockdown}{sb_note}"
+    );
+    if sb.blocks_unsigned_modules && !status.loaded {
+        if let Some(ref hint) = sb.hint {
+            let _ = writeln!(out, "Secure Boot Hint       : {hint}");
+        }
+    }
+    let _ = writeln!(out, "Kernel                 : {}", status.kernel_release);
+    let _ = writeln!(
+        out,
+        "Distribution           : {} ({})",
         status.distro_name, status.distro_family
     );
     if !status.loaded {
-        println!();
-        println!("Recommended next step:");
-        println!("  {}", status.recommended_command);
+        let _ = writeln!(out);
+        let _ = writeln!(out, "Recommended next step:");
+        let _ = writeln!(out, "  {}", status.recommended_command);
         if !status.manual_commands.is_empty() {
-            println!();
-            println!("Manual install options:");
+            let _ = writeln!(out);
+            let _ = writeln!(out, "Manual install options:");
             for cmd in &status.manual_commands {
-                println!("  {cmd}");
+                let _ = writeln!(out, "  {cmd}");
             }
         }
     }
+    out
+}
+
+pub fn print_driver_status(status: &DriverStatus) {
+    print!("{}", format_driver_status(status));
 }
 
 pub fn print_driver_action(out: &DriverActionOutput) {
@@ -1128,6 +1177,173 @@ pub fn print_record_stats(stats: &RecordStats, pts_name: Option<&str>) {
     if let Some(name) = pts_name {
         println!("View in Phoronix Test Suite: phoronix-test-suite show-result {name}");
     }
+}
+
+pub fn format_bench_report(report: &BenchReport) -> String {
+    use std::fmt::Write as _;
+
+    let mut out = String::new();
+    let _ = writeln!(out, "Per-Core CO Stability Test — {}", report.codename);
+    let _ = writeln!(
+        out,
+        "================================================================================"
+    );
+    let _ = writeln!(out, "Workload         : {}", report.workload);
+    let _ = writeln!(out, "Passes Completed : {}", report.passes_completed);
+    let _ = writeln!(out, "Total Duration   : {:.1}s", report.total_duration_secs);
+    let _ = writeln!(
+        out,
+        "Kernel MCE Log   : {}",
+        if report.dmesg_readable {
+            "readable"
+        } else {
+            "unreadable (run with sudo or grant dmesg/journalctl access for full MCE log detection)"
+        }
+    );
+
+    let verdict = if report.passed {
+        "PASSED".to_string()
+    } else if !report.failed_cores.is_empty() {
+        let cores = format_cpu_list(&report.failed_cores);
+        if report.cancelled {
+            format!("FAILED & CANCELLED (failed core(s): {cores})")
+        } else {
+            format!("FAILED (failed core(s): {cores})")
+        }
+    } else if report.cancelled {
+        "CANCELLED".to_string()
+    } else {
+        "INCOMPLETE".to_string()
+    };
+    let _ = writeln!(out, "Result           : {verdict}");
+
+    if !report.results.is_empty() {
+        let _ = writeln!(out);
+        let _ = writeln!(
+            out,
+            "{:<4} {:<4} {:<4} {:<14} {:>7} {:>8} {:>10} {:>9} {:>9} {:>15} {:>9}",
+            "PASS",
+            "CORE",
+            "CPU",
+            "STATUS",
+            "TIME",
+            "ITERS",
+            "PEAK FREQ",
+            "PEAK TEMP",
+            "PEAK PWR",
+            "VCORE MIN/MAX",
+            "MCE CE/UE"
+        );
+        let _ = writeln!(
+            out,
+            "{:-<4} {:-<4} {:-<4} {:-<14} {:->7} {:->8} {:->10} {:->9} {:->9} {:->15} {:->9}",
+            "", "", "", "", "", "", "", "", "", "", ""
+        );
+        for r in &report.results {
+            let freq = r
+                .peak_freq_mhz
+                .map(|m| format!("{m:.0} MHz"))
+                .unwrap_or_else(|| "n/a".into());
+            let temp = r
+                .peak_temp_c
+                .map(|t| format!("{t:.1} °C"))
+                .unwrap_or_else(|| "n/a".into());
+            let pwr = r
+                .peak_power_w
+                .map(|w| format!("{w:.1} W"))
+                .unwrap_or_else(|| "n/a".into());
+            let vcore = match (r.min_voltage_v, r.max_voltage_v) {
+                (Some(lo), Some(hi)) => format!("{lo:.3}/{hi:.3}V"),
+                (Some(v), None) | (None, Some(v)) => format!("{v:.3} V"),
+                (None, None) => "n/a".into(),
+            };
+            let mce = format!("{}/{}", r.mce_delta_corrected, r.mce_delta_uncorrected);
+            let _ = writeln!(
+                out,
+                "{:<4} {:<4} {:<4} {:<14} {:>6.1}s {:>8} {:>10} {:>9} {:>9} {:>15} {:>9}",
+                r.pass,
+                r.core_index,
+                r.logical_cpu,
+                r.status.as_str(),
+                r.duration_secs,
+                r.iterations,
+                freq,
+                temp,
+                pwr,
+                vcore,
+                mce
+            );
+        }
+    }
+
+    let failures: Vec<_> = report
+        .results
+        .iter()
+        .filter(|r| {
+            matches!(
+                r.status,
+                CoreBenchStatus::FailedMce | CoreBenchStatus::FailedCompute
+            ) || r.error.is_some()
+                || !r.new_mce_lines.is_empty()
+        })
+        .collect();
+
+    if !failures.is_empty() {
+        let _ = writeln!(out);
+        let _ = writeln!(out, "Failure Details:");
+        for r in failures {
+            let msg = r.error.as_deref().unwrap_or(r.status.as_str());
+            let _ = writeln!(out, "  - Pass {} Core {}: {msg}", r.pass, r.core_index);
+            for line in &r.new_mce_lines {
+                let _ = writeln!(out, "      MCE: {line}");
+            }
+        }
+    }
+
+    if !report.failed_cores.is_empty() {
+        let _ = writeln!(out);
+        let _ = writeln!(
+            out,
+            "Tip: Reduce negative Curve Optimizer offset (e.g. +5 toward 0) on failed core(s): {}",
+            format_cpu_list(&report.failed_cores)
+        );
+    }
+
+    out
+}
+
+pub fn print_bench_report(report: &BenchReport) {
+    print!("{}", format_bench_report(report));
+}
+
+pub fn print_exporter_service_status(status: &ExporterServiceStatus) {
+    println!("Prometheus Metrics Exporter Service (user)");
+    println!("==========================================");
+    println!("Service              : {}", status.service_name);
+    println!(
+        "Installed            : {}",
+        if status.installed { "yes" } else { "no" }
+    );
+    println!(
+        "Enabled              : {}",
+        if status.enabled { "yes" } else { "no" }
+    );
+    println!(
+        "Active               : {}",
+        if status.active { "yes" } else { "no" }
+    );
+    println!("State                : {}", status.state);
+    println!("Endpoint             : {}", status.endpoint);
+}
+
+pub fn print_exporter_service_action(out: &ExporterServiceActionOutput) {
+    let tag = if out.dry_run { "[DRY-RUN]" } else { "[OK]" };
+    println!("{tag} {}", out.action);
+    if let Some(ref note) = out.note {
+        println!("Note                 : {note}");
+    }
+    println!();
+    print_exporter_service_status(&out.status);
 }
 
 fn fmt_opt_f32(v: Option<f32>, prec: usize, unit: &str) -> String {
@@ -1402,5 +1618,85 @@ mod tests {
             .get("markdown")
             .and_then(|v| v.as_str())
             .is_some_and(|m| m.contains("test note")));
+    }
+
+    #[test]
+    fn driver_status_format_displays_secure_boot_row_and_hint_when_unloaded() {
+        use zensmu_core::driver::{secure_boot_status_from, DistroFamily};
+
+        let status = DriverStatus {
+            sysfs_path: "/sys/kernel/ryzen_smu_drv".into(),
+            loaded: false,
+            drv_version: None,
+            module_installed: true,
+            module_path: Some("/lib/modules/6.12/ryzen_smu.ko".into()),
+            dkms_installed: true,
+            dkms_status: Some("ryzen_smu/0.1.7: installed".into()),
+            autoload_configured: true,
+            kernel_release: "6.12.0".into(),
+            distro_family: DistroFamily::Fedora,
+            distro_name: "Fedora Linux".into(),
+            summary: "ryzen_smu installed but not loaded".into(),
+            recommended_command: "sudo zensmu driver load".into(),
+            manual_commands: vec![],
+            secure_boot: secure_boot_status_from(Some(true), Some("integrity".into())),
+        };
+        let rendered = format_driver_status(&status);
+        assert!(rendered.contains("Secure Boot / Lockdown :"), "{rendered}");
+        assert!(rendered.contains("Secure Boot enabled"), "{rendered}");
+        assert!(rendered.contains("lockdown=integrity"), "{rendered}");
+        assert!(rendered.contains("Secure Boot Hint"), "{rendered}");
+        assert!(rendered.contains("mokutil"), "{rendered}");
+    }
+
+    #[test]
+    fn bench_report_format_renders_passed_and_failed_runs() {
+        use zensmu_core::bench::{BenchWorkload, CoreBenchResult};
+
+        let failed_report = BenchReport {
+            codename: "Granite Ridge (Zen 5)".into(),
+            workload: BenchWorkload::Mixed,
+            passes_completed: 0,
+            total_duration_secs: 12.4,
+            passed: false,
+            cancelled: false,
+            failed_cores: vec![3],
+            dmesg_readable: true,
+            results: vec![CoreBenchResult {
+                pass: 1,
+                core_index: 3,
+                logical_cpu: 6,
+                status: CoreBenchStatus::FailedMce,
+                duration_secs: 12.4,
+                iterations: 512,
+                peak_freq_mhz: Some(5525.0),
+                peak_temp_c: Some(68.5),
+                peak_power_w: Some(46.2),
+                min_voltage_v: Some(1.125),
+                max_voltage_v: Some(1.255),
+                mce_delta_corrected: 1,
+                mce_delta_uncorrected: 0,
+                new_mce_lines: vec!["mce: [Hardware Error]: CPU 6".into()],
+                error: Some("hardware MCE detected on core 3".into()),
+            }],
+        };
+
+        let rendered = format_bench_report(&failed_report);
+        assert!(
+            rendered.contains("FAILED (failed core(s): 3)"),
+            "{rendered}"
+        );
+        assert!(rendered.contains("failed-mce"), "{rendered}");
+        assert!(rendered.contains("5525 MHz"), "{rendered}");
+        assert!(rendered.contains("1.125/1.255V"), "{rendered}");
+        assert!(rendered.contains("Failure Details:"), "{rendered}");
+        assert!(
+            rendered.contains("MCE: mce: [Hardware Error]: CPU 6"),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains("Reduce negative Curve Optimizer offset"),
+            "{rendered}"
+        );
     }
 }

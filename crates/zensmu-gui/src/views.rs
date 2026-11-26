@@ -9,8 +9,10 @@ use crate::elevate::CliAction;
 use eframe::egui::{self, Color32, RichText, Stroke, Ui};
 use egui_plot::{HLine, Line, Plot, PlotPoints};
 use std::collections::BTreeMap;
+use zensmu_core::bench::{BenchWorkload, CoreBenchStatus};
 use zensmu_core::driver::{DistroFamily, DriverInstallMethod};
 use zensmu_core::hw::identity::{driver_has_false_ok_bug, HardwareContext};
+use zensmu_core::metrics::{DEFAULT_METRICS_LISTEN, USER_EXPORTER_SERVICE_NAME};
 use zensmu_core::ops::apu::{
     APU_FAST_POWER_SOFT_MAX_W, APU_POWER_MAX_W, APU_POWER_MIN_W, APU_POWER_SOFT_MAX_W,
     APU_SKIN_TEMP_MAX_C, APU_SKIN_TEMP_MIN_C, APU_SKIN_TEMP_SOFT_MAX_C, APU_SOC_EDC_MAX_A,
@@ -605,6 +607,7 @@ pub fn render_top_bar(app: &mut ZensmuApp, ctx: &egui::Context) {
                     app.refresh_safety_files();
                     app.refresh_persist_status();
                     app.refresh_record_daemon_status();
+                    app.refresh_exporter_daemon_status();
                 }
 
                 let (guard_text, guard_fg, guard_bg, guard_stroke, guard_hover) =
@@ -641,6 +644,7 @@ pub fn render_top_bar(app: &mut ZensmuApp, ctx: &egui::Context) {
                     app.refresh_safety_files();
                     app.refresh_persist_status();
                     app.refresh_record_daemon_status();
+                    app.refresh_exporter_daemon_status();
                 }
 
                 if let Some(hw) = &app.hw {
@@ -982,6 +986,7 @@ pub fn render_sidebar(app: &mut ZensmuApp, ctx: &egui::Context) {
                         app.refresh_safety_files();
                         app.refresh_persist_status();
                         app.refresh_record_daemon_status();
+                        app.refresh_exporter_daemon_status();
                     }
                 }
                 ui.add_space(4.0);
@@ -1087,6 +1092,23 @@ pub fn render_banners(app: &mut ZensmuApp, ui: &mut Ui, ctx: &egui::Context) {
                 ui.label(RichText::new(&err).small().color(TEXT_PRIMARY));
                 if let Some(hint) = hw_hint {
                     ui.label(RichText::new(hint).small().color(TEXT_MUTED));
+                }
+                if !is_unsupported_or_mismatch
+                    && app.driver_status.secure_boot.blocks_unsigned_modules
+                {
+                    ui.add_space(4.0);
+                    let sb_warning = match app.driver_status.secure_boot.hint.as_deref() {
+                        Some(sb_hint) if !sb_hint.trim().is_empty() => {
+                            format!("Secure Boot / MOK warning: {sb_hint}")
+                        }
+                        _ => "Secure Boot / kernel lockdown is active — unsigned `ryzen_smu` DKMS modules require MOK signing (`sudo mokutil --import /var/lib/dkms/mok.pub`) or disabling Secure Boot.".to_string(),
+                    };
+                    ui.label(
+                        RichText::new(sb_warning)
+                            .small()
+                            .strong()
+                            .color(ACCENT_AMBER),
+                    );
                 }
                 ui.add_space(6.0);
                 let driver_cmd = app.driver_status.recommended_command.clone();
@@ -1706,6 +1728,7 @@ fn render_dashboard_recorder_strip(app: &mut ZensmuApp, ui: &mut Ui) {
         app.refresh_safety_files();
         app.refresh_persist_status();
         app.refresh_record_daemon_status();
+        app.refresh_exporter_daemon_status();
     }
 }
 
@@ -2274,6 +2297,358 @@ pub fn render_curve_optimizer(app: &mut ZensmuApp, ui: &mut Ui, ctx: &egui::Cont
                 }
             });
         });
+    }
+
+    // Core-Cycler Stability Tester Card (unprivileged)
+    ui.add_space(12.0);
+    render_core_cycler_card(app, ui, ctx);
+}
+
+fn format_bench_workload_label(workload: BenchWorkload) -> &'static str {
+    match workload {
+        BenchWorkload::Mixed => "Mixed",
+        BenchWorkload::Integer => "Integer",
+        BenchWorkload::FloatingPoint => "FP",
+        BenchWorkload::Cache => "Cache",
+    }
+}
+
+fn render_core_cycler_card(app: &mut ZensmuApp, ui: &mut Ui, ctx: &egui::Context) {
+    let running = app.bench.running;
+    let mut start_clicked = false;
+    let mut stop_clicked = false;
+
+    card_frame().show(ui, |ui| {
+        ui.set_width(ui.available_width());
+        split_or_wrap_row(
+            ui,
+            "co_core_cycler_header",
+            |ui| {
+                ui.label(RichText::new("Core-Cycler Stability Tester").strong());
+                if running {
+                    tinted_pill(ui, "RUNNING", ACCENT_CYAN, PILL_ALPHA_CYAN);
+                } else if let Some(report) = &app.bench.last_report {
+                    if report.cancelled {
+                        tinted_pill(ui, "CANCELLED", ACCENT_AMBER, PILL_ALPHA_AMBER);
+                    } else if report.passed {
+                        tinted_pill(ui, "PASSED", ACCENT_EMERALD, PILL_ALPHA_EMERALD);
+                    } else {
+                        tinted_pill(ui, "FAILED", ACCENT_CRIMSON, PILL_ALPHA_CRIMSON);
+                    }
+                } else {
+                    tinted_pill(
+                        ui,
+                        "Unprivileged · no pkexec",
+                        ACCENT_EMERALD,
+                        PILL_ALPHA_EMERALD,
+                    );
+                }
+            },
+            |ui| {
+                if running {
+                    if ui
+                        .add(cta_button("Stop Test", CTA_CRIMSON))
+                        .on_hover_text("Stop the running per-core stability test cleanly")
+                        .clicked()
+                    {
+                        stop_clicked = true;
+                    }
+                } else if ui
+                    .add_enabled(
+                        app.hw.is_some(),
+                        cta_button("Run Core-Cycler", CTA_EMERALD),
+                    )
+                    .on_hover_text(
+                        "Pin deterministic self-checking stress threads core-by-core without root",
+                    )
+                    .clicked()
+                {
+                    start_clicked = true;
+                }
+            },
+        );
+
+        ui.add_space(6.0);
+        ui.label(
+            RichText::new(
+                "Cycles a deterministic self-verifying stress worker across every physical core to catch unstable Curve Optimizer undervolts (compute errors & MCE/EDAC deltas) without requiring root.",
+            )
+            .small()
+            .color(TEXT_MUTED),
+        );
+
+        ui.add_space(8.0);
+        ui.add_enabled_ui(!running, |ui| {
+            ui.horizontal_wrapped(|ui| {
+                ui.label(RichText::new("Workload:").small().color(TEXT_MUTED));
+                egui::ComboBox::from_id_salt("co_bench_workload_combo")
+                    .width(96.0)
+                    .selected_text(format_bench_workload_label(app.bench.workload))
+                    .show_ui(ui, |ui| {
+                        for workload in [
+                            BenchWorkload::Mixed,
+                            BenchWorkload::Integer,
+                            BenchWorkload::FloatingPoint,
+                            BenchWorkload::Cache,
+                        ] {
+                            ui.selectable_value(
+                                &mut app.bench.workload,
+                                workload,
+                                format_bench_workload_label(workload),
+                            );
+                        }
+                    });
+
+                ui.label(RichText::new("Per-Core:").small().color(TEXT_MUTED));
+                egui::ComboBox::from_id_salt("co_bench_duration_combo")
+                    .width(74.0)
+                    .selected_text(format!("{}s", app.bench.duration_per_core_secs))
+                    .show_ui(ui, |ui| {
+                        for secs in [5u64, 15, 30, 60] {
+                            ui.selectable_value(
+                                &mut app.bench.duration_per_core_secs,
+                                secs,
+                                format!("{secs}s"),
+                            );
+                        }
+                    });
+
+                ui.label(RichText::new("Passes:").small().color(TEXT_MUTED));
+                egui::ComboBox::from_id_salt("co_bench_passes_combo")
+                    .width(60.0)
+                    .selected_text(app.bench.passes.to_string())
+                    .show_ui(ui, |ui| {
+                        for passes in [1u32, 2, 3] {
+                            ui.selectable_value(
+                                &mut app.bench.passes,
+                                passes,
+                                passes.to_string(),
+                            );
+                        }
+                    });
+
+                ui.checkbox(&mut app.bench.stop_on_error, "Stop on error");
+            });
+        });
+
+        if running {
+            ui.add_space(8.0);
+            if let Some(p) = &app.bench.progress {
+                let total_steps =
+                    (p.total_cores.max(1) as f64) * (p.total_passes.max(1) as f64);
+                let completed_steps =
+                    ((p.pass.saturating_sub(1) as usize) * p.total_cores + p.core_pos) as f64;
+                let core_frac = if p.target_secs > 0 {
+                    (p.elapsed_secs / (p.target_secs as f64)).clamp(0.0, 1.0)
+                } else {
+                    0.0
+                };
+                let overall_frac = ((completed_steps + core_frac) / total_steps).clamp(0.0, 1.0)
+                    as f32;
+
+                let mut readout = format!(
+                    "Pass {}/{} · Core C{} ({}/{}) · {:.1}s / {}s",
+                    p.pass,
+                    p.total_passes,
+                    p.core_index,
+                    p.core_pos + 1,
+                    p.total_cores,
+                    p.elapsed_secs,
+                    p.target_secs
+                );
+                if let Some(mhz) = p.latest_freq_mhz {
+                    readout.push_str(&format!(" · {mhz:.0} MHz"));
+                }
+                if let Some(temp_c) = p.latest_temp_c {
+                    readout.push_str(&format!(" · {temp_c:.1} °C"));
+                }
+
+                split_or_wrap_row(
+                    ui,
+                    "co_bench_progress_caption",
+                    |ui| {
+                        ui.spinner();
+                        ui.label(
+                            RichText::new(&readout)
+                                .small()
+                                .monospace()
+                                .color(TEXT_PRIMARY),
+                        );
+                    },
+                    |ui| {
+                        ui.label(
+                            RichText::new(format!("{:.0}%", overall_frac * 100.0))
+                                .small()
+                                .strong()
+                                .monospace()
+                                .color(ACCENT_CYAN),
+                        );
+                    },
+                );
+                ui.add_space(4.0);
+                ui.add(
+                    egui::ProgressBar::new(overall_frac)
+                        .desired_height(10.0)
+                        .corner_radius(egui::CornerRadius::same(4))
+                        .fill(ACCENT_CYAN),
+                );
+            } else {
+                ui.horizontal(|ui| {
+                    ui.spinner();
+                    ui.label(
+                        RichText::new("Initializing Core-Cycler worker…")
+                            .small()
+                            .color(TEXT_MUTED),
+                    );
+                });
+            }
+        }
+
+        if let Some(err) = &app.bench.error {
+            ui.add_space(6.0);
+            ui.label(
+                RichText::new(format!("✗ {err}"))
+                    .small()
+                    .color(ACCENT_CRIMSON),
+            );
+        }
+
+        if let Some(report) = &app.bench.last_report {
+            ui.add_space(8.0);
+            ui.separator();
+            ui.add_space(6.0);
+
+            ui.horizontal_wrapped(|ui| {
+                ui.label(
+                    RichText::new(format!(
+                        "Last Run · {} · {} pass(es) · {:.1}s total · {} core result(s)",
+                        format_bench_workload_label(report.workload),
+                        report.passes_completed,
+                        report.total_duration_secs,
+                        report.results.len()
+                    ))
+                    .small()
+                    .color(TEXT_MUTED),
+                );
+            });
+
+            if !report.dmesg_readable {
+                ui.add_space(4.0);
+                ui.label(
+                    RichText::new(
+                        "Kernel dmesg is restricted unprivileged — run `sudo zensmu test` to also scan kernel dmesg for WHEA/MCE logs.",
+                    )
+                    .small()
+                    .color(ACCENT_AMBER),
+                );
+            }
+
+            if !report.results.is_empty() {
+                let multi_pass =
+                    report.passes_completed > 1 || report.results.iter().any(|r| r.pass > 1);
+                ui.add_space(6.0);
+                egui::Grid::new("co_bench_results_grid")
+                    .num_columns(5)
+                    .striped(true)
+                    .spacing([14.0, 5.0])
+                    .show(ui, |ui| {
+                        grid_header_row(
+                            ui,
+                            &["Core / Result", "Peak Clock", "Peak Temp", "MCE Delta", "Detail"],
+                        );
+
+                        for res in &report.results {
+                            let (status_tag, status_color) = match res.status {
+                                CoreBenchStatus::Passed => ("PASS", ACCENT_EMERALD),
+                                CoreBenchStatus::FailedMce => ("FAIL (MCE)", ACCENT_CRIMSON),
+                                CoreBenchStatus::FailedCompute => {
+                                    ("FAIL (COMPUTE)", ACCENT_CRIMSON)
+                                }
+                                CoreBenchStatus::Cancelled => ("CANCELLED", ACCENT_AMBER),
+                            };
+                            let core_label = if multi_pass {
+                                format!("P{} C{} {status_tag}", res.pass, res.core_index)
+                            } else {
+                                format!("C{} {status_tag}", res.core_index)
+                            };
+                            ui.label(
+                                RichText::new(core_label)
+                                    .small()
+                                    .strong()
+                                    .monospace()
+                                    .color(status_color),
+                            );
+
+                            let freq_text = res
+                                .peak_freq_mhz
+                                .map(|mhz| format!("{mhz:.0} MHz"))
+                                .unwrap_or_else(|| "—".into());
+                            ui.label(
+                                RichText::new(freq_text)
+                                    .small()
+                                    .monospace()
+                                    .color(TEXT_PRIMARY),
+                            );
+
+                            let temp_text = res
+                                .peak_temp_c
+                                .map(|c| format!("{c:.1} °C"))
+                                .unwrap_or_else(|| "—".into());
+                            ui.label(
+                                RichText::new(temp_text)
+                                    .small()
+                                    .monospace()
+                                    .color(TEXT_PRIMARY),
+                            );
+
+                            let has_mce = res.mce_delta_corrected > 0
+                                || res.mce_delta_uncorrected > 0
+                                || !res.new_mce_lines.is_empty();
+                            let mce_text = if !res.new_mce_lines.is_empty() {
+                                format!(
+                                    "CE +{} · UE +{} · {} log",
+                                    res.mce_delta_corrected,
+                                    res.mce_delta_uncorrected,
+                                    res.new_mce_lines.len()
+                                )
+                            } else {
+                                format!(
+                                    "CE +{} · UE +{}",
+                                    res.mce_delta_corrected, res.mce_delta_uncorrected
+                                )
+                            };
+                            ui.label(
+                                RichText::new(mce_text)
+                                    .small()
+                                    .monospace()
+                                    .color(if has_mce { ACCENT_CRIMSON } else { TEXT_MUTED }),
+                            );
+
+                            let detail_text = match &res.error {
+                                Some(err) => err.clone(),
+                                None => format!("{:.1}s · {} iter", res.duration_secs, res.iterations),
+                            };
+                            ui.label(
+                                RichText::new(detail_text)
+                                    .small()
+                                    .color(if res.error.is_some() {
+                                        ACCENT_CRIMSON
+                                    } else {
+                                        TEXT_MUTED
+                                    }),
+                            );
+                            ui.end_row();
+                        }
+                    });
+            }
+        }
+    });
+
+    if start_clicked {
+        app.start_bench(ctx);
+    }
+    if stop_clicked {
+        app.stop_bench();
     }
 }
 
@@ -3272,6 +3647,10 @@ pub fn render_profiles_and_safety(app: &mut ZensmuApp, ui: &mut Ui, ctx: &egui::
     render_recorder_card(app, ui, ctx, has_hw);
     ui.add_space(12.0);
 
+    // Prometheus / OpenMetrics Exporter (unprivileged) Card
+    render_exporter_card(app, ui, ctx);
+    ui.add_space(12.0);
+
     // TOML Profile Card
     card_frame().show(ui, |ui| {
         ui.set_width(ui.available_width());
@@ -4186,6 +4565,149 @@ fn render_recorder_card(app: &mut ZensmuApp, ui: &mut Ui, ctx: &egui::Context, h
     if let Some((path_str, toast_msg)) = copy_path {
         ctx.copy_text(path_str);
         app.set_toast(ToastLevel::Info, toast_msg);
+    }
+}
+
+fn render_exporter_card(app: &mut ZensmuApp, ui: &mut Ui, ctx: &egui::Context) {
+    let exporter = app.exporter_status.clone();
+    let service_name = if exporter.service_name.is_empty() {
+        USER_EXPORTER_SERVICE_NAME
+    } else {
+        exporter.service_name.as_str()
+    };
+    let endpoint = if exporter.endpoint.is_empty() {
+        format!("http://{DEFAULT_METRICS_LISTEN}/metrics")
+    } else {
+        exporter.endpoint.clone()
+    };
+
+    let mut refresh_exporter = false;
+    let mut toggle_exporter = false;
+    let mut copy_url = false;
+
+    card_frame().show(ui, |ui| {
+        ui.set_width(ui.available_width());
+        split_or_wrap_row(
+            ui,
+            "exporter_card_header",
+            |ui| {
+                ui.label(
+                    RichText::new(format!("Prometheus / OpenMetrics Exporter ({service_name})"))
+                        .strong(),
+                );
+                if exporter.active {
+                    tinted_pill(ui, "Exporter: ACTIVE", ACCENT_EMERALD, PILL_ALPHA_EMERALD);
+                } else if exporter.enabled {
+                    tinted_pill(ui, "Exporter: ENABLED", ACCENT_CYAN, PILL_ALPHA_CYAN);
+                } else if !exporter.installed {
+                    tinted_pill(
+                        ui,
+                        "Exporter: NOT INSTALLED",
+                        ACCENT_AMBER,
+                        PILL_ALPHA_AMBER,
+                    );
+                } else {
+                    muted_pill(ui, "Exporter: OFF");
+                }
+            },
+            |ui| {
+                if ui
+                    .button("Refresh Status")
+                    .on_hover_text("Re-check user systemd exporter status (unprivileged)")
+                    .clicked()
+                {
+                    refresh_exporter = true;
+                }
+
+                let hover = if !exporter.installed {
+                    "zensmu-exporter.service is not installed in /usr/lib/systemd/user/ or ~/.config/systemd/user/"
+                } else if exporter.enabled {
+                    "Run `systemctl --user disable --now zensmu-exporter.service` (unprivileged)"
+                } else {
+                    "Run `systemctl --user enable --now zensmu-exporter.service` (unprivileged)"
+                };
+                if exporter.enabled {
+                    if ui
+                        .add_enabled(
+                            exporter.installed,
+                            egui::Button::new("Disable Exporter"),
+                        )
+                        .on_hover_text(hover)
+                        .clicked()
+                    {
+                        toggle_exporter = true;
+                    }
+                } else if ui
+                    .add_enabled(
+                        exporter.installed,
+                        cta_button("Enable Exporter", CTA_EMERALD),
+                    )
+                    .on_hover_text(hover)
+                    .clicked()
+                {
+                    toggle_exporter = true;
+                }
+            },
+        );
+
+        ui.add_space(6.0);
+        egui::Grid::new("exporter_service_grid")
+            .num_columns(2)
+            .striped(true)
+            .spacing([16.0, 6.0])
+            .show(ui, |ui| {
+                ui.label(RichText::new("User service state").small().color(TEXT_MUTED));
+                let state_color = if exporter.active {
+                    ACCENT_EMERALD
+                } else if exporter.enabled {
+                    ACCENT_CYAN
+                } else if !exporter.installed || exporter.state == "failed" {
+                    ACCENT_AMBER
+                } else {
+                    TEXT_MUTED
+                };
+                ui.label(
+                    RichText::new(&exporter.state)
+                        .small()
+                        .monospace()
+                        .strong()
+                        .color(state_color),
+                );
+                ui.end_row();
+
+                ui.label(RichText::new("Metrics endpoint").small().color(TEXT_MUTED));
+                ui.horizontal_wrapped(|ui| {
+                    ui.label(
+                        RichText::new(&endpoint)
+                            .small()
+                            .monospace()
+                            .color(TEXT_PRIMARY),
+                    );
+                    if ui
+                        .add(egui::Button::new("Copy URL").small())
+                        .on_hover_text("Copy Prometheus / OpenMetrics scrape endpoint URL")
+                        .clicked()
+                    {
+                        copy_url = true;
+                    }
+                });
+                ui.end_row();
+            });
+    });
+
+    if refresh_exporter {
+        app.refresh_exporter_daemon_status();
+        app.set_toast(ToastLevel::Info, "Refreshed Prometheus exporter status.");
+    }
+    if toggle_exporter {
+        app.toggle_exporter_daemon();
+    }
+    if copy_url {
+        ctx.copy_text(endpoint);
+        app.set_toast(
+            ToastLevel::Info,
+            "Copied Prometheus metrics URL to clipboard.",
+        );
     }
 }
 

@@ -1,0 +1,16 @@
+[Unit]
+Description=zensmu Prometheus AMD Ryzen SMU telemetry exporter (unprivileged)
+Documentation=https://github.com/brauliobo/zensmu
+After=network.target
+ConditionPathExists=/sys/kernel/ryzen_smu_drv/pm_table
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/zensmu export --listen 127.0.0.1:9452
+Restart=on-failure
+RestartSec=5
+Nice=10
+NoNewPrivileges=yes
+
+[Install]
+WantedBy=default.target

@@ -1,0 +1,79 @@
+name: Bug Report
+description: Report a bug in zensmu CLI, TUI (zensmu top), GUI (zensmu-gui), exporter, or packaging
+title: "[Bug]: "
+labels:
+  - bug
+  - triage
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thank you for reporting a bug! Please include the output of `sudo zensmu doctor` and `zensmu report` (both are privacy-safe and omit hostnames, usernames, and serials).
+
+  - type: textarea
+    id: summary
+    attributes:
+      label: Summary
+      description: Clear description of what happened vs. what you expected
+      placeholder: "Describe the bug and the expected behavior..."
+    validations:
+      required: true
+
+  - type: dropdown
+    id: component
+    attributes:
+      label: Affected Component
+      description: Which part of zensmu exhibited the issue?
+      options:
+        - CLI (zensmu)
+        - Live TUI (zensmu top)
+        - Desktop GUI (zensmu-gui)
+        - Prometheus Exporter (zensmu export)
+        - Systemd / Persistence / Boot Guard
+        - Driver Tooling / Packaging
+    validations:
+      required: true
+
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: Steps to Reproduce
+      description: Exact commands, flags, profile snippets, or UI actions that trigger the bug
+      placeholder: |
+        1. Run `sudo zensmu ...`
+        2. Observe ...
+    validations:
+      required: true
+
+  - type: textarea
+    id: diagnostics
+    attributes:
+      label: "`zensmu doctor` / `zensmu report` Output"
+      description: Paste the output of `sudo zensmu doctor` and/or `zensmu report`
+      placeholder: "Paste `sudo zensmu doctor` and `zensmu report` output here..."
+      render: text
+    validations:
+      required: true
+
+  - type: textarea
+    id: driver_secure_boot
+    attributes:
+      label: Driver, Kernel & Secure Boot Details
+      description: Include distro, kernel (`uname -r`), how `zensmu` and `ryzen_smu` were installed, and whether Secure Boot / MOK signing is enabled
+      placeholder: |
+        - Distro & kernel: e.g., Ubuntu 24.04 / Linux 6.11
+        - zensmu install method: e.g., .deb / .rpm / AUR / cargo
+        - ryzen_smu source: e.g., ryzen-smu-dkms / ryzen_smu-dkms-git / custom kernel
+        - Secure Boot: Enabled (MOK enrolled) / Disabled
+    validations:
+      required: true
+
+  - type: checkboxes
+    id: checklist
+    attributes:
+      label: Pre-submission Checks
+      options:
+        - label: I confirmed this still happens on the latest zensmu release.
+          required: false
+        - label: I reviewed my pasted output to ensure no unintended sensitive info is included.
+          required: false

@@ -79,14 +79,26 @@ jobs:
           ./target/release/zensmu completions bash > dist/completions/zensmu.bash
           ./target/release/zensmu completions zsh  > dist/completions/_zensmu
           ./target/release/zensmu completions fish > dist/completions/zensmu.fish
+          ./target/release/zensmu manpage > dist/zensmu.1
 
           STAGE_NAME="zensmu-v${VERSION}-x86_64-unknown-linux-gnu"
           STAGE_DIR="$(mktemp -d)"
           STAGE="${STAGE_DIR}/${STAGE_NAME}"
-          mkdir -p "${STAGE}/packaging/systemd" "${STAGE}/packaging/polkit"
+          mkdir -p \
+            "${STAGE}/packaging/systemd" \
+            "${STAGE}/packaging/polkit" \
+            "${STAGE}/packaging/desktop" \
+            "${STAGE}/man"
           cp target/release/zensmu target/release/zensmu-gui "${STAGE}/"
-          cp packaging/systemd/zensmu-apply.service packaging/systemd/zensmu-record.service packaging/systemd/zensmu-resume "${STAGE}/packaging/systemd/"
+          cp \
+            packaging/systemd/zensmu-apply.service \
+            packaging/systemd/zensmu-record.service \
+            packaging/systemd/zensmu-exporter.service \
+            packaging/systemd/zensmu-resume \
+            "${STAGE}/packaging/systemd/"
           cp packaging/polkit/org.zensmu.policy "${STAGE}/packaging/polkit/"
+          cp packaging/desktop/zensmu-gui.desktop packaging/desktop/zensmu.svg "${STAGE}/packaging/desktop/"
+          cp dist/zensmu.1 "${STAGE}/man/zensmu.1"
           cp README.md LICENSE "${STAGE}/"
 
           tar -C "${STAGE_DIR}" -czf "dist/${STAGE_NAME}.tar.gz" "${STAGE_NAME}"

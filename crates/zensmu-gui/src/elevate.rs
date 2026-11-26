@@ -2270,6 +2270,7 @@ mod tests {
             shaper_state: None,
             shaper_error: None,
             user_note: Some("Checking VRM caps".into()),
+            secure_boot: None,
         };
 
         let expected = ReportPayload::from_report(report.clone());

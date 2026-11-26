@@ -3,7 +3,9 @@
 use clap::{ArgAction, Args, Parser, Subcommand, ValueEnum};
 use clap_complete::Shell;
 use std::path::PathBuf;
+use zensmu_core::bench::BenchWorkload;
 use zensmu_core::driver::DriverInstallMethod;
+use zensmu_core::metrics::DEFAULT_METRICS_LISTEN;
 use zensmu_core::recorder::RecordFormat;
 use zensmu_core::types::ApuPowerMode;
 
@@ -142,6 +144,13 @@ pub enum Command {
     /// Record unprivileged live PM table telemetry (CSV, JSONL, or Phoronix Test Suite XML)
     Record(RecordCommand),
 
+    /// Run per-core Curve Optimizer stability tester / core-cycler (unprivileged; --rollback-on-fail requires root)
+    #[command(visible_alias = "bench")]
+    Test(TestCommand),
+
+    /// Export live PM table telemetry as an unprivileged Prometheus / OpenMetrics HTTP endpoint
+    Export(ExportCommand),
+
     /// Launch btop-style live terminal telemetry dashboard (unprivileged)
     Top {
         /// Refresh interval (e.g. 500ms, 1s)
@@ -170,6 +179,9 @@ pub enum Command {
         #[arg(value_enum)]
         shell: CompletionShell,
     },
+
+    /// Generate the zensmu(1) man page to stdout
+    Manpage,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
@@ -497,6 +509,96 @@ pub enum RecordServiceAction {
     Enable,
 
     /// Disable and stop zensmu-record.service via `systemctl --user disable --now`
+    Disable,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum BenchWorkloadArg {
+    /// Interleaved ALU/integer, FP64 FMA, and L1/L2 cache stress
+    Mixed,
+    /// Multi-lane 64-bit integer ALU/IMUL/Feistel stress
+    Integer,
+    /// Multi-lane IEEE-754 FP64 FMA multiply-add stress
+    #[value(name = "fp", alias = "floating-point")]
+    Fp,
+    /// Prime-strided 64-byte cache-line L1/L2 read-modify-write stress
+    Cache,
+}
+
+impl From<BenchWorkloadArg> for BenchWorkload {
+    fn from(value: BenchWorkloadArg) -> Self {
+        match value {
+            BenchWorkloadArg::Mixed => BenchWorkload::Mixed,
+            BenchWorkloadArg::Integer => BenchWorkload::Integer,
+            BenchWorkloadArg::Fp => BenchWorkload::FloatingPoint,
+            BenchWorkloadArg::Cache => BenchWorkload::Cache,
+        }
+    }
+}
+
+#[derive(Debug, Args)]
+pub struct TestCommand {
+    /// Physical core selection (e.g. "0,1,4..7" or "0-3"; default: all physical cores)
+    #[arg(long, value_name = "SPEC")]
+    pub cores: Option<String>,
+
+    /// Stress duration per core per pass (e.g. 30s, 2m; 1s..=3600s)
+    #[arg(short = 'd', long, default_value = "30s", value_name = "DURATION")]
+    pub duration: String,
+
+    /// Number of full passes across the selected cores (1..=100)
+    #[arg(short = 'p', long, default_value_t = 1, value_name = "N")]
+    pub passes: u32,
+
+    /// Deterministic self-verifying stress workload (mixed, integer, fp, cache)
+    #[arg(short = 'w', long, value_enum, default_value_t = BenchWorkloadArg::Mixed)]
+    pub workload: BenchWorkloadArg,
+
+    /// Telemetry and progress poll interval (e.g. 500ms, 1s; minimum 100ms)
+    #[arg(short = 'i', long, default_value = "500ms", value_name = "DURATION")]
+    pub interval: String,
+
+    /// Continue testing remaining cores after an MCE or compute self-check failure
+    #[arg(long)]
+    pub continue_on_error: bool,
+
+    /// Automatically restore last-state.json if any core fails with MCE/compute errors (requires root)
+    #[arg(long)]
+    pub rollback_on_fail: bool,
+}
+
+#[derive(Debug, Args)]
+pub struct ExportCommand {
+    /// Listen address for the HTTP/1.1 Prometheus exporter (default: 127.0.0.1:9452)
+    #[arg(long, default_value = DEFAULT_METRICS_LISTEN, value_name = "ADDR")]
+    pub listen: String,
+
+    /// Omit per-core metrics and export package/socket-level metrics only
+    #[arg(long)]
+    pub no_per_core: bool,
+
+    #[command(subcommand)]
+    pub action: Option<ExportAction>,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum ExportAction {
+    /// Inspect, enable, or disable the unprivileged user systemd exporter daemon (zensmu-exporter.service)
+    Service {
+        #[command(subcommand)]
+        action: ExportServiceAction,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+pub enum ExportServiceAction {
+    /// Inspect status of the unprivileged user zensmu-exporter.service daemon
+    Status,
+
+    /// Enable and start zensmu-exporter.service via `systemctl --user enable --now`
+    Enable,
+
+    /// Disable and stop zensmu-exporter.service via `systemctl --user disable --now`
     Disable,
 }
 
@@ -1382,5 +1484,160 @@ mod tests {
             }
             other => panic!("unexpected command: {other:?}"),
         }
+    }
+
+    #[test]
+    fn parses_test_and_bench_alias_subcommands() {
+        let defaults = Cli::try_parse_from(["zensmu", "test"]).unwrap();
+        match defaults.command {
+            Command::Test(t) => {
+                assert_eq!(t.cores, None);
+                assert_eq!(t.duration, "30s");
+                assert_eq!(t.passes, 1);
+                assert_eq!(t.workload, BenchWorkloadArg::Mixed);
+                assert_eq!(t.interval, "500ms");
+                assert!(!t.continue_on_error);
+                assert!(!t.rollback_on_fail);
+            }
+            other => panic!("unexpected command: {other:?}"),
+        }
+
+        let custom = Cli::try_parse_from([
+            "zensmu",
+            "test",
+            "--cores",
+            "0,1,4..7",
+            "-d",
+            "45s",
+            "-p",
+            "3",
+            "-w",
+            "fp",
+            "-i",
+            "250ms",
+            "--continue-on-error",
+            "--rollback-on-fail",
+            "--json",
+        ])
+        .unwrap();
+        assert!(custom.json);
+        match custom.command {
+            Command::Test(t) => {
+                assert_eq!(t.cores.as_deref(), Some("0,1,4..7"));
+                assert_eq!(t.duration, "45s");
+                assert_eq!(t.passes, 3);
+                assert_eq!(t.workload, BenchWorkloadArg::Fp);
+                assert_eq!(
+                    BenchWorkload::from(t.workload),
+                    BenchWorkload::FloatingPoint
+                );
+                assert_eq!(t.interval, "250ms");
+                assert!(t.continue_on_error);
+                assert!(t.rollback_on_fail);
+            }
+            other => panic!("unexpected command: {other:?}"),
+        }
+
+        let bench_alias = Cli::try_parse_from([
+            "zensmu",
+            "bench",
+            "--workload",
+            "cache",
+            "--duration",
+            "10s",
+            "--passes",
+            "2",
+        ])
+        .unwrap();
+        match bench_alias.command {
+            Command::Test(t) => {
+                assert_eq!(t.workload, BenchWorkloadArg::Cache);
+                assert_eq!(BenchWorkload::from(t.workload), BenchWorkload::Cache);
+                assert_eq!(t.duration, "10s");
+                assert_eq!(t.passes, 2);
+            }
+            other => panic!("unexpected command: {other:?}"),
+        }
+
+        let integer_wl = Cli::try_parse_from(["zensmu", "test", "-w", "integer"]).unwrap();
+        match integer_wl.command {
+            Command::Test(t) => {
+                assert_eq!(t.workload, BenchWorkloadArg::Integer);
+                assert_eq!(BenchWorkload::from(t.workload), BenchWorkload::Integer);
+            }
+            other => panic!("unexpected command: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_export_and_export_service_subcommands() {
+        let defaults = Cli::try_parse_from(["zensmu", "export"]).unwrap();
+        match defaults.command {
+            Command::Export(e) => {
+                assert_eq!(e.listen, DEFAULT_METRICS_LISTEN);
+                assert!(!e.no_per_core);
+                assert!(e.action.is_none());
+            }
+            other => panic!("unexpected command: {other:?}"),
+        }
+
+        let custom = Cli::try_parse_from([
+            "zensmu",
+            "export",
+            "--listen",
+            "0.0.0.0:9100",
+            "--no-per-core",
+        ])
+        .unwrap();
+        match custom.command {
+            Command::Export(e) => {
+                assert_eq!(e.listen, "0.0.0.0:9100");
+                assert!(e.no_per_core);
+                assert!(e.action.is_none());
+            }
+            other => panic!("unexpected command: {other:?}"),
+        }
+
+        let st = Cli::try_parse_from(["zensmu", "export", "service", "status", "--json"]).unwrap();
+        assert!(st.json);
+        assert!(matches!(
+            st.command,
+            Command::Export(ExportCommand {
+                action: Some(ExportAction::Service {
+                    action: ExportServiceAction::Status
+                }),
+                ..
+            })
+        ));
+
+        let en =
+            Cli::try_parse_from(["zensmu", "export", "service", "enable", "--dry-run"]).unwrap();
+        assert!(en.dry_run);
+        assert!(matches!(
+            en.command,
+            Command::Export(ExportCommand {
+                action: Some(ExportAction::Service {
+                    action: ExportServiceAction::Enable
+                }),
+                ..
+            })
+        ));
+
+        let dis = Cli::try_parse_from(["zensmu", "export", "service", "disable"]).unwrap();
+        assert!(matches!(
+            dis.command,
+            Command::Export(ExportCommand {
+                action: Some(ExportAction::Service {
+                    action: ExportServiceAction::Disable
+                }),
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn parses_manpage_subcommand() {
+        let cli = Cli::try_parse_from(["zensmu", "manpage"]).unwrap();
+        assert!(matches!(cli.command, Command::Manpage));
     }
 }

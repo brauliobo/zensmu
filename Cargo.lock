@@ -412,6 +412,16 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e0921b3876b3a1df8a1c9f912e7f94342458022c2e84288015893d83c4d62a79"
 
 [[package]]
+name = "clap_mangen"
+version = "0.2.33"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7e30ffc187e2e3aeafcd1c6e2aa416e29739454c0ccaa419226d5ecd181f2d78"
+dependencies = [
+ "clap",
+ "roff",
+]
+
+[[package]]
 name = "clipboard-win"
 version = "5.4.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2230,6 +2240,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "19b30a45b0cd0bcca8037f3d0dc3421eaf95327a17cad11964fb8179b4fc4832"
 
 [[package]]
+name = "roff"
+version = "1.1.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "323c417e1d9665a65b263ec744ba09030cfb277e9daa0b018a4ab62e57bc8189"
+
+[[package]]
 name = "rustc-hash"
 version = "1.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3585,10 +3601,11 @@ dependencies = [
 
 [[package]]
 name = "zensmu-cli"
-version = "0.2.1"
+version = "0.3.0"
 dependencies = [
  "clap",
  "clap_complete",
+ "clap_mangen",
  "crossterm",
  "libc",
  "ratatui",
@@ -3602,7 +3619,7 @@ dependencies = [
 
 [[package]]
 name = "zensmu-core"
-version = "0.2.1"
+version = "0.3.0"
 dependencies = [
  "libc",
  "serde",
@@ -3614,7 +3631,7 @@ dependencies = [
 
 [[package]]
 name = "zensmu-gui"
-version = "0.2.1"
+version = "0.3.0"
 dependencies = [
  "eframe",
  "egui_plot",

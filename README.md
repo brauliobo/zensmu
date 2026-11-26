@@ -1,5 +1,10 @@
 # zensmu
 
+[![CI](https://img.shields.io/github/actions/workflow/status/brauliobo/zensmu/ci.yml?branch=main&label=CI)](https://github.com/brauliobo/zensmu/actions/workflows/ci.yml)
+[![Latest Release](https://img.shields.io/github/v/release/brauliobo/zensmu?label=release)](https://github.com/brauliobo/zensmu/releases)
+[![AUR zensmu-bin](https://img.shields.io/aur/version/zensmu-bin?label=AUR%20zensmu-bin)](https://aur.archlinux.org/packages/zensmu-bin)
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+
 **Safety-first Rust CLI, live TUI (`zensmu top`), and unprivileged desktop GUI (`zensmu-gui`) for AMD Ryzen SMU control and telemetry on Linux.**
 
 Runs directly on the stock [`ryzen_smu`](https://gitlab.com/leogx9r/ryzen_smu) kernel module (`/sys/kernel/ryzen_smu_drv`) — no custom kernel fork required.
@@ -70,7 +75,43 @@ Runs directly on the stock [`ryzen_smu`](https://gitlab.com/leogx9r/ryzen_smu) k
   sudo make -C /tmp/ryzen_smu dkms-install && sudo modprobe ryzen_smu
   ```
 
+> **Secure Boot / MOK signing:** Out-of-tree DKMS modules like `ryzen_smu` cannot load unsigned when UEFI Secure Boot or kernel lockdown (`integrity`/`confidentiality`) is active. Enroll your DKMS Machine Owner Key (`sudo mokutil --import /var/lib/dkms/mok.pub` and reboot to complete enrollment) or disable Secure Boot in UEFI firmware. Run `zensmu driver status` to inspect Secure Boot and lockdown status.
+
 ### 2. Install `zensmu`
+
+#### APT Repository (Debian / Ubuntu — Auto-Updates)
+
+Hosted on GitHub Pages ([`https://brauliobo.github.io/zensmu/apt/`](https://brauliobo.github.io/zensmu/)):
+
+```bash
+echo "deb [trusted=yes] https://brauliobo.github.io/zensmu/apt ./" | sudo tee /etc/apt/sources.list.d/zensmu.list
+sudo apt update
+sudo apt install zensmu
+
+# Optional: install the out-of-tree ryzen_smu DKMS kernel driver
+sudo apt install linux-headers-$(uname -r) ryzen-smu-dkms
+```
+
+#### RPM / DNF Repository (Fedora / RHEL / openSUSE — Auto-Updates)
+
+Hosted on GitHub Pages ([`https://brauliobo.github.io/zensmu/rpm/`](https://brauliobo.github.io/zensmu/)):
+
+```bash
+# Fedora / RHEL (DNF)
+curl -fsSL https://brauliobo.github.io/zensmu/rpm/zensmu.repo | sudo tee /etc/yum.repos.d/zensmu.repo
+sudo dnf install zensmu
+# Optional: sudo dnf install kernel-devel-$(uname -r) ryzen-smu-dkms
+
+# openSUSE (Zypper)
+sudo zypper addrepo --no-gpgcheck https://brauliobo.github.io/zensmu/rpm zensmu
+sudo zypper refresh
+sudo zypper install --allow-unsigned-rpm zensmu
+# Optional: sudo zypper install --allow-unsigned-rpm kernel-default-devel ryzen-smu-dkms
+```
+
+A Fedora COPR RPM spec is also maintained in [`packaging/copr/zensmu.spec`](packaging/copr/zensmu.spec) for source-built COPR / `rpmbuild` packages.
+
+#### AUR, Direct Packages & Source Build
 
 Prebuilt packages for **Debian/Ubuntu (`.deb`)**, **Fedora/RHEL/openSUSE (`.rpm`)**, **Arch/CachyOS (`.pkg.tar.zst`)**, and generic Linux (`.tar.gz`) — plus optional `ryzen-smu-dkms` `.deb`/`.rpm` packages — are published automatically on every [GitHub Release](https://github.com/brauliobo/zensmu/releases):
 
@@ -79,10 +120,10 @@ Prebuilt packages for **Debian/Ubuntu (`.deb`)**, **Fedora/RHEL/openSUSE (`.rpm`
 paru -S zensmu-bin     # prebuilt binary
 paru -S zensmu-git     # build from main
 
-# Debian / Ubuntu (download .deb from Releases)
+# Debian / Ubuntu (direct .deb from Releases)
 sudo apt install ./zensmu_*_amd64.deb
 
-# Fedora / RHEL / openSUSE (download .rpm from Releases)
+# Fedora / RHEL / openSUSE (direct .rpm from Releases)
 sudo dnf install ./zensmu-*.x86_64.rpm
 ```
 
@@ -93,7 +134,7 @@ git clone https://github.com/brauliobo/zensmu.git && cd zensmu
 cargo build --release --workspace
 ```
 
-All packages install `zensmu`, `zensmu-gui`, `zensmu-apply.service`, `zensmu-record.service` (unprivileged user daemon), the `systemd-sleep` resume hook, the PolicyKit rule (`org.zensmu.policy`), and `bash`/`zsh`/`fish` completions.
+All packages install `zensmu`, `zensmu-gui`, the desktop launcher (`zensmu-gui.desktop` + `zensmu.svg` icon), the `zensmu.1` man page (`man zensmu`), `zensmu-apply.service`, `zensmu-record.service` and `zensmu-exporter.service` (unprivileged user daemons), the `systemd-sleep` resume hook, the PolicyKit rule (`org.zensmu.policy`), and `bash`/`zsh`/`fish` completions.
 
 ---
 
@@ -132,24 +173,26 @@ sudo zensmu shaper set --freq high --temp med=-15  # Zen 5 5x3 Curve Shaper
 sudo zensmu pbo set --ppt 105W --tdc 80A --edc 150A --tctl 85C --scalar 1 --fmax 5550
 sudo zensmu apu set --stapm 25W --fast 35W --slow 28W --tdc-soc 15A --apu-skin 70C --mode max-performance
 
+# Per-core Curve Optimizer stability tester / core-cycler (aliases: `test`, `bench`)
+zensmu test --duration 30s --workload mixed          # Pin self-verifying stress worker per core (mixed|integer|floating-point|cache)
+sudo zensmu bench --duration 60s --workload cache --rollback-on-fail  # Auto-rollback CO on MCE or compute error
+
+# Prometheus / OpenMetrics telemetry exporter (unprivileged HTTP /metrics on 127.0.0.1:9452)
+zensmu export --listen 127.0.0.1:9452                # Serve live /metrics and /healthz in foreground
+zensmu export service enable                         # Enable background user daemon (zensmu-exporter.service)
+
 # Record telemetry over time (unprivileged — CSV, JSONL, or Phoronix Test Suite composite.xml)
 zensmu record --interval 1s --duration 10m --tag co-20 -o run.csv
-zensmu record --interval 1s --pts-name ryzen-co20  # Writes ~/.phoronix-test-suite/test-results/ryzen-co20/composite.xml
+zensmu record --interval 1s --pts-name ryzen-co20    # Writes ~/.phoronix-test-suite/test-results/ryzen-co20/composite.xml
 zensmu record export-pts run.csv --pts-name ryzen-co20
-zensmu record service enable                       # Enable background user daemon (zensmu-record.service, rotating CSV)
+zensmu record service enable                         # Enable background user daemon (zensmu-record.service, rotating CSV)
 
 # Rollback, reset & boot/resume persistence
-sudo zensmu rollback                               # Restore last pre-change snapshot
-sudo zensmu reset                                  # Zero CO / Curve Shaper back to defaults
-sudo zensmu persist save --enable                  # Save live state to /etc/zensmu/active.toml + enable boot/resume service
-sudo zensmu persist status                         # Inspect active profile, module autoload, service, and boot guard
-sudo zensmu profile clear-guard                    # Clear boot-loop crash guard after relaxing an unstable profile
-
-# Record telemetry over time (unprivileged — CSV, JSONL, or Phoronix Test Suite composite.xml)
-zensmu record --period 60s --interval 500ms --tag prime95 -o run.csv
-zensmu record --period 5m --pts-name my-ryzen-run  # writes ~/.phoronix-test-suite/test-results/my-ryzen-run/composite.xml
-zensmu record export-pts run.csv --pts-name run-pts
-zensmu record service enable                       # enable unprivileged background user daemon (zensmu-record.service)
+sudo zensmu rollback                                 # Restore last pre-change snapshot
+sudo zensmu reset                                    # Zero CO / Curve Shaper back to defaults
+sudo zensmu persist save --enable                    # Save live state to /etc/zensmu/active.toml + enable boot/resume service
+sudo zensmu persist status                           # Inspect active profile, module autoload, service, and boot guard
+sudo zensmu profile clear-guard                      # Clear boot-loop crash guard after relaxing an unstable profile
 
 # Report untested CPUs / PM tables or bugs (privacy-safe — no hostnames, usernames, or serials)
 zensmu report --open                               # Open prefilled GitHub issue in browser
@@ -162,7 +205,7 @@ sudo zensmu report --raw-pm-table --create         # Collect full probes + PM fl
 
 ## Supported CPUs & Capabilities
 
-Unsupported or unverified codenames are explicitly refused rather than guessed.
+Unsupported or unverified codenames are explicitly refused rather than guessed. For full CPUID family/model mappings, supported PM table versions, and hardware validation status, see the **[Hardware Support Matrix (`docs/HARDWARE_MATRIX.md`)](docs/HARDWARE_MATRIX.md)**.
 
 | Generation | Codenames | Curve Optimizer | iGPU CO | Curve Shaper | PBO Limits | PBO Scalar | Fmax | Fused Limits | APU DPTC |
 | :--- | :--- | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: |

@@ -1,0 +1,300 @@
+name: Publish APT & RPM Repositories
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Optional release tag to include (defaults to latest published releases)"
+        required: false
+        type: string
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: "pages"
+  cancel-in-progress: false
+
+jobs:
+  build-and-deploy:
+    name: Build & Deploy APT/RPM Repositories to GitHub Pages
+    runs-on: ubuntu-24.04
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: Install repository metadata tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            dpkg-dev \
+            apt-utils \
+            createrepo-c
+
+      - name: Download .deb and .rpm assets from GitHub Releases
+        id: download
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          INPUT_TAG: ${{ inputs.tag }}
+        run: |
+          set -euo pipefail
+          mkdir -p site/apt/pool site/rpm/packages
+
+          # Collect up to the 3 most recent published releases (plus explicit tag if given)
+          mapfile -t RECENT_TAGS < <(
+            gh release list --repo "${GH_REPO}" \
+              --exclude-drafts \
+              --exclude-pre-releases \
+              --limit 3 \
+              --json tagName \
+              --jq '.[].tagName'
+          )
+
+          TAGS=()
+          if [[ -n "${INPUT_TAG}" ]]; then
+            TAGS+=("${INPUT_TAG}")
+          fi
+          for t in "${RECENT_TAGS[@]}"; do
+            skip=false
+            for existing in "${TAGS[@]}"; do
+              if [[ "${existing}" == "${t}" ]]; then
+                skip=true
+                break
+              fi
+            done
+            if [[ "${skip}" == false && ${#TAGS[@]} -lt 3 ]]; then
+              TAGS+=("${t}")
+            fi
+          done
+
+          if [[ ${#TAGS[@]} -eq 0 ]]; then
+            echo "::error::No published GitHub Releases found to index."
+            exit 1
+          fi
+
+          echo "Selected release tags (newest first): ${TAGS[*]}"
+          echo "latest_tag=${TAGS[0]}" >> "$GITHUB_OUTPUT"
+
+          # Download oldest-to-newest so newer releases win on identical filenames (e.g. ryzen-smu-dkms)
+          for (( idx=${#TAGS[@]}-1; idx>=0; idx-- )); do
+            TAG="${TAGS[$idx]}"
+            echo "Fetching .deb and .rpm assets from release ${TAG}..."
+            gh release download "${TAG}" \
+              --repo "${GH_REPO}" \
+              --pattern '*.deb' \
+              --dir site/apt/pool \
+              --clobber || true
+            gh release download "${TAG}" \
+              --repo "${GH_REPO}" \
+              --pattern '*.rpm' \
+              --dir site/rpm/packages \
+              --clobber || true
+          done
+
+          DEB_COUNT="$(find site/apt/pool -maxdepth 1 -type f -name '*.deb' | wc -l)"
+          RPM_COUNT="$(find site/rpm/packages -maxdepth 1 -type f -name '*.rpm' | wc -l)"
+          echo "Downloaded ${DEB_COUNT} .deb package(s) and ${RPM_COUNT} .rpm package(s)."
+          ls -la site/apt/pool site/rpm/packages
+
+          if [[ "${DEB_COUNT}" -eq 0 && "${RPM_COUNT}" -eq 0 ]]; then
+            echo "::error::No .deb or .rpm assets were downloaded from releases: ${TAGS[*]}"
+            exit 1
+          fi
+
+      - name: Build static APT repository metadata
+        run: |
+          set -euo pipefail
+          pushd site/apt >/dev/null
+          dpkg-scanpackages --multiversion pool > Packages
+          gzip -k -9 -f Packages
+          apt-ftparchive \
+            -o APT::FTPArchive::Release::Origin="zensmu" \
+            -o APT::FTPArchive::Release::Label="zensmu" \
+            -o APT::FTPArchive::Release::Suite="stable" \
+            -o APT::FTPArchive::Release::Codename="stable" \
+            -o APT::FTPArchive::Release::Architectures="amd64 all" \
+            -o APT::FTPArchive::Release::Description="zensmu APT repository (CLI/TUI/GUI and optional ryzen-smu-dkms)" \
+            release . > /tmp/apt-Release
+          mv /tmp/apt-Release Release
+          popd >/dev/null
+          ls -la site/apt
+
+      - name: Build static RPM/DNF repository metadata
+        env:
+          GH_REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          REPO_OWNER="${GH_REPO%%/*}"
+          REPO_NAME="${GH_REPO#*/}"
+          BASE_URL="https://${REPO_OWNER}.github.io/${REPO_NAME}"
+
+          createrepo_c site/rpm
+
+          cat > site/rpm/zensmu.repo <<EOF
+          [zensmu]
+          name=zensmu - AMD Ryzen SMU Control & Telemetry
+          baseurl=${BASE_URL}/rpm
+          enabled=1
+          gpgcheck=0
+          repo_gpgcheck=0
+          EOF
+
+          ls -la site/rpm site/rpm/repodata
+
+      - name: Generate repository landing page (site/index.html)
+        env:
+          GH_REPO: ${{ github.repository }}
+          LATEST_TAG: ${{ steps.download.outputs.latest_tag }}
+        run: |
+          set -euo pipefail
+          REPO_OWNER="${GH_REPO%%/*}"
+          REPO_NAME="${GH_REPO#*/}"
+          BASE_URL="https://${REPO_OWNER}.github.io/${REPO_NAME}"
+          UPDATED_UTC="$(date -u '+%Y-%m-%d %H:%M UTC')"
+
+          DEB_LIST=""
+          while IFS= read -r f; do
+            fname="$(basename "$f")"
+            DEB_LIST+="          <li><a href=\"apt/pool/${fname}\">${fname}</a></li>"$'\n'
+          done < <(find site/apt/pool -maxdepth 1 -type f -name '*.deb' | sort -V)
+
+          RPM_LIST=""
+          while IFS= read -r f; do
+            fname="$(basename "$f")"
+            RPM_LIST+="          <li><a href=\"rpm/packages/${fname}\">${fname}</a></li>"$'\n'
+          done < <(find site/rpm/packages -maxdepth 1 -type f -name '*.rpm' | sort -V)
+
+          cat > site/index.html <<EOF
+          <!DOCTYPE html>
+          <html lang="en">
+          <head>
+            <meta charset="utf-8">
+            <meta name="viewport" content="width=device-width, initial-scale=1">
+            <title>zensmu — Linux Package Repositories (APT &amp; RPM)</title>
+            <style>
+              :root {
+                color-scheme: dark;
+                --bg: #0D1017;
+                --card: #141925;
+                --border: #30394D;
+                --fg: #E6EDF3;
+                --muted: #9AA6BC;
+                --crimson: #FF7666;
+                --cyan: #38BDF8;
+                --code-bg: #090C12;
+              }
+              * { box-sizing: border-box; }
+              body {
+                margin: 0;
+                padding: 2rem 1.25rem 3.5rem;
+                background: var(--bg);
+                color: var(--fg);
+                font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+                line-height: 1.55;
+              }
+              main { max-width: 860px; margin: 0 auto; }
+              h1 { margin: 0 0 0.4rem; font-size: 1.85rem; }
+              h1 span { color: var(--crimson); }
+              h2 { margin: 0 0 0.75rem; font-size: 1.2rem; color: var(--cyan); }
+              h3 { margin: 1.1rem 0 0.4rem; font-size: 0.98rem; color: var(--fg); }
+              p { color: var(--muted); margin: 0 0 1rem; }
+              a { color: var(--cyan); text-decoration: none; }
+              a:hover { text-decoration: underline; }
+              .meta { font-size: 0.9rem; margin-bottom: 1.5rem; }
+              .card {
+                background: var(--card);
+                border: 1px solid var(--border);
+                border-radius: 12px;
+                padding: 1.25rem 1.4rem;
+                margin-bottom: 1.25rem;
+              }
+              pre {
+                margin: 0.5rem 0 0.9rem;
+                padding: 0.85rem 1rem;
+                background: var(--code-bg);
+                border: 1px solid var(--border);
+                border-radius: 8px;
+                overflow-x: auto;
+                font-size: 0.87rem;
+                line-height: 1.45;
+              }
+              code {
+                font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+              }
+              ul {
+                margin: 0.4rem 0 0;
+                padding-left: 1.25rem;
+                color: var(--muted);
+                font-size: 0.9rem;
+              }
+              li { margin: 0.2rem 0; }
+            </style>
+          </head>
+          <body>
+            <main>
+              <h1><span>zensmu</span> Linux Package Repositories</h1>
+              <p class="meta">
+                Safety-first AMD Ryzen SMU CLI, live TUI, GUI, and optional <code>ryzen-smu-dkms</code> driver packages.
+                Latest release: <strong>${LATEST_TAG}</strong> &middot; Updated ${UPDATED_UTC} &middot;
+                <a href="https://github.com/${GH_REPO}">GitHub</a> &middot;
+                <a href="https://github.com/${GH_REPO}/releases">Releases</a>
+              </p>
+
+              <section class="card">
+                <h2>Debian / Ubuntu (APT)</h2>
+                <p>Add the repository and install <code>zensmu</code> (and optionally the <code>ryzen-smu-dkms</code> kernel driver):</p>
+                <pre><code>echo "deb [trusted=yes] ${BASE_URL}/apt ./" | sudo tee /etc/apt/sources.list.d/zensmu.list
+          sudo apt update
+          sudo apt install zensmu
+
+          # Optional: install the out-of-tree ryzen_smu DKMS kernel driver
+          sudo apt install linux-headers-\$(uname -r) ryzen-smu-dkms</code></pre>
+                <h3>Published .deb Packages</h3>
+                <ul>
+          ${DEB_LIST}        </ul>
+              </section>
+
+              <section class="card">
+                <h2>Fedora / RHEL (DNF)</h2>
+                <p>Add the DNF repository and install <code>zensmu</code>:</p>
+                <pre><code>curl -fsSL ${BASE_URL}/rpm/zensmu.repo | sudo tee /etc/yum.repos.d/zensmu.repo
+          sudo dnf install zensmu
+
+          # Optional: install the out-of-tree ryzen_smu DKMS kernel driver
+          sudo dnf install kernel-devel-\$(uname -r) ryzen-smu-dkms</code></pre>
+
+                <h3>openSUSE (Zypper)</h3>
+                <pre><code>sudo zypper addrepo --no-gpgcheck ${BASE_URL}/rpm zensmu
+          sudo zypper refresh
+          sudo zypper install --allow-unsigned-rpm zensmu
+
+          # Optional: install the out-of-tree ryzen_smu DKMS kernel driver
+          sudo zypper install --allow-unsigned-rpm kernel-default-devel ryzen-smu-dkms</code></pre>
+
+                <h3>Published .rpm Packages</h3>
+                <ul>
+          ${RPM_LIST}        </ul>
+              </section>
+            </main>
+          </body>
+          </html>
+          EOF
+
+          touch site/.nojekyll
+
+      - name: Setup GitHub Pages
+        uses: actions/configure-pages@v5
+
+      - name: Upload GitHub Pages artifact
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: site
+
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4

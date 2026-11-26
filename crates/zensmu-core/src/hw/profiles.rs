@@ -270,9 +270,14 @@ fn zen4_desktop(codename: Codename) -> CpuCapabilities {
     }
 }
 
+/// Zen 5 Desktop / 9000X3D (Granite Ridge, including 9800X3D/9900X3D/9950X3D)
+/// and chiplet mobile (Fire Range, mapped to GraniteRidge by `ryzen_smu`).
+///
+/// Hardware-verified on Ryzen 7 9700X (Granite Ridge, SMU 98.79.0); 9000X3D and
+/// Fire Range share the Granite Ridge SMU command table (community reports welcome).
 fn zen5_desktop(codename: Codename) -> CpuCapabilities {
     let mut caps = zen4_desktop(codename);
-    // Zen 5 adds 15-point Curve Shaper on RSMU
+    // Zen 5 adds 15-point Curve Shaper on RSMU (AGESA/SMU dependent; 0xFE skipped cleanly)
     caps.get_curve_shaper = Some(OpcodeSpec::rsmu(0x84));
     caps.set_curve_shaper = Some(OpcodeSpec::rsmu(0xA6));
     caps
@@ -662,6 +667,12 @@ fn apu1_rembrandt(codename: Codename) -> CpuCapabilities {
     caps
 }
 
+/// Zen 5 Mobile APUs: Strix Point, Krackan Point (mapped to StrixPoint by `ryzen_smu`),
+/// and Strix Halo.
+///
+/// Spec-implemented from `ryzen_smu` / `ZenStates-Core` (MP1 RSP `0x03B1_0978`,
+/// RSMU `GetDldoPsmMargin = 0xAF`, CO `-50..+50`, full APU DPTC) — community report
+/// welcome via `zensmu report --raw-pm-table --open`.
 fn apu1_strix(codename: Codename) -> CpuCapabilities {
     let mut caps = apu1_phoenix(codename);
     caps.rsp_addrs.mp1_rsp = Some(0x03B1_0978);
@@ -823,5 +834,38 @@ mod tests {
                 .get_sustained_power_thm,
             None
         );
+    }
+
+    #[test]
+    fn strix_point_and_strix_halo_profiles_match_zen5_apu_spec() {
+        for codename in [Codename::StrixPoint, Codename::StrixHalo] {
+            let caps = capabilities_for(codename).unwrap();
+            assert!(!caps.is_family_17h);
+            assert_eq!(caps.rsp_addrs.rsmu_rsp, Some(0x03B1_0A80));
+            assert_eq!(caps.rsp_addrs.mp1_rsp, Some(0x03B1_0978));
+            assert_eq!(
+                caps.co_bounds,
+                Some(CoBounds {
+                    min: -50,
+                    max: 50,
+                    soft_min: -35,
+                })
+            );
+            assert_eq!(caps.get_co_per_core, Some(OpcodeSpec::rsmu(0xAF)));
+            assert_eq!(
+                caps.set_co_per_core,
+                Some(DualOpcode::rsmu_then_mp1(0x53, 0x4B))
+            );
+            assert_eq!(
+                caps.set_co_all_cores,
+                Some(DualOpcode::rsmu_then_mp1(0x5D, 0x4C))
+            );
+            assert_eq!(caps.get_igpu_co, Some(OpcodeSpec::rsmu(0x20)));
+            assert_eq!(caps.set_igpu_co, Some(OpcodeSpec::rsmu(0x1F)));
+            assert!(caps.get_curve_shaper.is_none());
+            assert!(caps.set_curve_shaper.is_none());
+            assert!(caps.set_stapm_limit.is_some());
+            assert!(caps.set_apu_skin_temp.is_some());
+        }
     }
 }

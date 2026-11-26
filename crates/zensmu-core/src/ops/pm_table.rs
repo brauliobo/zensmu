@@ -137,6 +137,9 @@ fn apu_std_header(min_size: usize) -> PmTableLayout {
 fn layout_for(codename: Codename, version: u32) -> Option<PmTableLayout> {
     match codename {
         Codename::GraniteRidge => {
+            // 1-CCD (9600X/9700X/9800X3D): 0x724 bytes — 0x0062_0105 hardware-verified on Ryzen 7 9700X;
+            // 0x0062_1101/0x0062_1102 and 2-CCD (9900X/9950X/9900X3D/9950X3D/Fire Range, 0x994 bytes)
+            // are spec-implemented (community reports welcome via `zensmu report --raw-pm-table --open`).
             let min_size = match version {
                 0x0062_0105 | 0x0062_1101 | 0x0062_1102 => 0x724,
                 0x0062_0205 | 0x0062_1201 | 0x0062_1202 => 0x994,
@@ -353,6 +356,7 @@ fn layout_for(codename: Codename, version: u32) -> Option<PmTableLayout> {
             })
         }
         Codename::StrixPoint => match version {
+            // Spec-implemented for Strix Point / Krackan Point (0xD54 bytes) — community report welcome.
             0x005D_0008..=0x005D_000B => Some(PmTableLayout {
                 fclk_mhz: Some(0x4E0),
                 uclk_mhz: Some(0x4E4),
@@ -362,6 +366,7 @@ fn layout_for(codename: Codename, version: u32) -> Option<PmTableLayout> {
             _ => None,
         },
         Codename::StrixHalo => match version {
+            // Spec-implemented for Strix Halo (0xDC0 bytes, standard APU header) — community report welcome.
             0x0064_0107..=0x0064_010C => Some(apu_std_header(0xDC0)),
             _ => None,
         },
@@ -668,6 +673,65 @@ mod tests {
         assert_eq!(lsnap.tctl_value_c, Some(44.4));
         assert_eq!(lsnap.vddcr_soc_v, Some(0.725));
         assert_eq!(lsnap.fclk_mhz, Some(1200.0));
+    }
+
+    #[test]
+    fn decodes_zen5_x3d_dual_ccd_and_strix_halo_pm_tables() {
+        // 1-CCD 9800X3D / updated AGESA (0x0062_1102, 0x724 bytes)
+        let mut x3d_1ccd = vec![0u8; 0x724];
+        write_f32(&mut x3d_1ccd, 0x008, 162.0);
+        write_f32(&mut x3d_1ccd, 0x00C, 92.5);
+        write_f32(&mut x3d_1ccd, 0x0FC, 180.0);
+        write_f32(&mut x3d_1ccd, 0x11C, 2000.0);
+        let snap_1ccd = decode_pm_table(Codename::GraniteRidge, 0x0062_1102, &x3d_1ccd).unwrap();
+        assert_eq!(snap_1ccd.ppt_limit_w, Some(162.0));
+        assert_eq!(snap_1ccd.ppt_value_w, Some(92.5));
+        assert_eq!(snap_1ccd.edc_limit_a, Some(180.0));
+        assert_eq!(snap_1ccd.fclk_mhz, Some(2000.0));
+
+        // 2-CCD 9950X / 9950X3D (0x0062_0205 / 0x0062_1202, 0x994 bytes)
+        assert!(matches!(
+            decode_pm_table(Codename::GraniteRidge, 0x0062_1202, &x3d_1ccd),
+            Err(Error::UnsupportedPmTable { .. })
+        ));
+        let mut x3d_2ccd = vec![0u8; 0x994];
+        write_f32(&mut x3d_2ccd, 0x008, 200.0);
+        write_f32(&mut x3d_2ccd, 0x020, 160.0);
+        write_f32(&mut x3d_2ccd, 0x0FC, 225.0);
+        write_f32(&mut x3d_2ccd, 0x434, 1.05);
+        let snap_2ccd = decode_pm_table(Codename::GraniteRidge, 0x0062_1202, &x3d_2ccd).unwrap();
+        assert_eq!(snap_2ccd.ppt_limit_w, Some(200.0));
+        assert_eq!(snap_2ccd.tdc_limit_a, Some(160.0));
+        assert_eq!(snap_2ccd.edc_limit_a, Some(225.0));
+        assert_eq!(snap_2ccd.cldo_vddp_v, Some(1.05));
+
+        // Strix Point 0x005D_000B (0xD54 bytes)
+        let mut strix_p = vec![0u8; 0xD54];
+        write_f32(&mut strix_p, 0x000, 54.0);
+        write_f32(&mut strix_p, 0x040, 95.0);
+        write_f32(&mut strix_p, 0x4E0, 2000.0);
+        write_f32(&mut strix_p, 0x4E4, 2800.0);
+        write_f32(&mut strix_p, 0x4EC, 3750.0);
+        let snap_sp = decode_pm_table(Codename::StrixPoint, 0x005D_000B, &strix_p).unwrap();
+        assert_eq!(snap_sp.stapm_limit_w, Some(54.0));
+        assert_eq!(snap_sp.tctl_limit_c, Some(95.0));
+        assert_eq!(snap_sp.fclk_mhz, Some(2000.0));
+        assert_eq!(snap_sp.uclk_mhz, Some(2800.0));
+        assert_eq!(snap_sp.mclk_mhz, Some(3750.0));
+
+        // Strix Halo 0x0064_010C (0xDC0 bytes) + truncated buffer refusal
+        assert!(matches!(
+            decode_pm_table(Codename::StrixHalo, 0x0064_010C, &strix_p),
+            Err(Error::UnsupportedPmTable { .. })
+        ));
+        let mut strix_h = vec![0u8; 0xDC0];
+        write_f32(&mut strix_h, 0x000, 120.0);
+        write_f32(&mut strix_h, 0x008, 140.0);
+        write_f32(&mut strix_h, 0x040, 95.0);
+        let snap_sh = decode_pm_table(Codename::StrixHalo, 0x0064_010C, &strix_h).unwrap();
+        assert_eq!(snap_sh.stapm_limit_w, Some(120.0));
+        assert_eq!(snap_sh.ppt_limit_w, Some(140.0));
+        assert_eq!(snap_sh.tctl_limit_c, Some(95.0));
     }
 
     #[test]

@@ -1,0 +1,91 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 128 128" width="128" height="128" role="img" aria-label="zensmu">
+  <defs>
+    <linearGradient id="badge-bg" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%" stop-color="#141925"/>
+      <stop offset="100%" stop-color="#0D1017"/>
+    </linearGradient>
+    <linearGradient id="amd-crimson" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0%" stop-color="#FF7666"/>
+      <stop offset="100%" stop-color="#B92222"/>
+    </linearGradient>
+    <linearGradient id="die-fill" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0%" stop-color="#171E2E"/>
+      <stop offset="100%" stop-color="#0F141F"/>
+    </linearGradient>
+    <linearGradient id="pulse-stroke" x1="0" y1="0" x2="1" y2="0">
+      <stop offset="0%" stop-color="#38BDF8" stop-opacity="0.35"/>
+      <stop offset="22%" stop-color="#38BDF8"/>
+      <stop offset="78%" stop-color="#7DD3FC"/>
+      <stop offset="100%" stop-color="#38BDF8" stop-opacity="0.45"/>
+    </linearGradient>
+    <linearGradient id="pulse-area" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%" stop-color="#38BDF8" stop-opacity="0.24"/>
+      <stop offset="100%" stop-color="#38BDF8" stop-opacity="0"/>
+    </linearGradient>
+  </defs>
+
+  <!-- Outer dark cockpit chip badge -->
+  <rect x="6" y="6" width="116" height="116" rx="26" fill="url(#badge-bg)" stroke="#30394D" stroke-width="2.5"/>
+  <rect x="12" y="12" width="104" height="104" rx="20" fill="none" stroke="#1E2638" stroke-width="1"/>
+
+  <!-- SMU package pins (top, bottom, left, right) -->
+  <g stroke="url(#amd-crimson)" stroke-width="4" stroke-linecap="round">
+    <!-- Top pins -->
+    <line x1="43" y1="20" x2="43" y2="30"/>
+    <line x1="57" y1="20" x2="57" y2="30"/>
+    <line x1="71" y1="20" x2="71" y2="30"/>
+    <line x1="85" y1="20" x2="85" y2="30"/>
+    <!-- Bottom pins -->
+    <line x1="43" y1="98" x2="43" y2="108"/>
+    <line x1="57" y1="98" x2="57" y2="108"/>
+    <line x1="71" y1="98" x2="71" y2="108"/>
+    <line x1="85" y1="98" x2="85" y2="108"/>
+    <!-- Left pins -->
+    <line x1="20" y1="43" x2="30" y2="43"/>
+    <line x1="20" y1="57" x2="30" y2="57"/>
+    <line x1="20" y1="71" x2="30" y2="71"/>
+    <line x1="20" y1="85" x2="30" y2="85"/>
+    <!-- Right pins -->
+    <line x1="98" y1="43" x2="108" y2="43"/>
+    <line x1="98" y1="57" x2="108" y2="57"/>
+    <line x1="98" y1="71" x2="108" y2="71"/>
+    <line x1="98" y1="85" x2="108" y2="85"/>
+  </g>
+
+  <!-- CPU package substrate -->
+  <rect x="30" y="30" width="68" height="68" rx="12" fill="#0D1017" stroke="url(#amd-crimson)" stroke-width="2.5"/>
+
+  <!-- Inner silicon die -->
+  <rect x="37" y="37" width="54" height="54" rx="7" fill="url(#die-fill)" stroke="#30394D" stroke-width="1.5"/>
+
+  <!-- Subtle cockpit oscilloscope grid -->
+  <g stroke="#222B3E" stroke-width="1">
+    <line x1="41" y1="52" x2="87" y2="52"/>
+    <line x1="41" y1="64" x2="87" y2="64"/>
+    <line x1="41" y1="76" x2="87" y2="76"/>
+    <line x1="56" y1="41" x2="56" y2="87"/>
+    <line x1="72" y1="41" x2="72" y2="87"/>
+  </g>
+
+  <!-- Stylized Zen die corner bracket (top-right AMD accent) -->
+  <path d="M 73 41 L 87 41 L 87 55 L 82 55 L 82 46 L 73 46 Z" fill="url(#amd-crimson)" opacity="0.9"/>
+
+  <!-- Pin-1 orientation marker (bottom-left) -->
+  <polygon points="41,87 41,80 48,87" fill="#FF7666"/>
+
+  <!-- Cyan telemetry curve area fill -->
+  <path d="M 40 70 L 49 70 L 54 62 L 60 76 L 67 48 L 73 68 L 79 64 L 88 64 L 88 86 L 40 86 Z" fill="url(#pulse-area)"/>
+
+  <!-- Cyan telemetry curve glow -->
+  <path d="M 40 70 L 49 70 L 54 62 L 60 76 L 67 48 L 73 68 L 79 64 L 88 64"
+        fill="none" stroke="#38BDF8" stroke-width="6.5" stroke-linecap="round" stroke-linejoin="round" opacity="0.22"/>
+
+  <!-- Crisp cyan telemetry curve pulse -->
+  <path d="M 40 70 L 49 70 L 54 62 L 60 76 L 67 48 L 73 68 L 79 64 L 88 64"
+        fill="none" stroke="url(#pulse-stroke)" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"/>
+
+  <!-- Telemetry peak indicator node -->
+  <circle cx="67" cy="48" r="3" fill="#38BDF8"/>
+  <circle cx="67" cy="48" r="1.4" fill="#E0F2FE"/>
+</svg>

@@ -6,6 +6,7 @@ use serde::Serialize;
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
+use zensmu_core::driver::{detect_secure_boot, SecureBootStatus};
 use zensmu_core::error::Error;
 use zensmu_core::hw::identity::{
     detect_hardware, driver_has_false_ok_bug, read_host_cpuid, verify_codename_against_cpuid,
@@ -117,9 +118,13 @@ pub fn run_doctor(
 
     // 1. ryzen_smu loaded & readable
     let (driver_check, driver_info) = check_driver_loaded(transport, sysfs_path);
+    let driver_loaded = driver_info.is_some();
     checks.push(driver_check);
 
-    // 2. Sysfs permissions
+    // 2. UEFI Secure Boot / kernel lockdown status
+    checks.push(check_secure_boot(driver_loaded));
+
+    // 3. Sysfs permissions
     checks.push(check_sysfs_permissions(sysfs_path, is_root));
 
     // 3. drv_version / smu.c:213 false-OK bug check
@@ -210,6 +215,55 @@ fn check_driver_loaded(
             ),
             None,
         ),
+    }
+}
+
+fn check_secure_boot(driver_loaded: bool) -> DoctorCheck {
+    let status = detect_secure_boot();
+    check_secure_boot_with(&status, driver_loaded)
+}
+
+fn check_secure_boot_with(status: &SecureBootStatus, driver_loaded: bool) -> DoctorCheck {
+    const ID: &str = "secure_boot";
+    const NAME: &str = "Secure Boot / kernel lockdown";
+
+    let sb_label = match status.secure_boot_enabled {
+        Some(true) => "enabled",
+        Some(false) => "disabled",
+        None => "unknown",
+    };
+    let lockdown_label = status.lockdown_mode.as_deref().unwrap_or("none");
+
+    if status.blocks_unsigned_modules {
+        if driver_loaded {
+            DoctorCheck::pass(
+                ID,
+                NAME,
+                format!(
+                    "Secure Boot / lockdown active (Secure Boot={sb_label}, lockdown={lockdown_label}); ryzen_smu is loaded/signed"
+                ),
+            )
+        } else {
+            let fallback = "Sign the ryzen_smu DKMS module with an enrolled MOK (`sudo mokutil --import /var/lib/dkms/mok.pub`) or disable Secure Boot in UEFI firmware";
+            DoctorCheck::warn(
+                ID,
+                NAME,
+                format!(
+                    "Secure Boot / lockdown active (Secure Boot={sb_label}, lockdown={lockdown_label}) and ryzen_smu is not loaded; unsigned out-of-tree modules are blocked"
+                ),
+                Some(status.hint.as_deref().unwrap_or(fallback)),
+            )
+        }
+    } else if status.secure_boot_enabled == Some(false) && lockdown_label == "none" {
+        DoctorCheck::pass(ID, NAME, "Secure Boot disabled / kernel lockdown=none")
+    } else {
+        DoctorCheck::pass(
+            ID,
+            NAME,
+            format!(
+                "Secure Boot={sb_label} / kernel lockdown={lockdown_label} (unsigned modules permitted)"
+            ),
+        )
     }
 }
 
@@ -612,5 +666,33 @@ mod tests {
             .checks
             .iter()
             .any(|c| c.id == "boot_guard" && c.status == CheckStatus::Warn));
+        assert!(report.checks.iter().any(|c| c.id == "secure_boot"));
+    }
+
+    #[test]
+    fn secure_boot_check_covers_blocked_loaded_and_disabled_states() {
+        use zensmu_core::driver::secure_boot_status_from;
+
+        let blocked = secure_boot_status_from(Some(true), Some("integrity".into()));
+        let loaded_ok = check_secure_boot_with(&blocked, true);
+        assert_eq!(loaded_ok.id, "secure_boot");
+        assert_eq!(loaded_ok.status, CheckStatus::Pass);
+        assert!(loaded_ok.message.contains("loaded/signed"));
+        assert!(loaded_ok.remediation.is_none());
+
+        let unloaded_warn = check_secure_boot_with(&blocked, false);
+        assert_eq!(unloaded_warn.id, "secure_boot");
+        assert_eq!(unloaded_warn.status, CheckStatus::Warn);
+        assert!(unloaded_warn
+            .remediation
+            .as_deref()
+            .is_some_and(|h| h.contains("mokutil")));
+
+        let open = secure_boot_status_from(Some(false), Some("none".into()));
+        let open_pass = check_secure_boot_with(&open, false);
+        assert_eq!(open_pass.status, CheckStatus::Pass);
+        assert!(open_pass
+            .message
+            .contains("Secure Boot disabled / kernel lockdown=none"));
     }
 }

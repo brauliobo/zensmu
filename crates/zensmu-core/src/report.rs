@@ -6,6 +6,7 @@
 //! mutating SMU commands or collecting hostnames, usernames, IP/MAC addresses,
 //! or hardware serial numbers.
 
+use crate::driver::{detect_secure_boot, SecureBootStatus};
 use crate::error::Error;
 use crate::hw::identity::{
     read_host_cpuid, verify_codename_against_cpuid, CpuidInfo, HardwareContext,
@@ -116,6 +117,8 @@ pub struct DebugReport {
     pub shaper_state: Option<CurveShaperState>,
     pub shaper_error: Option<String>,
     pub user_note: Option<String>,
+    #[serde(default)]
+    pub secure_boot: Option<SecureBootStatus>,
 }
 
 /// Collect a complete, strictly read-only, privacy-safe diagnostic report.
@@ -129,8 +132,17 @@ pub fn collect_debug_report(transport: &dyn SmuTransport, opts: &ReportOptions) 
     let cpuid = read_host_cpuid();
     let topology = CpuTopology::detect_linux().ok();
     let hwmon_reference = scan_hwmon_dir(Path::new("/sys/class/hwmon"));
+    let secure_boot = Some(detect_secure_boot());
 
-    collect_debug_report_inner(transport, opts, system, cpuid, topology, hwmon_reference)
+    collect_debug_report_inner(
+        transport,
+        opts,
+        system,
+        cpuid,
+        topology,
+        hwmon_reference,
+        secure_boot,
+    )
 }
 
 fn collect_debug_report_inner(
@@ -140,6 +152,7 @@ fn collect_debug_report_inner(
     cpuid: Option<CpuidInfo>,
     topology: Option<CpuTopology>,
     hwmon_reference: Vec<HwmonSensorReading>,
+    secure_boot: Option<SecureBootStatus>,
 ) -> DebugReport {
     let zensmu_version = env!("CARGO_PKG_VERSION").to_string();
     let user_note = opts
@@ -325,6 +338,7 @@ fn collect_debug_report_inner(
         shaper_state,
         shaper_error,
         user_note,
+        secure_boot,
     }
 }
 
@@ -466,6 +480,27 @@ impl DebugReport {
             .unwrap_or("unavailable");
         let _ = writeln!(md, "| Kernel | `{}` |", escape_md_cell(kernel_str));
 
+        if let Some(ref sb) = self.secure_boot {
+            let sb_state = match sb.secure_boot_enabled {
+                Some(true) => "enabled",
+                Some(false) => "disabled",
+                None => "unknown",
+            };
+            let lockdown = match sb.lockdown_mode.as_deref() {
+                Some(mode) => format!("lockdown: `{}`", escape_md_cell(mode)),
+                None => "lockdown: unavailable".to_string(),
+            };
+            let suffix = if sb.blocks_unsigned_modules {
+                " (blocks unsigned modules)"
+            } else {
+                ""
+            };
+            let _ = writeln!(
+                md,
+                "| Secure Boot / Lockdown | {sb_state}, {lockdown}{suffix} |"
+            );
+        }
+
         let board_str = format_board_bios(&self.system);
         let _ = writeln!(
             md,
@@ -569,6 +604,15 @@ impl DebugReport {
                     "\n> **Driver / identity note:** `{}`",
                     escape_md_cell(err)
                 );
+            }
+        }
+        if self.driver.is_none() {
+            if let Some(ref sb) = self.secure_boot {
+                if sb.blocks_unsigned_modules {
+                    if let Some(ref hint) = sb.hint {
+                        let _ = writeln!(md, "\n> **Secure Boot / lockdown note:** {hint}");
+                    }
+                }
             }
         }
 
@@ -1259,6 +1303,10 @@ mod tests {
                 label: "Tctl".into(),
                 value: "54.2 °C".into(),
             }],
+            Some(crate::driver::secure_boot_status_from(
+                Some(false),
+                Some("none".into()),
+            )),
         );
 
         assert_eq!(report.zensmu_version, env!("CARGO_PKG_VERSION"));
@@ -1333,6 +1381,7 @@ mod tests {
             Some(mock_cpuid_9700x()),
             Some(CpuTopology::synthetic(1, 8, 2)),
             Vec::new(),
+            None,
         );
 
         assert!(pm_report.capabilities_supported);
@@ -1386,6 +1435,7 @@ mod tests {
             }),
             Some(CpuTopology::synthetic(1, 8, 2)),
             Vec::new(),
+            None,
         );
 
         assert!(cpu_report.codename.is_none());
@@ -1439,6 +1489,7 @@ mod tests {
             Some(mock_cpuid_9700x()),
             Some(CpuTopology::synthetic(1, 8, 2)),
             Vec::new(),
+            None,
         );
 
         let url = compact.github_issue_url();
@@ -1561,5 +1612,32 @@ mod tests {
             parse_os_release_pretty_name("PRETTY_NAME='Ubuntu 24.04 LTS'\n"),
             Some("Ubuntu 24.04 LTS".into())
         );
+    }
+
+    #[test]
+    fn report_renders_secure_boot_and_deserializes_legacy_json() {
+        let sb_blocking =
+            crate::driver::secure_boot_status_from(Some(true), Some("integrity".into()));
+        let report = collect_debug_report_inner(
+            &FailingTransport,
+            &ReportOptions::default(),
+            mock_system_info(),
+            Some(mock_cpuid_9700x()),
+            Some(CpuTopology::synthetic(1, 8, 2)),
+            Vec::new(),
+            Some(sb_blocking),
+        );
+        let md = report.to_markdown();
+        assert!(md.contains(
+            "| Secure Boot / Lockdown | enabled, lockdown: `integrity` (blocks unsigned modules) |"
+        ));
+        assert!(md.contains("**Secure Boot / lockdown note:**"));
+        assert!(md.contains("mokutil --import"));
+
+        // Verify legacy JSON without `secure_boot` still deserializes cleanly
+        let mut val = serde_json::to_value(&report).unwrap();
+        val.as_object_mut().unwrap().remove("secure_boot");
+        let parsed: DebugReport = serde_json::from_value(val).unwrap();
+        assert!(parsed.secure_boot.is_none());
     }
 }
