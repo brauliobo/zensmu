@@ -1,3 +1,21 @@
-fn main() {
-    println!("zensmu-gui placeholder");
+mod app;
+mod elevate;
+mod views;
+
+use eframe::egui;
+
+fn main() -> eframe::Result<()> {
+    let options = eframe::NativeOptions {
+        viewport: egui::ViewportBuilder::default()
+            .with_title("zensmu — AMD Ryzen SMU Control & Telemetry")
+            .with_inner_size([1220.0, 780.0])
+            .with_min_inner_size([920.0, 620.0]),
+        ..Default::default()
+    };
+
+    eframe::run_native(
+        "zensmu",
+        options,
+        Box::new(|cc| Ok(Box::new(app::ZensmuApp::new(cc)))),
+    )
 }
