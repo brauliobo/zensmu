@@ -181,21 +181,107 @@ fn layout_for(codename: Codename, version: u32) -> Option<PmTableLayout> {
                 cldo_vddg_ccd_v: None,
             })
         }
+        Codename::Renoir | Codename::Lucienne => {
+            // Verified live on Ryzen 7 5700U (Lucienne, PM table 0x00370005, 0x8C8 bytes)
+            // and cross-checked with RyzenAdj + ZenStates-Core PowerTable.cs.
+            let (min_size, fclk, uclk, mclk, vsoc) = match version {
+                0x0037_0000 => (0x794, 0x4B4, 0x4B8, 0x4BC, 0x190),
+                0x0037_0001 => (0x884, 0x5A4, 0x5A8, 0x5AC, 0x190),
+                0x0037_0002 => (0x88C, 0x5AC, 0x5B0, 0x5B4, 0x198),
+                0x0037_0003 | 0x0037_0004 => (0x8AC, 0x5CC, 0x5D0, 0x5D4, 0x198),
+                0x0037_0005 => (0x8C8, 0x5E8, 0x5EC, 0x5F0, 0x198),
+                _ => return None,
+            };
+            Some(PmTableLayout {
+                min_size,
+                ppt_limit_w: Some(0x008),
+                ppt_value_w: Some(0x00C),
+                tdc_limit_a: Some(0x020),
+                tdc_value_a: Some(0x024),
+                edc_limit_a: Some(0x030),
+                edc_value_a: Some(0x034),
+                tctl_limit_c: Some(0x040),
+                tctl_value_c: Some(0x044),
+                fclk_mhz: Some(fclk),
+                uclk_mhz: Some(uclk),
+                mclk_mhz: Some(mclk),
+                vddcr_soc_v: Some(vsoc),
+                vddcr_misc_v: None,
+                cldo_vddp_v: None,
+                cldo_vddg_iod_v: None,
+                cldo_vddg_ccd_v: None,
+            })
+        }
+        Codename::Cezanne => {
+            let (min_size, fclk, uclk, mclk) = match version {
+                0x0040_0001 => (0x8D0, 0x624, 0x628, 0x62C),
+                0x0040_0002 => (0x928, 0x63C, 0x640, 0x644),
+                0x0040_0003 => (0x94C, 0x660, 0x664, 0x668),
+                0x0040_0004 | 0x0040_0005 => (0x944, 0x664, 0x668, 0x66C),
+                _ => return None,
+            };
+            Some(PmTableLayout {
+                min_size,
+                ppt_limit_w: Some(0x008),
+                ppt_value_w: Some(0x00C),
+                tdc_limit_a: Some(0x020),
+                tdc_value_a: Some(0x024),
+                edc_limit_a: Some(0x030),
+                edc_value_a: Some(0x034),
+                tctl_limit_c: Some(0x040),
+                tctl_value_c: Some(0x044),
+                fclk_mhz: Some(fclk),
+                uclk_mhz: Some(uclk),
+                mclk_mhz: Some(mclk),
+                vddcr_soc_v: Some(0x19C),
+                vddcr_misc_v: None,
+                cldo_vddp_v: None,
+                cldo_vddg_iod_v: None,
+                cldo_vddg_ccd_v: None,
+            })
+        }
+        Codename::Rembrandt => {
+            let (min_size, fclk, uclk, mclk, vsoc) = match version {
+                0x0045_0004 => (0xAA4, 0x664, 0x668, 0x66C, 0x19C),
+                0x0045_0005 => (0xAB0, 0x6B0, 0x6B4, 0x6B8, 0x1C8),
+                _ => return None,
+            };
+            Some(PmTableLayout {
+                min_size,
+                ppt_limit_w: Some(0x008),
+                ppt_value_w: Some(0x00C),
+                tdc_limit_a: Some(0x020),
+                tdc_value_a: Some(0x024),
+                edc_limit_a: Some(0x030),
+                edc_value_a: Some(0x034),
+                tctl_limit_c: Some(0x040),
+                tctl_value_c: Some(0x044),
+                fclk_mhz: Some(fclk),
+                uclk_mhz: Some(uclk),
+                mclk_mhz: Some(mclk),
+                vddcr_soc_v: Some(vsoc),
+                vddcr_misc_v: None,
+                cldo_vddp_v: None,
+                cldo_vddg_iod_v: None,
+                cldo_vddg_ccd_v: None,
+            })
+        }
         Codename::Phoenix | Codename::HawkPoint => {
             let supported = matches!(version, 0x004C_0003..=0x004C_0009);
             if !supported {
                 return None;
             }
+            let has_std_header = matches!(version, 0x004C_0006..=0x004C_0009);
             Some(PmTableLayout {
                 min_size: 0x778,
-                ppt_limit_w: None,
-                ppt_value_w: None,
-                tdc_limit_a: None,
-                tdc_value_a: None,
-                tctl_limit_c: None,
-                tctl_value_c: None,
-                edc_limit_a: None,
-                edc_value_a: None,
+                ppt_limit_w: if has_std_header { Some(0x008) } else { None },
+                ppt_value_w: if has_std_header { Some(0x00C) } else { None },
+                tdc_limit_a: if has_std_header { Some(0x020) } else { None },
+                tdc_value_a: if has_std_header { Some(0x024) } else { None },
+                edc_limit_a: if has_std_header { Some(0x030) } else { None },
+                edc_value_a: if has_std_header { Some(0x034) } else { None },
+                tctl_limit_c: if has_std_header { Some(0x040) } else { None },
+                tctl_value_c: if has_std_header { Some(0x044) } else { None },
                 fclk_mhz: Some(0x164),
                 uclk_mhz: Some(0x174),
                 mclk_mhz: Some(0x184),
@@ -430,14 +516,33 @@ mod tests {
         assert_eq!(vsnap.cldo_vddp_v, Some(0.90));
 
         let mut phoenix = vec![0u8; 0x800];
+        write_f32(&mut phoenix, 0x008, 45.0);
         write_f32(&mut phoenix, 0x164, 2000.0);
         write_f32(&mut phoenix, 0x1BC, 1.15);
         write_f32(&mut phoenix, 0x774, 0.95);
         let psnap = decode_pm_table(Codename::Phoenix, 0x004C_0008, &phoenix).unwrap();
+        assert_eq!(psnap.ppt_limit_w, Some(45.0));
         assert_eq!(psnap.fclk_mhz, Some(2000.0));
         assert_eq!(psnap.vddcr_soc_v, Some(1.15));
         assert_eq!(psnap.cldo_vddp_v, Some(0.95));
-        assert_eq!(psnap.ppt_limit_w, None);
+
+        let mut lucienne = vec![0u8; 0x8C8];
+        write_f32(&mut lucienne, 0x008, 30.0);
+        write_f32(&mut lucienne, 0x00C, 4.6);
+        write_f32(&mut lucienne, 0x020, 33.0);
+        write_f32(&mut lucienne, 0x030, 70.0);
+        write_f32(&mut lucienne, 0x040, 85.0);
+        write_f32(&mut lucienne, 0x044, 44.4);
+        write_f32(&mut lucienne, 0x198, 0.725);
+        write_f32(&mut lucienne, 0x5E8, 1200.0);
+        let lsnap = decode_pm_table(Codename::Lucienne, 0x0037_0005, &lucienne).unwrap();
+        assert_eq!(lsnap.ppt_limit_w, Some(30.0));
+        assert_eq!(lsnap.tdc_limit_a, Some(33.0));
+        assert_eq!(lsnap.edc_limit_a, Some(70.0));
+        assert_eq!(lsnap.tctl_limit_c, Some(85.0));
+        assert_eq!(lsnap.tctl_value_c, Some(44.4));
+        assert_eq!(lsnap.vddcr_soc_v, Some(0.725));
+        assert_eq!(lsnap.fclk_mhz, Some(1200.0));
     }
 
     #[test]

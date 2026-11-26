@@ -13,7 +13,7 @@ depends=(
     'glibc'
 )
 optdepends=(
-    'ryzen_smu-dkms-git: DKMS kernel module providing /sys/kernel/ryzen_smu_drv (required unless shipped by your kernel, e.g. CachyOS/custom kernel)'
+    'ryzen_smu-dkms-git: required DKMS kernel module providing /sys/kernel/ryzen_smu_drv (needed on Arch/CachyOS unless built into a custom kernel)'
     'libglvnd: OpenGL support for zensmu-gui'
     'libxkbcommon: keyboard support for zensmu-gui on Wayland/X11'
     'wayland: native Wayland windowing for zensmu-gui'
