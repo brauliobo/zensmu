@@ -1,7 +1,7 @@
 # Maintainer: Braulio Oliveira <brauliobo@gmail.com>
 
 pkgname=zensmu-git
-pkgver=0.2.0.r0.g0000000
+pkgver=0.2.0.r0.g44aa45b
 pkgrel=1
 pkgdesc="Safety-first Rust CLI, live TUI, and unprivileged GUI for AMD Ryzen SMU control and telemetry"
 arch=('x86_64')

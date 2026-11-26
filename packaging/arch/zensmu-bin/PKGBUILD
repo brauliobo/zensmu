@@ -23,7 +23,7 @@ provides=('zensmu')
 conflicts=('zensmu' 'zensmu-git')
 options=('!strip' '!debug')
 source=("${pkgname}-${pkgver}-x86_64.tar.gz::https://github.com/brauliobo/zensmu/releases/download/v${pkgver}/zensmu-v${pkgver}-x86_64-unknown-linux-gnu.tar.gz")
-sha256sums=('0f80e5e9726e816a1d3130e85c758dbf99e48293515f30c6964eca41ed41c095')
+sha256sums=('ff56c9c26c39adbf5200c75d5799748fd89de8b82dabbdc467928f1adb7ee753')
 
 package() {
     local root="${srcdir}/zensmu-v${pkgver}-x86_64-unknown-linux-gnu"
