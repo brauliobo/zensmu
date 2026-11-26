@@ -587,21 +587,8 @@ mod tests {
         ));
 
         let set = Cli::try_parse_from([
-            "zensmu",
-            "pbo",
-            "set",
-            "--ppt",
-            "142W",
-            "--tdc",
-            "110A",
-            "--edc",
-            "170A",
-            "--tctl",
-            "85C",
-            "--scalar",
-            "2",
-            "--fmax",
-            "5.65GHz",
+            "zensmu", "pbo", "set", "--ppt", "142W", "--tdc", "110A", "--edc", "170A", "--tctl",
+            "85C", "--scalar", "2", "--fmax", "5.65GHz",
         ])
         .unwrap();
         match set.command {
@@ -626,8 +613,7 @@ mod tests {
             other => panic!("unexpected command: {other:?}"),
         }
 
-        let set_alias =
-            Cli::try_parse_from(["zensmu", "pbo", "set", "--tjmax", "85"]).unwrap();
+        let set_alias = Cli::try_parse_from(["zensmu", "pbo", "set", "--tjmax", "85"]).unwrap();
         match set_alias.command {
             Command::Pbo {
                 action: PboAction::Set { tctl, .. },
@@ -716,8 +702,8 @@ mod tests {
         assert!(matches!(t1.command, Command::Telemetry { action: None }));
 
         // Telemetry watch
-        let t2 = Cli::try_parse_from(["zensmu", "telemetry", "watch", "--interval", "250ms"])
-            .unwrap();
+        let t2 =
+            Cli::try_parse_from(["zensmu", "telemetry", "watch", "--interval", "250ms"]).unwrap();
         match t2.command {
             Command::Telemetry {
                 action: Some(TelemetryAction::Watch { interval }),
@@ -872,14 +858,9 @@ mod tests {
             other => panic!("unexpected command: {other:?}"),
         }
 
-        let disable_rm = Cli::try_parse_from([
-            "zensmu",
-            "persist",
-            "disable",
-            "--remove-profile",
-            "--json",
-        ])
-        .unwrap();
+        let disable_rm =
+            Cli::try_parse_from(["zensmu", "persist", "disable", "--remove-profile", "--json"])
+                .unwrap();
         assert!(disable_rm.json);
         match disable_rm.command {
             Command::Persist(PersistCommand {

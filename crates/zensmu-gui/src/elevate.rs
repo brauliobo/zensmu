@@ -14,7 +14,6 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::thread;
-use zensmu_core::config::profile::ProfileDiffEntry;
 use zensmu_core::ops::apu::ApuSetRequest;
 use zensmu_core::ops::co::{CoSnapshot, CoreCoMargin};
 use zensmu_core::ops::pbo::{PboSetRequest, PboStatus};
@@ -607,11 +606,7 @@ impl CliAction {
                 allow_extreme,
                 dry_run,
             } => {
-                let mut args = vec![
-                    "profile".into(),
-                    "apply".into(),
-                    path.display().to_string(),
-                ];
+                let mut args = vec!["profile".into(), "apply".into(), path.display().to_string()];
                 append_write_flags(&mut args, *allow_extreme, *dry_run);
                 args.push("--json".into());
                 vec![args]
@@ -777,7 +772,7 @@ pub struct PersistActionOutput {
 /// Result delivered asynchronously from the background CLI worker thread back to the GUI.
 #[derive(Debug, Clone)]
 pub enum ElevatedResult {
-    Status(StatusPayload),
+    Status(Box<StatusPayload>),
     Co(CoSnapshot),
     Shaper(CurveShaperState),
     Pbo(PboStatus),
@@ -793,10 +788,6 @@ pub enum ElevatedResult {
     ProfileExported {
         path: PathBuf,
         toml: String,
-    },
-    #[allow(dead_code)]
-    ProfileDiff {
-        entries: Vec<ProfileDiffEntry>,
     },
     PersistUpdated {
         action: String,
@@ -890,7 +881,7 @@ fn execute_action(zensmu_bin: &Path, is_root: bool, action: CliAction) -> Elevat
     let first = stdouts.first().map(String::as_str).unwrap_or("");
     match action {
         CliAction::Status => match parse_status_payload(first) {
-            Ok(payload) => ElevatedResult::Status(payload),
+            Ok(payload) => ElevatedResult::Status(Box::new(payload)),
             Err(message) => ElevatedResult::Error { title, message },
         },
         CliAction::CoGet => match parse_co_snapshot(first) {
@@ -1003,6 +994,8 @@ fn run_command_spec(spec: &CommandSpec) -> Result<String, String> {
 fn looks_like_permission_error(msg: &str) -> bool {
     let lower = msg.to_ascii_lowercase();
     lower.contains("permission denied")
+        || lower.contains("access denied")
+        || lower.contains("eacces")
         || lower.contains("requires root")
         || lower.contains("sudo")
         || lower.contains("pkexec")
@@ -1293,7 +1286,10 @@ mod tests {
 
     #[test]
     fn cli_arg_construction_matches_expected_flags() {
-        assert_eq!(CliAction::Status.to_arg_batches(), vec![vec!["status", "--json"]]);
+        assert_eq!(
+            CliAction::Status.to_arg_batches(),
+            vec![vec!["status", "--json"]]
+        );
         assert_eq!(
             CliAction::CoGet.to_arg_batches(),
             vec![vec!["co", "get", "--json"]]
@@ -1347,6 +1343,47 @@ mod tests {
             CliAction::CoReset { dry_run: true }.to_arg_batches(),
             vec![vec!["co", "reset", "--dry-run", "--json"]]
         );
+
+        let co_igpu = CliAction::CoSetIgpu {
+            margin: -15,
+            allow_extreme: false,
+            dry_run: true,
+        };
+        assert!(!co_igpu.requires_privilege());
+        assert_eq!(
+            co_igpu.to_arg_batches(),
+            vec![vec!["co", "set", "--igpu=-15", "--dry-run", "--json"]]
+        );
+        let co_igpu_live = co_igpu.into_live();
+        assert!(co_igpu_live.requires_privilege());
+        assert_eq!(
+            co_igpu_live.to_arg_batches(),
+            vec![vec!["co", "set", "--igpu=-15", "--yes", "--json"]]
+        );
+
+        let shaper_all = CliAction::ShaperSetAll {
+            state: CurveShaperState::default(),
+            allow_extreme: true,
+            dry_run: true,
+        };
+        assert!(!shaper_all.requires_privilege());
+        let shaper_batches = shaper_all.to_arg_batches();
+        assert_eq!(shaper_batches.len(), 5);
+        assert_eq!(
+            shaper_batches[0],
+            vec![
+                "shaper",
+                "set",
+                "--freq",
+                "min",
+                "--temp",
+                "low=0,med=0,high=0",
+                "--allow-extreme",
+                "--dry-run",
+                "--json"
+            ]
+        );
+        assert_eq!(shaper_batches[4][3], "max");
 
         let shaper_tier = CliAction::ShaperSetTier {
             tier: FreqTier::High,
@@ -1431,14 +1468,33 @@ mod tests {
             ]]
         );
 
+        let export = CliAction::ProfileExport {
+            path: PathBuf::from("/tmp/zensmu-export.toml"),
+        };
+        assert!(export.requires_privilege());
         assert_eq!(
-            CliAction::Rollback { dry_run: true }.to_arg_batches(),
+            export.to_arg_batches(),
+            vec![vec![
+                "profile",
+                "export",
+                "/tmp/zensmu-export.toml",
+                "--json"
+            ]]
+        );
+
+        let rollback_dry = CliAction::Rollback { dry_run: true };
+        assert!(rollback_dry.requires_privilege());
+        assert_eq!(
+            rollback_dry.to_arg_batches(),
             vec![vec!["rollback", "--dry-run", "--json"]]
         );
+        let reset_live = CliAction::Reset { dry_run: false };
+        assert!(reset_live.requires_privilege());
         assert_eq!(
-            CliAction::Reset { dry_run: false }.to_arg_batches(),
+            reset_live.to_arg_batches(),
             vec![vec!["reset", "--yes", "--json"]]
         );
+        assert!(CliAction::PboReset { dry_run: true }.requires_privilege());
     }
 
     #[test]
@@ -1667,12 +1723,7 @@ mod tests {
         assert!(disable_rm.requires_privilege());
         assert_eq!(
             disable_rm.to_arg_batches(),
-            vec![vec![
-                "persist",
-                "disable",
-                "--remove-profile",
-                "--json"
-            ]]
+            vec![vec!["persist", "disable", "--remove-profile", "--json"]]
         );
 
         assert!(CliAction::ClearBootGuard.requires_privilege());
@@ -1713,18 +1764,27 @@ mod tests {
         assert_eq!(decoded.action, "persist save");
         assert!(!decoded.dry_run);
         assert!(decoded.service_enabled);
-        assert_eq!(decoded.status.active_profile_codename, Some(Codename::GraniteRidge));
-        assert_eq!(decoded.note.as_deref(), Some("Enabled zensmu-apply.service"));
+        assert_eq!(
+            decoded.status.active_profile_codename,
+            Some(Codename::GraniteRidge)
+        );
+        assert_eq!(
+            decoded.note.as_deref(),
+            Some("Enabled zensmu-apply.service")
+        );
 
-        let err_payload = r#"{"ok": false, "error": "cannot enable service without active profile"}"#;
+        let err_payload =
+            r#"{"ok": false, "error": "cannot enable service without active profile"}"#;
         assert!(parse_persist_action_output(err_payload)
             .unwrap_err()
             .contains("without active profile"));
 
-        let guard_json = r#"{"guard_path":"/var/lib/zensmu/applying.lock","was_tripped":true,"cleared":true}"#;
+        let guard_json =
+            r#"{"guard_path":"/var/lib/zensmu/applying.lock","was_tripped":true,"cleared":true}"#;
         assert!(parse_clear_guard_output(guard_json).unwrap());
 
-        let guard_noop = r#"{"guard_path":"/var/lib/zensmu/applying.lock","was_tripped":false,"cleared":false}"#;
+        let guard_noop =
+            r#"{"guard_path":"/var/lib/zensmu/applying.lock","was_tripped":false,"cleared":false}"#;
         assert!(!parse_clear_guard_output(guard_noop).unwrap());
 
         let guard_err = r#"{"ok":false,"error":"permission denied"}"#;

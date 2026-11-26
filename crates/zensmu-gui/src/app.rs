@@ -21,7 +21,11 @@ use zensmu_core::ops::apu::{
     APU_SOC_TDC_MIN_A, APU_SOC_TDC_SOFT_MAX_A,
 };
 use zensmu_core::ops::co::CoSnapshot;
-use zensmu_core::ops::pbo::{PboSetRequest, PboStatus, TCTL_MAX_C};
+use zensmu_core::ops::pbo::{
+    PboSetRequest, PboStatus, EDC_MAX_A, EDC_MIN_A, EDC_SOFT_MAX_A, FMAX_MAX_MHZ, FMAX_MIN_MHZ,
+    PPT_MAX_W, PPT_MIN_W, PPT_SOFT_MAX_W, SCALAR_MAX, SCALAR_MIN, SCALAR_SOFT_MAX, TCTL_MAX_C,
+    TCTL_MIN_C, TDC_MAX_A, TDC_MIN_A, TDC_SOFT_MAX_A,
+};
 use zensmu_core::ops::pm_table::{self, TelemetrySnapshot};
 use zensmu_core::safety::guard::{BootLoopGuard, SentinelInfo};
 use zensmu_core::safety::persist::{read_persist_status, PersistPaths, PersistStatus};
@@ -60,7 +64,7 @@ pub struct TelemetrySample {
 
 /// Message sent from the unprivileged telemetry poller thread to the UI.
 enum TelemetryMsg {
-    Sample(TelemetrySample),
+    Sample(Box<TelemetrySample>),
     Error(String),
 }
 
@@ -107,23 +111,12 @@ pub struct PersistConfirmModal {
 }
 
 /// Editable Curve Optimizer UI state.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct CoEditorState {
     pub all_core: i32,
     pub per_core: Vec<i32>,
     pub igpu: i32,
     pub allow_extreme: bool,
-}
-
-impl Default for CoEditorState {
-    fn default() -> Self {
-        Self {
-            all_core: 0,
-            per_core: Vec::new(),
-            igpu: 0,
-            allow_extreme: false,
-        }
-    }
 }
 
 /// Editable Curve Shaper (Zen 5) UI state.
@@ -133,23 +126,43 @@ pub struct ShaperEditorState {
     pub allow_extreme: bool,
 }
 
+/// Sync a positive finite live telemetry limit into a non-dirty `u32` slider field.
+fn sync_u32_limit(target: &mut u32, dirty: bool, live: Option<f32>, min: u32, max: u32) {
+    if !dirty {
+        if let Some(v) = live.filter(|v| v.is_finite() && *v > 0.0) {
+            *target = v.round().clamp(min as f32, max as f32) as u32;
+        }
+    }
+}
+
+/// Convert a finite, strictly positive telemetry float to `Some(u32)` for diff snapshots.
+fn finite_positive_u32(live: Option<f32>) -> Option<u32> {
+    live.filter(|v| v.is_finite() && *v > 0.0)
+        .map(|v| v.round() as u32)
+}
+
 /// Editable PBO Limits UI state.
 #[derive(Debug, Clone)]
 pub struct PboEditorState {
     pub ppt_enabled: bool,
     pub ppt_w: u32,
+    pub ppt_dirty: bool,
     pub tdc_enabled: bool,
     pub tdc_a: u32,
+    pub tdc_dirty: bool,
     pub edc_enabled: bool,
     pub edc_a: u32,
+    pub edc_dirty: bool,
     pub tctl_enabled: bool,
     pub tctl_c: u32,
+    pub tctl_dirty: bool,
     pub scalar_enabled: bool,
     pub scalar: u32,
+    pub scalar_dirty: bool,
     pub fmax_enabled: bool,
     pub fmax_mhz: u32,
+    pub fmax_dirty: bool,
     pub allow_extreme: bool,
-    pub seeded_from_telemetry: bool,
 }
 
 impl Default for PboEditorState {
@@ -157,23 +170,93 @@ impl Default for PboEditorState {
         Self {
             ppt_enabled: true,
             ppt_w: 88,
+            ppt_dirty: false,
             tdc_enabled: true,
             tdc_a: 75,
+            tdc_dirty: false,
             edc_enabled: true,
             edc_a: 150,
+            edc_dirty: false,
             tctl_enabled: true,
             tctl_c: 85,
+            tctl_dirty: false,
             scalar_enabled: false,
             scalar: 1,
+            scalar_dirty: false,
             fmax_enabled: false,
             fmax_mhz: 5500,
+            fmax_dirty: false,
             allow_extreme: false,
-            seeded_from_telemetry: false,
         }
     }
 }
 
 impl PboEditorState {
+    /// Sync live hardware PBO limits from a PM table telemetry snapshot into non-dirty slider fields.
+    pub fn sync_from_telemetry(&mut self, snap: &TelemetrySnapshot) {
+        sync_u32_limit(
+            &mut self.ppt_w,
+            self.ppt_dirty,
+            snap.ppt_limit_w,
+            PPT_MIN_W,
+            PPT_MAX_W,
+        );
+        sync_u32_limit(
+            &mut self.tdc_a,
+            self.tdc_dirty,
+            snap.tdc_limit_a,
+            TDC_MIN_A,
+            TDC_MAX_A,
+        );
+        sync_u32_limit(
+            &mut self.edc_a,
+            self.edc_dirty,
+            snap.edc_limit_a,
+            EDC_MIN_A,
+            EDC_MAX_A,
+        );
+        sync_u32_limit(
+            &mut self.tctl_c,
+            self.tctl_dirty,
+            snap.tctl_limit_c,
+            TCTL_MIN_C,
+            TCTL_MAX_C,
+        );
+    }
+
+    /// Sync PBO scalar and Fmax from a `PboStatus` mailbox snapshot.
+    ///
+    /// When `force` is true (explicit refresh or post-apply resync), dirty flags for
+    /// scalar and Fmax are cleared and overwritten from live hardware state.
+    pub fn sync_from_status(&mut self, status: &PboStatus, force: bool) {
+        if force {
+            self.scalar_dirty = false;
+            self.fmax_dirty = false;
+        }
+        sync_u32_limit(
+            &mut self.scalar,
+            self.scalar_dirty,
+            status.scalar,
+            SCALAR_MIN,
+            SCALAR_MAX,
+        );
+        if !self.fmax_dirty {
+            if let Some(fmax) = status.fmax_mhz {
+                self.fmax_mhz = fmax.clamp(FMAX_MIN_MHZ, FMAX_MAX_MHZ);
+            }
+        }
+    }
+
+    /// Clear all dirty flags so subsequent telemetry/status snapshots resync slider values.
+    pub fn clear_dirty(&mut self) {
+        self.ppt_dirty = false;
+        self.tdc_dirty = false;
+        self.edc_dirty = false;
+        self.tctl_dirty = false;
+        self.scalar_dirty = false;
+        self.fmax_dirty = false;
+    }
+
     pub fn build_request_for(&self, caps: &CpuCapabilities) -> PboSetRequest {
         PboSetRequest {
             ppt_w: (self.ppt_enabled && caps.set_ppt.is_some()).then_some(self.ppt_w),
@@ -193,6 +276,15 @@ impl PboEditorState {
             || (self.tctl_enabled && caps.set_tctl.is_some())
             || (self.scalar_enabled && caps.set_pbo_scalar.is_some())
             || (self.fmax_enabled && caps.set_fmax.is_some())
+    }
+
+    /// Returns true if any enabled PBO field exceeds its conservative soft ceiling.
+    pub fn has_any_extreme_for(&self, caps: &CpuCapabilities) -> bool {
+        let req = self.build_request_for(caps);
+        req.ppt_w.is_some_and(|v| v > PPT_SOFT_MAX_W)
+            || req.tdc_a.is_some_and(|v| v > TDC_SOFT_MAX_A)
+            || req.edc_a.is_some_and(|v| v > EDC_SOFT_MAX_A)
+            || req.scalar.is_some_and(|v| v > SCALAR_SOFT_MAX)
     }
 }
 
@@ -316,70 +408,62 @@ impl ApuEditorState {
         self.live_apu_skin_temp_c = snap.apu_skin_temp_limit_c;
         self.live_dgpu_skin_temp_c = snap.dgpu_skin_temp_limit_c;
 
-        if !self.stapm_dirty {
-            if let Some(v) = snap.stapm_limit_w.filter(|&v| v > 0.0) {
-                self.stapm_w = v
-                    .round()
-                    .clamp(APU_POWER_MIN_W as f32, APU_POWER_MAX_W as f32)
-                    as u32;
-            }
-        }
-        if !self.fast_dirty {
-            if let Some(v) = snap.ppt_limit_w.filter(|&v| v > 0.0) {
-                self.fast_w = v
-                    .round()
-                    .clamp(APU_POWER_MIN_W as f32, APU_POWER_MAX_W as f32)
-                    as u32;
-            }
-        }
-        if !self.slow_dirty {
-            if let Some(v) = snap.slow_limit_w.filter(|&v| v > 0.0) {
-                self.slow_w = v
-                    .round()
-                    .clamp(APU_POWER_MIN_W as f32, APU_POWER_MAX_W as f32)
-                    as u32;
-            }
-        }
-        if !self.apu_slow_dirty {
-            if let Some(v) = snap.apu_slow_limit_w.filter(|&v| v > 0.0) {
-                self.apu_slow_w = v
-                    .round()
-                    .clamp(APU_POWER_MIN_W as f32, APU_POWER_MAX_W as f32)
-                    as u32;
-            }
-        }
-        if !self.tdc_soc_dirty {
-            if let Some(v) = snap.tdc_soc_limit_a.filter(|&v| v > 0.0) {
-                self.tdc_soc_a = v
-                    .round()
-                    .clamp(APU_SOC_TDC_MIN_A as f32, APU_SOC_TDC_MAX_A as f32)
-                    as u32;
-            }
-        }
-        if !self.edc_soc_dirty {
-            if let Some(v) = snap.edc_soc_limit_a.filter(|&v| v > 0.0) {
-                self.edc_soc_a = v
-                    .round()
-                    .clamp(APU_SOC_EDC_MIN_A as f32, APU_SOC_EDC_MAX_A as f32)
-                    as u32;
-            }
-        }
-        if !self.apu_skin_temp_dirty {
-            if let Some(v) = snap.apu_skin_temp_limit_c.filter(|&v| v > 0.0) {
-                self.apu_skin_temp_c = v
-                    .round()
-                    .clamp(APU_SKIN_TEMP_MIN_C as f32, APU_SKIN_TEMP_MAX_C as f32)
-                    as u32;
-            }
-        }
-        if !self.dgpu_skin_temp_dirty {
-            if let Some(v) = snap.dgpu_skin_temp_limit_c.filter(|&v| v > 0.0) {
-                self.dgpu_skin_temp_c = v
-                    .round()
-                    .clamp(APU_SKIN_TEMP_MIN_C as f32, APU_SKIN_TEMP_MAX_C as f32)
-                    as u32;
-            }
-        }
+        sync_u32_limit(
+            &mut self.stapm_w,
+            self.stapm_dirty,
+            snap.stapm_limit_w,
+            APU_POWER_MIN_W,
+            APU_POWER_MAX_W,
+        );
+        sync_u32_limit(
+            &mut self.fast_w,
+            self.fast_dirty,
+            snap.ppt_limit_w,
+            APU_POWER_MIN_W,
+            APU_POWER_MAX_W,
+        );
+        sync_u32_limit(
+            &mut self.slow_w,
+            self.slow_dirty,
+            snap.slow_limit_w,
+            APU_POWER_MIN_W,
+            APU_POWER_MAX_W,
+        );
+        sync_u32_limit(
+            &mut self.apu_slow_w,
+            self.apu_slow_dirty,
+            snap.apu_slow_limit_w,
+            APU_POWER_MIN_W,
+            APU_POWER_MAX_W,
+        );
+        sync_u32_limit(
+            &mut self.tdc_soc_a,
+            self.tdc_soc_dirty,
+            snap.tdc_soc_limit_a,
+            APU_SOC_TDC_MIN_A,
+            APU_SOC_TDC_MAX_A,
+        );
+        sync_u32_limit(
+            &mut self.edc_soc_a,
+            self.edc_soc_dirty,
+            snap.edc_soc_limit_a,
+            APU_SOC_EDC_MIN_A,
+            APU_SOC_EDC_MAX_A,
+        );
+        sync_u32_limit(
+            &mut self.apu_skin_temp_c,
+            self.apu_skin_temp_dirty,
+            snap.apu_skin_temp_limit_c,
+            APU_SKIN_TEMP_MIN_C,
+            APU_SKIN_TEMP_MAX_C,
+        );
+        sync_u32_limit(
+            &mut self.dgpu_skin_temp_c,
+            self.dgpu_skin_temp_dirty,
+            snap.dgpu_skin_temp_limit_c,
+            APU_SKIN_TEMP_MIN_C,
+            APU_SKIN_TEMP_MAX_C,
+        );
     }
 
     /// Clear all dirty flags so subsequent telemetry samples resync slider values.
@@ -525,6 +609,7 @@ pub struct ZensmuApp {
     pub persist_status: PersistStatus,
     pub persist_confirm: Option<PersistConfirmModal>,
     staging_persist_path: Option<PathBuf>,
+    staging_profile_path: Option<PathBuf>,
 
     // Dry-run confirmation modal & async pkexec runner
     pub pending_modal: Option<DryRunModal>,
@@ -566,6 +651,7 @@ impl ZensmuApp {
             persist_status: read_persist_status(&PersistPaths::default(), None, None),
             persist_confirm: None,
             staging_persist_path: None,
+            staging_profile_path: None,
             pending_modal: None,
             runner,
             toast: None,
@@ -630,6 +716,8 @@ impl ZensmuApp {
             Ok(hw) => {
                 let core_count = hw.topology.physical_cores;
                 self.co_editor.per_core = vec![0; core_count];
+                self.pbo_editor.clear_dirty();
+                self.apu_editor.clear_dirty();
                 if self.profile_editor.toml_text.is_empty() {
                     self.profile_editor.toml_text = default_profile_template(&hw);
                 }
@@ -696,10 +784,10 @@ impl ZensmuApp {
             while !stop.load(Ordering::Relaxed) {
                 if !pause.load(Ordering::Relaxed) {
                     let msg = match pm_table::read_telemetry(&transport, &hw) {
-                        Ok(snapshot) => TelemetryMsg::Sample(TelemetrySample {
+                        Ok(snapshot) => TelemetryMsg::Sample(Box::new(TelemetrySample {
                             elapsed_s: start_time.elapsed().as_secs_f64(),
                             snapshot,
-                        }),
+                        })),
                         Err(e) => TelemetryMsg::Error(e.to_string()),
                     };
                     if tx.send(msg).is_err() {
@@ -811,17 +899,17 @@ impl ZensmuApp {
             snap.fmax_mhz = pbo.fmax_mhz;
         }
         if let Some(telem) = &self.latest_telemetry {
-            snap.ppt_w = telem.ppt_limit_w.map(|v| v.round() as u32);
-            snap.tdc_a = telem.tdc_limit_a.map(|v| v.round() as u32);
-            snap.edc_a = telem.edc_limit_a.map(|v| v.round() as u32);
-            snap.tctl_c = telem.tctl_limit_c.map(|v| v.round() as u32);
-            snap.stapm_w = telem.stapm_limit_w.map(|v| v.round() as u32);
-            snap.slow_w = telem.slow_limit_w.map(|v| v.round() as u32);
-            snap.apu_slow_w = telem.apu_slow_limit_w.map(|v| v.round() as u32);
-            snap.tdc_soc_a = telem.tdc_soc_limit_a.map(|v| v.round() as u32);
-            snap.edc_soc_a = telem.edc_soc_limit_a.map(|v| v.round() as u32);
-            snap.apu_skin_temp_c = telem.apu_skin_temp_limit_c.map(|v| v.round() as u32);
-            snap.dgpu_skin_temp_c = telem.dgpu_skin_temp_limit_c.map(|v| v.round() as u32);
+            snap.ppt_w = finite_positive_u32(telem.ppt_limit_w);
+            snap.tdc_a = finite_positive_u32(telem.tdc_limit_a);
+            snap.edc_a = finite_positive_u32(telem.edc_limit_a);
+            snap.tctl_c = finite_positive_u32(telem.tctl_limit_c);
+            snap.stapm_w = finite_positive_u32(telem.stapm_limit_w);
+            snap.slow_w = finite_positive_u32(telem.slow_limit_w);
+            snap.apu_slow_w = finite_positive_u32(telem.apu_slow_limit_w);
+            snap.tdc_soc_a = finite_positive_u32(telem.tdc_soc_limit_a);
+            snap.edc_soc_a = finite_positive_u32(telem.edc_soc_limit_a);
+            snap.apu_skin_temp_c = finite_positive_u32(telem.apu_skin_temp_limit_c);
+            snap.dgpu_skin_temp_c = finite_positive_u32(telem.dgpu_skin_temp_limit_c);
         }
 
         let diffs = profile.diff_against(&snap);
@@ -862,40 +950,24 @@ impl ZensmuApp {
     /// Write the editor TOML buffer to a temporary file and run `profile apply --dry-run --json`.
     pub fn preview_apply_profile(&mut self, ctx: &egui::Context) {
         // Validate locally first so malformed TOML never spawns pkexec.
-        if let Some(hw) = &self.hw {
-            match Profile::from_toml_str(&self.profile_editor.toml_text) {
-                Ok(p) => {
-                    if let Err(e) = p.validate_for(
-                        hw.codename,
-                        hw.topology.physical_cores,
-                        self.profile_editor.allow_extreme,
-                    ) {
-                        self.profile_editor.validation = Some(Err(e.to_string()));
-                        self.set_toast(ToastLevel::Error, e.to_string());
-                        return;
-                    }
-                }
-                Err(e) => {
-                    let msg = format!("Invalid TOML: {e}");
-                    self.profile_editor.validation = Some(Err(msg.clone()));
-                    self.set_toast(ToastLevel::Error, msg);
-                    return;
-                }
-            }
+        if !self.validate_editor_toml_for_persist() {
+            return;
         }
 
-        let tmp_path = std::env::temp_dir().join(format!(
-            "zensmu-gui-profile-{}.toml",
-            std::process::id()
-        ));
+        let tmp_path =
+            std::env::temp_dir().join(format!("zensmu-gui-profile-{}.toml", std::process::id()));
         if let Err(e) = fs::write(&tmp_path, &self.profile_editor.toml_text) {
             self.set_toast(
                 ToastLevel::Error,
-                format!("Failed to stage temporary profile '{}': {e}", tmp_path.display()),
+                format!(
+                    "Failed to stage temporary profile '{}': {e}",
+                    tmp_path.display()
+                ),
             );
             return;
         }
 
+        self.staging_profile_path = Some(tmp_path.clone());
         self.dispatch_cli(
             CliAction::ProfileApply {
                 path: tmp_path,
@@ -904,6 +976,24 @@ impl ZensmuApp {
             },
             ctx,
         );
+    }
+
+    /// Close the dry-run confirmation modal and clean up any staged profile file.
+    pub fn dismiss_dry_run_modal(&mut self) {
+        self.pending_modal = None;
+        self.cleanup_staging_profile();
+    }
+
+    fn cleanup_staging_profile(&mut self) {
+        if let Some(tmp) = self.staging_profile_path.take() {
+            let _ = fs::remove_file(tmp);
+        }
+    }
+
+    fn cleanup_staging_persist(&mut self) {
+        if let Some(tmp) = self.staging_persist_path.take() {
+            let _ = fs::remove_file(tmp);
+        }
     }
 
     /// Validate the TOML editor buffer against detected hardware; updates inline validation & toast on failure.
@@ -940,10 +1030,8 @@ impl ZensmuApp {
             return;
         }
 
-        let tmp_path = std::env::temp_dir().join(format!(
-            "zensmu-gui-persist-{}.toml",
-            std::process::id()
-        ));
+        let tmp_path =
+            std::env::temp_dir().join(format!("zensmu-gui-persist-{}.toml", std::process::id()));
         if let Err(e) = fs::write(&tmp_path, &self.profile_editor.toml_text) {
             self.set_toast(
                 ToastLevel::Error,
@@ -984,10 +1072,8 @@ impl ZensmuApp {
 
     /// Export current live hardware state via `zensmu profile export` to a temp file and display it.
     pub fn export_current_profile(&mut self, ctx: &egui::Context) {
-        let tmp_path = std::env::temp_dir().join(format!(
-            "zensmu-gui-export-{}.toml",
-            std::process::id()
-        ));
+        let tmp_path =
+            std::env::temp_dir().join(format!("zensmu-gui-export-{}.toml", std::process::id()));
         self.dispatch_cli(CliAction::ProfileExport { path: tmp_path }, ctx);
     }
 
@@ -1002,21 +1088,8 @@ impl ZensmuApp {
         for msg in drained {
             match msg {
                 TelemetryMsg::Sample(sample) => {
-                    if !self.pbo_editor.seeded_from_telemetry {
-                        if let Some(v) = sample.snapshot.ppt_limit_w {
-                            self.pbo_editor.ppt_w = v.round().clamp(15.0, 300.0) as u32;
-                        }
-                        if let Some(v) = sample.snapshot.tdc_limit_a {
-                            self.pbo_editor.tdc_a = v.round().clamp(15.0, 250.0) as u32;
-                        }
-                        if let Some(v) = sample.snapshot.edc_limit_a {
-                            self.pbo_editor.edc_a = v.round().clamp(20.0, 300.0) as u32;
-                        }
-                        if let Some(v) = sample.snapshot.tctl_limit_c {
-                            self.pbo_editor.tctl_c = v.round().clamp(50.0, 95.0) as u32;
-                        }
-                        self.pbo_editor.seeded_from_telemetry = true;
-                    }
+                    let sample = *sample;
+                    self.pbo_editor.sync_from_telemetry(&sample.snapshot);
                     self.apu_editor.sync_from_telemetry(&sample.snapshot);
                     self.latest_telemetry = Some(sample.snapshot.clone());
                     self.telemetry_error = None;
@@ -1036,7 +1109,7 @@ impl ZensmuApp {
         for result in self.runner.poll_results() {
             match result {
                 ElevatedResult::Status(payload) => {
-                    self.apply_status_payload(payload);
+                    self.apply_status_payload(*payload);
                     self.refresh_safety_files();
                     self.refresh_persist_status();
                     self.set_toast(ToastLevel::Success, "Refreshed live SMU state.");
@@ -1051,8 +1124,11 @@ impl ZensmuApp {
                     self.set_toast(ToastLevel::Success, "Read current Curve Shaper matrix.");
                 }
                 ElevatedResult::Pbo(status) => {
-                    self.sync_pbo_from_status(status);
-                    self.set_toast(ToastLevel::Success, "Read current PBO status & fused limits.");
+                    self.sync_pbo_from_status(status, true);
+                    self.set_toast(
+                        ToastLevel::Success,
+                        "Read current PBO status & fused limits.",
+                    );
                 }
                 ElevatedResult::DryRunPlan {
                     title,
@@ -1066,6 +1142,8 @@ impl ZensmuApp {
                     });
                 }
                 ElevatedResult::Applied { title, ops } => {
+                    self.cleanup_staging_profile();
+                    self.pbo_editor.clear_dirty();
                     self.apu_editor.clear_dirty();
                     self.refresh_safety_files();
                     self.refresh_persist_status();
@@ -1085,18 +1163,12 @@ impl ZensmuApp {
                         "Exported current SMU state into the TOML editor.",
                     );
                 }
-                ElevatedResult::ProfileDiff { entries } => {
-                    self.profile_editor.diff_entries = entries;
-                    self.set_toast(ToastLevel::Info, "Updated profile diff.");
-                }
                 ElevatedResult::PersistUpdated {
                     action,
                     status,
                     note,
                 } => {
-                    if let Some(tmp) = self.staging_persist_path.take() {
-                        let _ = fs::remove_file(tmp);
-                    }
+                    self.cleanup_staging_persist();
                     self.persist_status = status;
                     self.refresh_safety_files();
                     self.refresh_persist_status();
@@ -1129,9 +1201,8 @@ impl ZensmuApp {
                     }
                 }
                 ElevatedResult::Error { title, message } => {
-                    if let Some(tmp) = self.staging_persist_path.take() {
-                        let _ = fs::remove_file(tmp);
-                    }
+                    self.cleanup_staging_persist();
+                    self.cleanup_staging_profile();
                     self.set_toast(ToastLevel::Error, format!("{title}: {message}"));
                 }
             }
@@ -1147,9 +1218,10 @@ impl ZensmuApp {
             self.shaper_editor.draft = cs;
         }
         if let Some(pbo) = payload.pbo {
-            self.sync_pbo_from_status(pbo);
+            self.sync_pbo_from_status(pbo, true);
         }
         if let Some(telem) = payload.telemetry {
+            self.pbo_editor.sync_from_telemetry(&telem);
             self.apu_editor.sync_from_telemetry(&telem);
             self.latest_telemetry = Some(telem);
         }
@@ -1162,9 +1234,7 @@ impl ZensmuApp {
             .map(|h| h.topology.physical_cores)
             .unwrap_or(snap.cores.len())
             .max(snap.cores.len());
-        if self.co_editor.per_core.len() < count {
-            self.co_editor.per_core.resize(count, 0);
-        }
+        self.co_editor.per_core.resize(count, 0);
         for c in &snap.cores {
             if let Some(slot) = self.co_editor.per_core.get_mut(c.core_index as usize) {
                 *slot = i32::from(c.margin);
@@ -1181,13 +1251,8 @@ impl ZensmuApp {
         self.co_snapshot = Some(snap);
     }
 
-    fn sync_pbo_from_status(&mut self, status: PboStatus) {
-        if let Some(scalar) = status.scalar {
-            self.pbo_editor.scalar = scalar.round().clamp(1.0, 10.0) as u32;
-        }
-        if let Some(fmax) = status.fmax_mhz {
-            self.pbo_editor.fmax_mhz = fmax.clamp(2000, 6500);
-        }
+    fn sync_pbo_from_status(&mut self, status: PboStatus, force: bool) {
+        self.pbo_editor.sync_from_status(&status, force);
         self.pbo_status = Some(status);
     }
 }
@@ -1195,6 +1260,8 @@ impl ZensmuApp {
 impl Drop for ZensmuApp {
     fn drop(&mut self) {
         self.telemetry_stop.store(true, Ordering::Relaxed);
+        self.cleanup_staging_persist();
+        self.cleanup_staging_profile();
     }
 }
 
@@ -1472,5 +1539,84 @@ mod tests {
         };
         let pbo_req = pbo.build_request_for(&lucienne_caps);
         assert_eq!(pbo_req.fmax_mhz, None);
+    }
+
+    #[test]
+    fn pbo_editor_respects_dirty_flags_clamps_full_bounds_and_resyncs() {
+        use zensmu_core::hw::profiles::capabilities_for;
+        use zensmu_core::types::Codename;
+
+        let mut pbo = PboEditorState {
+            ppt_dirty: true,
+            ppt_w: 120,
+            scalar_dirty: true,
+            scalar: 4,
+            ..Default::default()
+        };
+
+        let snap = TelemetrySnapshot {
+            codename: Codename::GraniteRidge,
+            table_version: 0x0062_0205,
+            table_size: 0x800,
+            ppt_limit_w: Some(1000.0), // BIOS Motherboard/Unlimited profile
+            ppt_value_w: Some(85.0),
+            tdc_limit_a: Some(480.0),
+            tdc_value_a: Some(45.0),
+            edc_limit_a: Some(f32::NAN), // non-finite ignored
+            edc_value_a: Some(60.0),
+            tctl_limit_c: Some(95.0),
+            tctl_value_c: Some(65.0),
+            stapm_limit_w: None,
+            stapm_value_w: None,
+            slow_limit_w: None,
+            slow_value_w: None,
+            apu_slow_limit_w: None,
+            apu_slow_value_w: None,
+            tdc_soc_limit_a: None,
+            tdc_soc_value_a: None,
+            edc_soc_limit_a: None,
+            edc_soc_value_a: None,
+            apu_skin_temp_limit_c: None,
+            apu_skin_temp_value_c: None,
+            dgpu_skin_temp_limit_c: None,
+            dgpu_skin_temp_value_c: None,
+            fclk_mhz: Some(2000.0),
+            uclk_mhz: Some(3000.0),
+            mclk_mhz: Some(3000.0),
+            vddcr_soc_v: Some(1.2),
+            vddcr_misc_v: None,
+            cldo_vddp_v: None,
+            cldo_vddg_iod_v: None,
+            cldo_vddg_ccd_v: None,
+        };
+
+        pbo.sync_from_telemetry(&snap);
+        // Dirty PPT stays at user value; non-dirty TDC/Tctl sync to full bounds; NaN EDC untouched.
+        assert_eq!(pbo.ppt_w, 120);
+        assert_eq!(pbo.tdc_a, 480);
+        assert_eq!(pbo.edc_a, 150);
+        assert_eq!(pbo.tctl_c, 95);
+
+        let caps = capabilities_for(Codename::GraniteRidge).unwrap();
+        assert!(pbo.has_any_extreme_for(&caps)); // TDC 480 > 180 soft max
+
+        // Status sync respects dirty when force=false, overwrites when force=true.
+        let status = PboStatus {
+            scalar: Some(2.0),
+            fmax_mhz: Some(5650),
+            ..PboStatus::default()
+        };
+        pbo.sync_from_status(&status, false);
+        assert_eq!(pbo.scalar, 4);
+        assert_eq!(pbo.fmax_mhz, 5650);
+
+        pbo.sync_from_status(&status, true);
+        assert_eq!(pbo.scalar, 2);
+        assert!(!pbo.scalar_dirty);
+
+        // Clearing dirty allows PPT to resync to live 1000W limit.
+        pbo.clear_dirty();
+        pbo.sync_from_telemetry(&snap);
+        assert_eq!(pbo.ppt_w, 1000);
     }
 }

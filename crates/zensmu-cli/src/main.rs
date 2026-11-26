@@ -13,12 +13,12 @@ use commands::{
 };
 use doctor::{is_effective_root, run_doctor};
 use output::{
-    ActivePboLimits, ClearGuardOutput, CoGetOutput, InfoOutput, MutationOutput, PboGetOutput,
-    PersistActionOutput, ProfileDiffOutput, ProfileListItem, ProfileListOutput, ProfileSaveOutput,
-    ProfileValidateOutput, ShaperGetOutput, StatusOutput, TelemetryDumpOutput, print_co_table,
-    print_doctor, print_error, print_info, print_json, print_json_compact, print_mutation,
-    print_pbo_status, print_persist_action, print_persist_status, print_planned_ops,
-    print_profile_diff, print_profile_list, print_shaper_matrix, print_status, print_telemetry,
+    print_co_table, print_doctor, print_error, print_info, print_json, print_json_compact,
+    print_mutation, print_pbo_status, print_persist_action, print_persist_status,
+    print_planned_ops, print_profile_diff, print_profile_list, print_shaper_matrix, print_status,
+    print_telemetry, ActivePboLimits, ClearGuardOutput, CoGetOutput, InfoOutput, MutationOutput,
+    PboGetOutput, PersistActionOutput, ProfileDiffOutput, ProfileListItem, ProfileListOutput,
+    ProfileSaveOutput, ProfileValidateOutput, ShaperGetOutput, StatusOutput, TelemetryDumpOutput,
 };
 use std::fs;
 use std::io::{self, IsTerminal, Read, Write};
@@ -29,7 +29,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 use zensmu_core::config::profile::Profile;
 use zensmu_core::error::{Error, Result};
-use zensmu_core::hw::identity::{HardwareContext, detect_hardware};
+use zensmu_core::hw::identity::{detect_hardware, HardwareContext};
 use zensmu_core::ops::apu::{self, ApuSetRequest};
 use zensmu_core::ops::co;
 use zensmu_core::ops::pbo::{self, PboSetRequest};
@@ -37,11 +37,11 @@ use zensmu_core::ops::pm_table;
 use zensmu_core::ops::shaper;
 use zensmu_core::safety::bounds;
 use zensmu_core::safety::guard::{BootLoopGuard, DEFAULT_GUARD_PATH};
-use zensmu_core::safety::persist::{self, PersistPaths};
-use zensmu_core::safety::snapshot::{DEFAULT_STATE_DIR, SmuStateSnapshot, SnapshotStore};
+use zensmu_core::safety::persist::{self, PersistPaths, PersistStatus};
+use zensmu_core::safety::snapshot::{SmuStateSnapshot, SnapshotStore, DEFAULT_STATE_DIR};
 use zensmu_core::session;
+use zensmu_core::transport::sysfs::{SysfsTransport, DEFAULT_SYSFS_PATH};
 use zensmu_core::transport::SmuTransport;
-use zensmu_core::transport::sysfs::{DEFAULT_SYSFS_PATH, SysfsTransport};
 use zensmu_core::types::{
     Codename, CurveShaperState, FreqTier, PlannedOp, ShaperTierMargins, TempBand,
 };
@@ -122,35 +122,11 @@ fn parse_confirm_secs(cli: &Cli) -> Result<Option<u64>> {
 }
 
 fn run(cli: Cli) -> Result<CliOutcome> {
-    match &cli.command {
-        Command::Completions { shell } => {
-            let mut cmd = Cli::command();
-            let gen_shell: Shell = (*shell).into();
-            let mut buf = Vec::new();
-            clap_complete::generate(gen_shell, &mut cmd, "zensmu", &mut buf);
-            if let Err(err) = io::stdout().write_all(&buf) {
-                if err.kind() != io::ErrorKind::BrokenPipe {
-                    return Err(Error::Io {
-                        path: "stdout".into(),
-                        source: err,
-                    });
-                }
-            }
-            return Ok(CliOutcome::Success);
-        }
-        Command::Profile {
-            action: ProfileAction::ClearGuard,
-        } => return cmd_profile_clear_guard(&cli),
-        Command::Profile {
-            action: ProfileAction::List { dir },
-        } => return cmd_profile_list(&cli, dir),
-        Command::Doctor => return cmd_doctor(&cli),
-        _ => {}
-    }
-
     let transport = build_transport(&cli);
 
     match &cli.command {
+        Command::Completions { shell } => cmd_completions(*shell),
+        Command::Doctor => cmd_doctor(&cli, &transport),
         Command::Info => cmd_info(&cli, &transport),
         Command::Status => cmd_status(&cli, &transport),
         Command::Co { action } => cmd_co(&cli, &transport, action),
@@ -163,8 +139,23 @@ fn run(cli: Cli) -> Result<CliOutcome> {
         Command::Persist(persist_cmd) => cmd_persist(&cli, &transport, persist_cmd),
         Command::Rollback => cmd_rollback(&cli, &transport),
         Command::Reset => cmd_reset(&cli, &transport),
-        Command::Doctor | Command::Completions { .. } => unreachable!(),
     }
+}
+
+fn cmd_completions(shell: commands::CompletionShell) -> Result<CliOutcome> {
+    let mut cmd = Cli::command();
+    let gen_shell: Shell = shell.into();
+    let mut buf = Vec::new();
+    clap_complete::generate(gen_shell, &mut cmd, "zensmu", &mut buf);
+    if let Err(err) = io::stdout().write_all(&buf) {
+        if err.kind() != io::ErrorKind::BrokenPipe {
+            return Err(Error::Io {
+                path: "stdout".into(),
+                source: err,
+            });
+        }
+    }
+    Ok(CliOutcome::Success)
 }
 
 // ============================================================================
@@ -182,11 +173,10 @@ fn cmd_info(cli: &Cli, transport: &dyn SmuTransport) -> Result<CliOutcome> {
     Ok(CliOutcome::Success)
 }
 
-fn cmd_doctor(cli: &Cli) -> Result<CliOutcome> {
-    let transport = build_transport(cli);
+fn cmd_doctor(cli: &Cli, transport: &dyn SmuTransport) -> Result<CliOutcome> {
     let sp = sysfs_path(cli);
     let gp = guard_path(cli);
-    let report = run_doctor(&transport, &sp, &gp, cli.no_cpuid_check);
+    let report = run_doctor(transport, &sp, &gp, cli.no_cpuid_check);
     let healthy = report.healthy;
 
     if cli.json {
@@ -199,6 +189,14 @@ fn cmd_doctor(cli: &Cli) -> Result<CliOutcome> {
         Ok(CliOutcome::Success)
     } else {
         Ok(CliOutcome::ExitWithCode(1))
+    }
+}
+
+fn mailbox_read_outcome<T>(res: Result<T>) -> (Option<T>, Option<String>) {
+    match res {
+        Ok(val) => (Some(val), None),
+        Err(Error::PermissionDenied { .. }) => (None, Some("requires root".into())),
+        Err(err) => (None, Some(err.to_string())),
     }
 }
 
@@ -222,30 +220,18 @@ fn cmd_status(cli: &Cli, transport: &dyn SmuTransport) -> Result<CliOutcome> {
     };
 
     let (co_snap, co_error) = if hw.capabilities.get_co_per_core.is_some() {
-        match co::get_co(transport, &hw) {
-            Ok(c) => (Some(c), None),
-            Err(Error::PermissionDenied { .. }) => (None, Some("requires root".into())),
-            Err(e) => (None, Some(e.to_string())),
-        }
+        mailbox_read_outcome(co::get_co(transport, &hw))
     } else {
         (None, None)
     };
 
     let (curve_shaper, curve_shaper_error) = if hw.capabilities.get_curve_shaper.is_some() {
-        match shaper::get_curve_shaper(transport, &hw) {
-            Ok(cs) => (Some(cs), None),
-            Err(Error::PermissionDenied { .. }) => (None, Some("requires root".into())),
-            Err(e) => (None, Some(e.to_string())),
-        }
+        mailbox_read_outcome(shaper::get_curve_shaper(transport, &hw))
     } else {
         (None, None)
     };
 
-    let (pbo_st, pbo_error) = match pbo::get_pbo_status(transport, &hw) {
-        Ok(p) => (Some(p), None),
-        Err(Error::PermissionDenied { .. }) => (None, Some("requires root".into())),
-        Err(e) => (None, Some(e.to_string())),
-    };
+    let (pbo_st, pbo_error) = mailbox_read_outcome(pbo::get_pbo_status(transport, &hw));
 
     let out = StatusOutput {
         codename: hw.codename,
@@ -350,12 +336,8 @@ fn cmd_co(cli: &Cli, transport: &dyn SmuTransport, action: &CoAction) -> Result<
                 if hw.capabilities.set_co_all_cores.is_some() {
                     ops.extend(co::set_co_all(transport, &hw, 0, false, dry_run)?);
                 } else {
-                    let zeros: Vec<(u32, i32)> = hw
-                        .topology
-                        .cores
-                        .iter()
-                        .map(|c| (c.index, 0))
-                        .collect();
+                    let zeros: Vec<(u32, i32)> =
+                        hw.topology.cores.iter().map(|c| (c.index, 0)).collect();
                     ops.extend(co::set_co_cores(transport, &hw, &zeros, false, dry_run)?);
                 }
                 if hw.capabilities.set_igpu_co.is_some() {
@@ -510,12 +492,7 @@ fn cmd_pbo(cli: &Cli, transport: &dyn SmuTransport, action: &PboAction) -> Resul
         PboAction::Get => {
             let status = pbo::get_pbo_status(transport, &hw)?;
             let active_limits = pm_table::read_telemetry(transport, &hw)
-                .map(|t| ActivePboLimits {
-                    ppt_w: t.ppt_limit_w,
-                    tdc_a: t.tdc_limit_a,
-                    edc_a: t.edc_limit_a,
-                    tctl_c: t.tctl_limit_c,
-                })
+                .map(|t| ActivePboLimits::from_telemetry(&t))
                 .unwrap_or_default();
 
             let out = PboGetOutput {
@@ -547,13 +524,7 @@ fn cmd_pbo(cli: &Cli, transport: &dyn SmuTransport, action: &PboAction) -> Resul
                 scalar: *scalar,
                 fmax_mhz: fmax.as_deref().map(bounds::parse_mhz).transpose()?,
             };
-            if req.ppt_w.is_none()
-                && req.tdc_a.is_none()
-                && req.edc_a.is_none()
-                && req.tctl_c.is_none()
-                && req.scalar.is_none()
-                && req.fmax_mhz.is_none()
-            {
+            if req == PboSetRequest::default() {
                 return Err(Error::InvalidInput(
                     "specify at least one of --ppt, --tdc, --edc, --tctl, --scalar, or --fmax"
                         .into(),
@@ -595,13 +566,7 @@ fn cmd_pbo(cli: &Cli, transport: &dyn SmuTransport, action: &PboAction) -> Resul
                 fmax_mhz,
             };
 
-            if req.ppt_w.is_none()
-                && req.tdc_a.is_none()
-                && req.edc_a.is_none()
-                && req.tctl_c.is_none()
-                && req.scalar.is_none()
-                && req.fmax_mhz.is_none()
-            {
+            if req == PboSetRequest::default() {
                 return Err(Error::InvalidInput(
                     "no fused factory limits or boot-baseline snapshot available to restore PBO"
                         .into(),
@@ -621,9 +586,8 @@ fn cmd_pbo(cli: &Cli, transport: &dyn SmuTransport, action: &PboAction) -> Resul
 
 fn parse_secs_u32(s: &str) -> Result<u32> {
     let secs = bounds::parse_duration_secs(s)?;
-    u32::try_from(secs).map_err(|_| {
-        Error::InvalidInput(format!("duration '{s}' exceeds u32 seconds range"))
-    })
+    u32::try_from(secs)
+        .map_err(|_| Error::InvalidInput(format!("duration '{s}' exceeds u32 seconds range")))
 }
 
 fn cmd_apu(cli: &Cli, transport: &dyn SmuTransport, action: &ApuAction) -> Result<CliOutcome> {
@@ -654,7 +618,10 @@ fn cmd_apu(cli: &Cli, transport: &dyn SmuTransport, action: &ApuAction) -> Resul
                 tdc_soc_a: tdc_soc.as_deref().map(bounds::parse_amps).transpose()?,
                 edc_soc_a: edc_soc.as_deref().map(bounds::parse_amps).transpose()?,
                 apu_skin_temp_c: apu_skin.as_deref().map(bounds::parse_celsius).transpose()?,
-                dgpu_skin_temp_c: dgpu_skin.as_deref().map(bounds::parse_celsius).transpose()?,
+                dgpu_skin_temp_c: dgpu_skin
+                    .as_deref()
+                    .map(bounds::parse_celsius)
+                    .transpose()?,
                 power_mode: mode.map(Into::into),
             };
 
@@ -879,11 +846,7 @@ fn cmd_profile(
                     operations: planned,
                     note: None,
                 };
-                if cli.json {
-                    print_json(&out);
-                } else {
-                    print_mutation(&out);
-                }
+                emit_mutation(cli, &out, false);
                 return Ok(CliOutcome::Success);
             }
 
@@ -903,8 +866,7 @@ fn cmd_profile(
             let store = SnapshotStore::new(state_dir(cli));
             let pre_snap = capture_and_store_snapshots(cli, transport, &hw, &store)?;
 
-            let ops =
-                session::apply_profile(transport, &hw, &profile, cli.allow_extreme, false)?;
+            let ops = session::apply_profile(transport, &hw, &profile, cli.allow_extreme, false)?;
 
             if let Some(secs) = confirm_secs {
                 let outcome = wait_for_confirmation_or_rollback(
@@ -955,14 +917,11 @@ fn cmd_profile(
                 operations: ops,
                 note,
             };
-            if cli.json {
-                print_json(&out);
-            } else if !cli.quiet {
-                print_mutation(&out);
-            }
+            emit_mutation(cli, &out, true);
             Ok(CliOutcome::Success)
         }
-        ProfileAction::ClearGuard | ProfileAction::List { .. } => unreachable!(),
+        ProfileAction::ClearGuard => cmd_profile_clear_guard(cli),
+        ProfileAction::List { dir } => cmd_profile_list(cli, dir),
     }
 }
 
@@ -980,7 +939,10 @@ fn cmd_profile_clear_guard(cli: &Cli) -> Result<CliOutcome> {
     if cli.json {
         print_json(&out);
     } else if was_tripped {
-        println!("Cleared tripped boot-loop guard sentinel at {}", out.guard_path);
+        println!(
+            "Cleared tripped boot-loop guard sentinel at {}",
+            out.guard_path
+        );
     } else {
         println!(
             "Boot-loop guard sentinel at {} was already clear.",
@@ -1044,6 +1006,29 @@ fn cmd_profile_list(cli: &Cli, dir: &Path) -> Result<CliOutcome> {
 // Boot & Suspend Persistence (`persist`)
 // ============================================================================
 
+fn emit_persist_action(
+    cli: &Cli,
+    paths: &PersistPaths,
+    action: &str,
+    dry_run: bool,
+    status: PersistStatus,
+    note: String,
+) {
+    let out = PersistActionOutput {
+        action: action.into(),
+        dry_run,
+        active_profile_path: paths.active_profile.display().to_string(),
+        service_enabled: status.service_enabled,
+        status,
+        note: Some(note),
+    };
+    if cli.json {
+        print_json(&out);
+    } else if dry_run || !cli.quiet {
+        print_persist_action(&out);
+    }
+}
+
 fn cmd_persist(
     cli: &Cli,
     transport: &dyn SmuTransport,
@@ -1078,7 +1063,11 @@ fn cmd_persist(
             // (e.g. PPT=1000W, Scalar=5x) above interactive soft thresholds, so validate
             // live snapshots against hard hardware bounds while keeping soft checks for --from files.
             let effective_allow_extreme = cli.allow_extreme || from.is_none();
-            profile.validate_for(hw.codename, hw.topology.physical_cores, effective_allow_extreme)?;
+            profile.validate_for(
+                hw.codename,
+                hw.topology.physical_cores,
+                effective_allow_extreme,
+            )?;
 
             if cli.dry_run {
                 let status = persist::read_persist_status(
@@ -1100,19 +1089,7 @@ fn cmd_persist(
                         paths.modules_load.display()
                     )
                 };
-                let out = PersistActionOutput {
-                    action: "persist save".into(),
-                    dry_run: true,
-                    active_profile_path: paths.active_profile.display().to_string(),
-                    service_enabled: status.service_enabled,
-                    status,
-                    note: Some(note),
-                };
-                if cli.json {
-                    print_json(&out);
-                } else {
-                    print_persist_action(&out);
-                }
+                emit_persist_action(cli, &paths, "persist save", true, status, note);
                 return Ok(CliOutcome::Success);
             }
 
@@ -1150,19 +1127,7 @@ fn cmd_persist(
                     paths.modules_load.display()
                 )
             };
-            let out = PersistActionOutput {
-                action: "persist save".into(),
-                dry_run: false,
-                active_profile_path: paths.active_profile.display().to_string(),
-                service_enabled: status.service_enabled,
-                status,
-                note: Some(note),
-            };
-            if cli.json {
-                print_json(&out);
-            } else if !cli.quiet {
-                print_persist_action(&out);
-            }
+            emit_persist_action(cli, &paths, "persist save", false, status, note);
             Ok(CliOutcome::Success)
         }
         PersistAction::Enable => {
@@ -1184,23 +1149,18 @@ fn cmd_persist(
                     Some(hw.codename),
                     Some(hw.topology.physical_cores),
                 );
-                let out = PersistActionOutput {
-                    action: "persist enable".into(),
-                    dry_run: true,
-                    active_profile_path: paths.active_profile.display().to_string(),
-                    service_enabled: status.service_enabled,
+                emit_persist_action(
+                    cli,
+                    &paths,
+                    "persist enable",
+                    true,
                     status,
-                    note: Some(format!(
+                    format!(
                         "would ensure {} and enable {}",
                         paths.modules_load.display(),
                         paths.service_name
-                    )),
-                };
-                if cli.json {
-                    print_json(&out);
-                } else {
-                    print_persist_action(&out);
-                }
+                    ),
+                );
                 return Ok(CliOutcome::Success);
             }
 
@@ -1216,19 +1176,14 @@ fn cmd_persist(
                 Some(hw.codename),
                 Some(hw.topology.physical_cores),
             );
-            let out = PersistActionOutput {
-                action: "persist enable".into(),
-                dry_run: false,
-                active_profile_path: paths.active_profile.display().to_string(),
-                service_enabled: status.service_enabled,
+            emit_persist_action(
+                cli,
+                &paths,
+                "persist enable",
+                false,
                 status,
-                note: Some(format!("enabled {}", paths.service_name)),
-            };
-            if cli.json {
-                print_json(&out);
-            } else if !cli.quiet {
-                print_persist_action(&out);
-            }
+                format!("enabled {}", paths.service_name),
+            );
             Ok(CliOutcome::Success)
         }
         PersistAction::Disable { remove_profile } => {
@@ -1249,19 +1204,7 @@ fn cmd_persist(
                 } else {
                     format!("would disable {}", paths.service_name)
                 };
-                let out = PersistActionOutput {
-                    action: "persist disable".into(),
-                    dry_run: true,
-                    active_profile_path: paths.active_profile.display().to_string(),
-                    service_enabled: status.service_enabled,
-                    status,
-                    note: Some(note),
-                };
-                if cli.json {
-                    print_json(&out);
-                } else {
-                    print_persist_action(&out);
-                }
+                emit_persist_action(cli, &paths, "persist disable", true, status, note);
                 return Ok(CliOutcome::Success);
             }
 
@@ -1296,19 +1239,7 @@ fn cmd_persist(
             } else {
                 format!("disabled {}", paths.service_name)
             };
-            let out = PersistActionOutput {
-                action: "persist disable".into(),
-                dry_run: false,
-                active_profile_path: paths.active_profile.display().to_string(),
-                service_enabled: status.service_enabled,
-                status,
-                note: Some(note),
-            };
-            if cli.json {
-                print_json(&out);
-            } else if !cli.quiet {
-                print_persist_action(&out);
-            }
+            emit_persist_action(cli, &paths, "persist disable", false, status, note);
             Ok(CliOutcome::Success)
         }
     }
@@ -1318,118 +1249,100 @@ fn cmd_persist(
 // Rollback & Reset (`rollback`, `reset`)
 // ============================================================================
 
-fn cmd_rollback(cli: &Cli, transport: &dyn SmuTransport) -> Result<CliOutcome> {
+enum SnapshotRestoreKind {
+    Rollback,
+    Reset,
+}
+
+fn execute_snapshot_restore(
+    cli: &Cli,
+    transport: &dyn SmuTransport,
+    kind: SnapshotRestoreKind,
+) -> Result<CliOutcome> {
     let hw = probe_hw(cli, transport)?;
     let store = SnapshotStore::new(state_dir(cli));
-    let snap = store.load_last_state()?.ok_or_else(|| {
-        Error::InvalidInput(format!(
-            "no last-state snapshot found at {} (no prior mutation recorded in this boot)",
-            store.last_state_path().display()
-        ))
-    })?;
+    let (action, snap, source_path, save_current_as_last_state) = match kind {
+        SnapshotRestoreKind::Rollback => {
+            let path = store.last_state_path();
+            let snap = store.load_last_state()?.ok_or_else(|| {
+                Error::InvalidInput(format!(
+                    "no last-state snapshot found at {} (no prior mutation recorded in this boot)",
+                    path.display()
+                ))
+            })?;
+            ("rollback", snap, path, false)
+        }
+        SnapshotRestoreKind::Reset => {
+            let path = store.boot_baseline_path();
+            let snap = store.load_boot_baseline()?.ok_or_else(|| {
+                Error::InvalidInput(format!(
+                    "no boot-baseline snapshot found at {} (no prior mutation recorded in this boot)",
+                    path.display()
+                ))
+            })?;
+            ("reset", snap, path, true)
+        }
+    };
 
+    let planned = session::apply_snapshot(transport, &hw, &snap, true, true)?;
     if cli.dry_run {
-        let ops = session::apply_snapshot(transport, &hw, &snap, true, true)?;
         let out = MutationOutput {
-            action: "rollback".into(),
+            action: action.into(),
             dry_run: true,
             applied: false,
             rolled_back: false,
             confirmed: None,
-            operations: ops,
-            note: Some(format!("from {}", store.last_state_path().display())),
+            operations: planned,
+            note: Some(format!("from {}", source_path.display())),
         };
-        if cli.json {
-            print_json(&out);
-        } else {
-            print_mutation(&out);
-        }
+        emit_mutation(cli, &out, false);
         return Ok(CliOutcome::Success);
     }
 
-    let planned = session::apply_snapshot(transport, &hw, &snap, true, true)?;
-    if !confirm_before_write(cli, &planned, "rollback")? {
+    if !confirm_before_write(cli, &planned, action)? {
         return Ok(CliOutcome::ExitWithCode(1));
+    }
+
+    if save_current_as_last_state {
+        // Save current state as last-state so `reset` itself can be rolled back if desired.
+        if let Ok(cur) = session::capture_snapshot(transport, &hw) {
+            let _ = store.save_last_state(&cur);
+        }
     }
 
     let ops = session::apply_snapshot(transport, &hw, &snap, true, false)?;
     let out = MutationOutput {
-        action: "rollback".into(),
+        action: action.into(),
         dry_run: false,
         applied: true,
         rolled_back: false,
         confirmed: None,
         operations: ops,
-        note: Some(format!("restored {}", store.last_state_path().display())),
+        note: Some(format!("restored {}", source_path.display())),
     };
-    if cli.json {
-        print_json(&out);
-    } else if !cli.quiet {
-        print_mutation(&out);
-    }
+    emit_mutation(cli, &out, true);
     Ok(CliOutcome::Success)
 }
 
+fn cmd_rollback(cli: &Cli, transport: &dyn SmuTransport) -> Result<CliOutcome> {
+    execute_snapshot_restore(cli, transport, SnapshotRestoreKind::Rollback)
+}
+
 fn cmd_reset(cli: &Cli, transport: &dyn SmuTransport) -> Result<CliOutcome> {
-    let hw = probe_hw(cli, transport)?;
-    let store = SnapshotStore::new(state_dir(cli));
-    let baseline = store.load_boot_baseline()?.ok_or_else(|| {
-        Error::InvalidInput(format!(
-            "no boot-baseline snapshot found at {} (no prior mutation recorded in this boot)",
-            store.boot_baseline_path().display()
-        ))
-    })?;
-
-    if cli.dry_run {
-        let ops = session::apply_snapshot(transport, &hw, &baseline, true, true)?;
-        let out = MutationOutput {
-            action: "reset".into(),
-            dry_run: true,
-            applied: false,
-            rolled_back: false,
-            confirmed: None,
-            operations: ops,
-            note: Some(format!("from {}", store.boot_baseline_path().display())),
-        };
-        if cli.json {
-            print_json(&out);
-        } else {
-            print_mutation(&out);
-        }
-        return Ok(CliOutcome::Success);
-    }
-
-    let planned = session::apply_snapshot(transport, &hw, &baseline, true, true)?;
-    if !confirm_before_write(cli, &planned, "reset")? {
-        return Ok(CliOutcome::ExitWithCode(1));
-    }
-
-    // Save current state as last-state so `reset` itself can be rolled back if desired.
-    if let Ok(cur) = session::capture_snapshot(transport, &hw) {
-        let _ = store.save_last_state(&cur);
-    }
-
-    let ops = session::apply_snapshot(transport, &hw, &baseline, true, false)?;
-    let out = MutationOutput {
-        action: "reset".into(),
-        dry_run: false,
-        applied: true,
-        rolled_back: false,
-        confirmed: None,
-        operations: ops,
-        note: Some(format!("restored {}", store.boot_baseline_path().display())),
-    };
-    if cli.json {
-        print_json(&out);
-    } else if !cli.quiet {
-        print_mutation(&out);
-    }
-    Ok(CliOutcome::Success)
+    execute_snapshot_restore(cli, transport, SnapshotRestoreKind::Reset)
 }
 
 // ============================================================================
 // Shared Transactional Mutation, Snapshot & Dead-Man's Switch Helpers
 // ============================================================================
+
+fn emit_mutation(cli: &Cli, out: &MutationOutput, respect_quiet: bool) {
+    if cli.json {
+        print_json(out);
+    } else if !respect_quiet || !cli.quiet {
+        print_mutation(out);
+    }
+}
 
 fn execute_mutation<F>(
     cli: &Cli,
@@ -1455,11 +1368,7 @@ where
             operations: planned,
             note: None,
         };
-        if cli.json {
-            print_json(&out);
-        } else {
-            print_mutation(&out);
-        }
+        emit_mutation(cli, &out, false);
         return Ok(CliOutcome::Success);
     }
 
@@ -1493,11 +1402,7 @@ where
         operations: ops,
         note: None,
     };
-    if cli.json {
-        print_json(&out);
-    } else if !cli.quiet {
-        print_mutation(&out);
-    }
+    emit_mutation(cli, &out, true);
     Ok(CliOutcome::Success)
 }
 
@@ -1534,10 +1439,12 @@ fn confirm_before_write(cli: &Cli, planned: &[PlannedOp], action: &str) -> Resul
     let _ = io::stderr().flush();
 
     let mut line = String::new();
-    io::stdin().read_line(&mut line).map_err(|source| Error::Io {
-        path: "stdin".into(),
-        source,
-    })?;
+    io::stdin()
+        .read_line(&mut line)
+        .map_err(|source| Error::Io {
+            path: "stdin".into(),
+            source,
+        })?;
     let trimmed = line.trim();
     if trimmed.eq_ignore_ascii_case("y") || trimmed.eq_ignore_ascii_case("yes") {
         Ok(true)
@@ -1553,6 +1460,17 @@ enum ConfirmOutcome {
     Rejected,
     TimedOut,
     Interrupted,
+}
+
+impl ConfirmOutcome {
+    fn rollback_reason(self) -> Option<&'static str> {
+        match self {
+            Self::Confirmed => None,
+            Self::Rejected => Some("rejected by user"),
+            Self::TimedOut => Some("confirmation timed out"),
+            Self::Interrupted => Some("interrupted (Ctrl-C)"),
+        }
+    }
 }
 
 fn wait_for_confirmation_or_rollback(
@@ -1599,7 +1517,7 @@ fn wait_for_confirmation_or_rollback(
             if n == 0 {
                 break ConfirmOutcome::Rejected;
             }
-            let input = String::from_utf8_lossy(&buf[..n]);
+            let input = String::from_utf8_lossy(buf.get(..n).unwrap_or(&[]));
             let trimmed = input.trim();
             if trimmed.is_empty()
                 || trimmed.eq_ignore_ascii_case("y")
@@ -1616,8 +1534,8 @@ fn wait_for_confirmation_or_rollback(
         eprintln!();
     }
 
-    match outcome {
-        ConfirmOutcome::Confirmed => {
+    match outcome.rollback_reason() {
+        None => {
             let out = MutationOutput {
                 action: action.to_string(),
                 dry_run: false,
@@ -1627,20 +1545,10 @@ fn wait_for_confirmation_or_rollback(
                 operations: ops,
                 note: Some("confirmed by user".into()),
             };
-            if cli.json {
-                print_json(&out);
-            } else if !cli.quiet {
-                print_mutation(&out);
-            }
+            emit_mutation(cli, &out, true);
             Ok(CliOutcome::Success)
         }
-        ConfirmOutcome::Rejected | ConfirmOutcome::TimedOut | ConfirmOutcome::Interrupted => {
-            let reason = match outcome {
-                ConfirmOutcome::Rejected => "rejected by user",
-                ConfirmOutcome::TimedOut => "confirmation timed out",
-                ConfirmOutcome::Interrupted => "interrupted (Ctrl-C)",
-                ConfirmOutcome::Confirmed => unreachable!(),
-            };
+        Some(reason) => {
             if let Some(snap) = pre_snap {
                 session::apply_snapshot(transport, hw, snap, true, false)?;
             }
@@ -1653,11 +1561,7 @@ fn wait_for_confirmation_or_rollback(
                 operations: ops,
                 note: Some(format!("automatically rolled back ({reason})")),
             };
-            if cli.json {
-                print_json(&out);
-            } else {
-                print_mutation(&out);
-            }
+            emit_mutation(cli, &out, false);
             Ok(CliOutcome::ExitWithCode(1))
         }
     }

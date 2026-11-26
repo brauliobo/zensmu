@@ -5,9 +5,44 @@ use crate::config::profile::Profile;
 use crate::error::Result;
 use crate::hw::identity::HardwareContext;
 use crate::ops::{apu, co, pbo, pm_table, shaper};
+use crate::safety::bounds::{PBO_SCALAR_MAX, PBO_SCALAR_MIN};
 use crate::safety::snapshot::SmuStateSnapshot;
 use crate::transport::SmuTransport;
 use crate::types::{FreqTier, PlannedOp, ShaperTierMargins};
+
+/// Return `desired` only when it differs from `current` by more than `0.5`
+/// (avoids redundant SMU writes and BIOS Motherboard-PBO rejections).
+fn skip_unchanged_u32(desired: Option<u32>, current: Option<f32>) -> Option<u32> {
+    let d = desired?;
+    if let Some(c) = current {
+        if c.is_finite() && (c - d as f32).abs() <= 0.5 {
+            return None;
+        }
+    }
+    Some(d)
+}
+
+fn skip_unchanged_scalar(desired: Option<u32>, current: Option<f32>) -> Option<u32> {
+    match (desired, current) {
+        (Some(d), Some(c)) if c.is_finite() && (c - d as f32).abs() <= 0.05 => None,
+        (d, _) => d,
+    }
+}
+
+fn skip_unchanged_exact(desired: Option<u32>, current: Option<u32>) -> Option<u32> {
+    match (desired, current) {
+        (Some(d), Some(c)) if d == c => None,
+        (d, _) => d,
+    }
+}
+
+fn cap_if<T>(supported: bool, val: Option<T>) -> Option<T> {
+    if supported {
+        val
+    } else {
+        None
+    }
+}
 
 /// Capture all currently readable SMU state into a `SmuStateSnapshot`.
 /// Optional subsystems (e.g. Curve Shaper on Zen 4, PM table on unverified versions)
@@ -43,7 +78,10 @@ pub fn capture_snapshot(
     }
 
     if let Ok(telem) = pm_table::read_telemetry(transport, hw) {
-        let pos_u32 = |opt: Option<f32>| opt.filter(|&v| v >= 1.0).map(|v| v.round() as u32);
+        let pos_u32 = |opt: Option<f32>| {
+            opt.filter(|&v| v.is_finite() && v >= 1.0)
+                .map(|v| v.round() as u32)
+        };
         snap.ppt_w = pos_u32(telem.ppt_limit_w);
         snap.tdc_a = pos_u32(telem.tdc_limit_a);
         snap.edc_a = pos_u32(telem.edc_limit_a);
@@ -69,9 +107,10 @@ pub fn apply_snapshot(
     dry_run: bool,
 ) -> Result<Vec<PlannedOp>> {
     let mut ops = Vec::new();
+    let caps = &hw.capabilities;
 
     if let Some(ref cores) = snap.co_per_core {
-        if !cores.is_empty() && hw.capabilities.set_co_per_core.is_some() {
+        if !cores.is_empty() && caps.set_co_per_core.is_some() {
             let updates: Vec<(u32, i32)> = cores.iter().map(|&(idx, m)| (idx, m as i32)).collect();
             ops.extend(co::set_co_cores(
                 transport,
@@ -84,7 +123,7 @@ pub fn apply_snapshot(
     }
 
     if let Some(igpu) = snap.igpu_co {
-        if hw.capabilities.set_igpu_co.is_some() {
+        if caps.set_igpu_co.is_some() {
             ops.push(co::set_igpu_co(
                 transport,
                 hw,
@@ -96,7 +135,7 @@ pub fn apply_snapshot(
     }
 
     if let Some(ref cs) = snap.curve_shaper {
-        if hw.capabilities.set_curve_shaper.is_some() {
+        if caps.set_curve_shaper.is_some() {
             ops.extend(shaper::set_curve_shaper_all(
                 transport,
                 hw,
@@ -107,133 +146,106 @@ pub fn apply_snapshot(
         }
     }
 
-    // Compare against live hardware so rollback/reset skips unchanged PBO limits
+    // Compare against live hardware so rollback/reset skips unchanged PBO/APU limits
     // (avoids redundant SMU writes and prevents failing on BIOS Motherboard-PBO limits).
     let live_telem = pm_table::read_telemetry(transport, hw).ok();
     let live_pbo = pbo::get_pbo_status(transport, hw).ok();
-    let changed_u32 = |desired: Option<u32>, current: Option<f32>| -> Option<u32> {
-        let d = desired?;
-        if let Some(c) = current {
-            if (c - d as f32).abs() <= 0.5 {
-                return None;
-            }
-        }
-        Some(d)
-    };
-    let desired_scalar = snap.pbo_scalar.map(|s| s.round().clamp(1.0, 10.0) as u32);
-    let scalar_req = match (desired_scalar, live_pbo.as_ref().and_then(|p| p.scalar)) {
-        (Some(d), Some(c)) if (c - d as f32).abs() <= 0.05 => None,
-        (d, _) => d,
-    };
-    let fmax_req = match (snap.fmax_mhz, live_pbo.as_ref().and_then(|p| p.fmax_mhz)) {
-        (Some(d), Some(c)) if d == c => None,
-        (d, _) => d,
-    };
+    let desired_scalar = snap
+        .pbo_scalar
+        .filter(|s| s.is_finite() && *s >= PBO_SCALAR_MIN as f32)
+        .map(|s| {
+            s.round()
+                .clamp(PBO_SCALAR_MIN as f32, PBO_SCALAR_MAX as f32) as u32
+        });
 
     let pbo_req = pbo::PboSetRequest {
-        ppt_w: if hw.capabilities.set_ppt.is_some() {
-            changed_u32(snap.ppt_w, live_telem.as_ref().and_then(|t| t.ppt_limit_w))
-        } else {
-            None
-        },
-        tdc_a: if hw.capabilities.set_tdc.is_some() {
-            changed_u32(snap.tdc_a, live_telem.as_ref().and_then(|t| t.tdc_limit_a))
-        } else {
-            None
-        },
-        edc_a: if hw.capabilities.set_edc.is_some() {
-            changed_u32(snap.edc_a, live_telem.as_ref().and_then(|t| t.edc_limit_a))
-        } else {
-            None
-        },
-        tctl_c: if hw.capabilities.set_tctl.is_some() {
-            changed_u32(snap.tctl_c, live_telem.as_ref().and_then(|t| t.tctl_limit_c))
-        } else {
-            None
-        },
-        scalar: if hw.capabilities.set_pbo_scalar.is_some() {
-            scalar_req
-        } else {
-            None
-        },
-        fmax_mhz: if hw.capabilities.set_fmax.is_some() {
-            fmax_req
-        } else {
-            None
-        },
+        ppt_w: cap_if(
+            caps.set_ppt.is_some(),
+            skip_unchanged_u32(snap.ppt_w, live_telem.as_ref().and_then(|t| t.ppt_limit_w)),
+        ),
+        tdc_a: cap_if(
+            caps.set_tdc.is_some(),
+            skip_unchanged_u32(snap.tdc_a, live_telem.as_ref().and_then(|t| t.tdc_limit_a)),
+        ),
+        edc_a: cap_if(
+            caps.set_edc.is_some(),
+            skip_unchanged_u32(snap.edc_a, live_telem.as_ref().and_then(|t| t.edc_limit_a)),
+        ),
+        tctl_c: cap_if(
+            caps.set_tctl.is_some(),
+            skip_unchanged_u32(
+                snap.tctl_c,
+                live_telem.as_ref().and_then(|t| t.tctl_limit_c),
+            ),
+        ),
+        scalar: cap_if(
+            caps.set_pbo_scalar.is_some(),
+            skip_unchanged_scalar(desired_scalar, live_pbo.as_ref().and_then(|p| p.scalar)),
+        ),
+        fmax_mhz: cap_if(
+            caps.set_fmax.is_some(),
+            skip_unchanged_exact(snap.fmax_mhz, live_pbo.as_ref().and_then(|p| p.fmax_mhz)),
+        ),
     };
-    if pbo_req.ppt_w.is_some()
-        || pbo_req.tdc_a.is_some()
-        || pbo_req.edc_a.is_some()
-        || pbo_req.tctl_c.is_some()
-        || pbo_req.scalar.is_some()
-        || pbo_req.fmax_mhz.is_some()
-    {
+    if !pbo_req.is_empty() {
         // Restoring a captured hardware snapshot permits BIOS-configured baseline limits.
-        ops.extend(pbo::set_pbo(
-            transport,
-            hw,
-            &pbo_req,
-            true,
-            dry_run,
-        )?);
+        ops.extend(pbo::set_pbo(transport, hw, &pbo_req, true, dry_run)?);
     }
 
     if hw.codename.is_apu() {
         let apu_req = apu::ApuSetRequest {
-            stapm_w: if hw.capabilities.set_stapm_limit.is_some() {
-                changed_u32(snap.stapm_w, live_telem.as_ref().and_then(|t| t.stapm_limit_w))
-            } else {
-                None
-            },
+            stapm_w: cap_if(
+                caps.set_stapm_limit.is_some(),
+                skip_unchanged_u32(
+                    snap.stapm_w,
+                    live_telem.as_ref().and_then(|t| t.stapm_limit_w),
+                ),
+            ),
             stapm_time_s: None,
             fast_w: None,
-            slow_w: if hw.capabilities.set_slow_limit.is_some() {
-                changed_u32(snap.slow_w, live_telem.as_ref().and_then(|t| t.slow_limit_w))
-            } else {
-                None
-            },
+            slow_w: cap_if(
+                caps.set_slow_limit.is_some(),
+                skip_unchanged_u32(
+                    snap.slow_w,
+                    live_telem.as_ref().and_then(|t| t.slow_limit_w),
+                ),
+            ),
             slow_time_s: None,
-            apu_slow_w: if hw.capabilities.set_apu_slow_limit.is_some() {
-                changed_u32(
+            apu_slow_w: cap_if(
+                caps.set_apu_slow_limit.is_some(),
+                skip_unchanged_u32(
                     snap.apu_slow_w,
                     live_telem.as_ref().and_then(|t| t.apu_slow_limit_w),
-                )
-            } else {
-                None
-            },
-            tdc_soc_a: if hw.capabilities.set_tdc_soc.is_some() {
-                changed_u32(
+                ),
+            ),
+            tdc_soc_a: cap_if(
+                caps.set_tdc_soc.is_some(),
+                skip_unchanged_u32(
                     snap.tdc_soc_a,
                     live_telem.as_ref().and_then(|t| t.tdc_soc_limit_a),
-                )
-            } else {
-                None
-            },
-            edc_soc_a: if hw.capabilities.set_edc_soc.is_some() {
-                changed_u32(
+                ),
+            ),
+            edc_soc_a: cap_if(
+                caps.set_edc_soc.is_some(),
+                skip_unchanged_u32(
                     snap.edc_soc_a,
                     live_telem.as_ref().and_then(|t| t.edc_soc_limit_a),
-                )
-            } else {
-                None
-            },
-            apu_skin_temp_c: if hw.capabilities.set_apu_skin_temp.is_some() {
-                changed_u32(
+                ),
+            ),
+            apu_skin_temp_c: cap_if(
+                caps.set_apu_skin_temp.is_some(),
+                skip_unchanged_u32(
                     snap.apu_skin_temp_c,
                     live_telem.as_ref().and_then(|t| t.apu_skin_temp_limit_c),
-                )
-            } else {
-                None
-            },
-            dgpu_skin_temp_c: if hw.capabilities.set_dgpu_skin_temp.is_some() {
-                changed_u32(
+                ),
+            ),
+            dgpu_skin_temp_c: cap_if(
+                caps.set_dgpu_skin_temp.is_some(),
+                skip_unchanged_u32(
                     snap.dgpu_skin_temp_c,
                     live_telem.as_ref().and_then(|t| t.dgpu_skin_temp_limit_c),
-                )
-            } else {
-                None
-            },
+                ),
+            ),
             power_mode: None,
         };
         if !apu_req.is_empty() {
@@ -327,90 +339,77 @@ pub fn apply_profile(
                 pbo::get_pbo_status(transport, hw).ok(),
             )
         };
-        let skip_same_f32 = |desired: Option<u32>, current: Option<f32>| -> Option<u32> {
-            let d = desired?;
-            if let Some(c) = current {
-                if (c - d as f32).abs() <= 0.5 {
-                    return None;
-                }
-            }
-            Some(d)
-        };
-        let scalar = match (pbo_prof.scalar, live_pbo.as_ref().and_then(|p| p.scalar)) {
-            (Some(d), Some(c)) if (c - d as f32).abs() <= 0.05 => None,
-            (d, _) => d,
-        };
-        let fmax_mhz = match (pbo_prof.fmax_mhz, live_pbo.as_ref().and_then(|p| p.fmax_mhz)) {
-            (Some(d), Some(c)) if d == c => None,
-            (d, _) => d,
-        };
 
         let req = pbo::PboSetRequest {
-            ppt_w: skip_same_f32(pbo_prof.ppt_w, live_telem.as_ref().and_then(|t| t.ppt_limit_w)),
-            tdc_a: skip_same_f32(pbo_prof.tdc_a, live_telem.as_ref().and_then(|t| t.tdc_limit_a)),
-            edc_a: skip_same_f32(pbo_prof.edc_a, live_telem.as_ref().and_then(|t| t.edc_limit_a)),
-            tctl_c: skip_same_f32(pbo_prof.tctl_c, live_telem.as_ref().and_then(|t| t.tctl_limit_c)),
-            scalar,
-            fmax_mhz,
+            ppt_w: skip_unchanged_u32(
+                pbo_prof.ppt_w,
+                live_telem.as_ref().and_then(|t| t.ppt_limit_w),
+            ),
+            tdc_a: skip_unchanged_u32(
+                pbo_prof.tdc_a,
+                live_telem.as_ref().and_then(|t| t.tdc_limit_a),
+            ),
+            edc_a: skip_unchanged_u32(
+                pbo_prof.edc_a,
+                live_telem.as_ref().and_then(|t| t.edc_limit_a),
+            ),
+            tctl_c: skip_unchanged_u32(
+                pbo_prof.tctl_c,
+                live_telem.as_ref().and_then(|t| t.tctl_limit_c),
+            ),
+            scalar: skip_unchanged_scalar(
+                pbo_prof.scalar,
+                live_pbo.as_ref().and_then(|p| p.scalar),
+            ),
+            fmax_mhz: skip_unchanged_exact(
+                pbo_prof.fmax_mhz,
+                live_pbo.as_ref().and_then(|p| p.fmax_mhz),
+            ),
         };
-        if req.ppt_w.is_some()
-            || req.tdc_a.is_some()
-            || req.edc_a.is_some()
-            || req.tctl_c.is_some()
-            || req.scalar.is_some()
-            || req.fmax_mhz.is_some()
-        {
+        if !req.is_empty() {
             ops.extend(pbo::set_pbo(transport, hw, &req, allow_extreme, dry_run)?);
         }
     }
 
     if let Some(ref apu_prof) = profile.apu {
+        // Re-read telemetry after `[pbo]` so `apu.fast_w` sees any updated `ppt_limit_w`.
         let live_telem = if dry_run {
             None
         } else {
             pm_table::read_telemetry(transport, hw).ok()
         };
-        let skip_same_f32 = |desired: Option<u32>, current: Option<f32>| -> Option<u32> {
-            let d = desired?;
-            if let Some(c) = current {
-                if (c - d as f32).abs() <= 0.5 {
-                    return None;
-                }
-            }
-            Some(d)
-        };
         let req = apu::ApuSetRequest {
-            stapm_w: skip_same_f32(
+            stapm_w: skip_unchanged_u32(
                 apu_prof.stapm_w,
                 live_telem.as_ref().and_then(|t| t.stapm_limit_w),
             ),
             stapm_time_s: apu_prof.stapm_time_s,
-            fast_w: skip_same_f32(
+            fast_w: skip_unchanged_u32(
                 apu_prof.fast_w,
                 live_telem.as_ref().and_then(|t| t.ppt_limit_w),
             ),
-            slow_w: skip_same_f32(
+            slow_w: skip_unchanged_u32(
                 apu_prof.slow_w,
                 live_telem.as_ref().and_then(|t| t.slow_limit_w),
             ),
             slow_time_s: apu_prof.slow_time_s,
-            apu_slow_w: skip_same_f32(
+            apu_slow_w: skip_unchanged_u32(
                 apu_prof.apu_slow_w,
                 live_telem.as_ref().and_then(|t| t.apu_slow_limit_w),
             ),
-            tdc_soc_a: skip_same_f32(
+            tdc_soc_a: skip_unchanged_u32(
                 apu_prof.tdc_soc_a,
                 live_telem.as_ref().and_then(|t| t.tdc_soc_limit_a),
             ),
-            edc_soc_a: skip_same_f32(
+            edc_soc_a: skip_unchanged_u32(
                 apu_prof.edc_soc_a,
                 live_telem.as_ref().and_then(|t| t.edc_soc_limit_a),
             ),
-            apu_skin_temp_c: skip_same_f32(
+            apu_skin_temp_c: skip_unchanged_u32(
                 apu_prof.apu_skin_temp_c,
                 live_telem.as_ref().and_then(|t| t.apu_skin_temp_limit_c),
             ),
-            dgpu_skin_temp_c: skip_same_f32(
+            dgpu_skin_temp_c: skip_unchanged_u32(
                 apu_prof.dgpu_skin_temp_c,
                 live_telem.as_ref().and_then(|t| t.dgpu_skin_temp_limit_c),
             ),
@@ -495,5 +494,113 @@ scalar = 1
         assert_eq!(restored.tctl_c, Some(95));
         assert_eq!(restored.co_per_core.as_ref().unwrap()[0].1, 0);
         assert_eq!(restored.curve_shaper.unwrap().high.med, 0);
+    }
+
+    #[test]
+    fn apu_snapshot_profile_apply_and_rollback_roundtrip() {
+        let transport = MockTransport::phoenix_apu();
+        let hw = mock_hw(&transport);
+
+        // 1. Capture baseline APU snapshot
+        let baseline = capture_snapshot(&transport, &hw).unwrap();
+        assert_eq!(baseline.stapm_w, Some(28));
+        assert_eq!(baseline.ppt_w, Some(45));
+        assert_eq!(baseline.slow_w, Some(35));
+        assert_eq!(baseline.apu_slow_w, Some(30));
+        assert_eq!(baseline.tdc_soc_a, Some(20));
+        assert_eq!(baseline.edc_soc_a, Some(35));
+        assert_eq!(baseline.apu_skin_temp_c, Some(70));
+        assert_eq!(baseline.dgpu_skin_temp_c, Some(65));
+        assert_eq!(baseline.co_per_core.as_ref().unwrap()[0].1, 0);
+        assert_eq!(baseline.igpu_co, Some(0));
+
+        // 2. Snapshot -> Profile roundtrip validates cleanly and diffs empty
+        let baseline_profile = Profile::from_snapshot(&baseline);
+        assert!(baseline_profile
+            .validate_for(hw.codename, hw.topology.physical_cores, false)
+            .is_ok());
+        assert!(baseline_profile.diff_against(&baseline).is_empty());
+
+        // 3. Build a tuned APU profile
+        let tuned_toml = r#"
+schema = 1
+[target]
+codename = "phoenix"
+physical_cores = 8
+
+[curve_optimizer]
+all = -15
+per_core = { 0 = -20 }
+igpu = -10
+
+[pbo]
+ppt_w = 54
+tdc_a = 48
+edc_a = 85
+tctl_c = 80
+scalar = 2
+
+[apu]
+stapm_w = 35
+stapm_time_s = 120
+slow_w = 42
+slow_time_s = 10
+apu_slow_w = 34
+tdc_soc_a = 25
+edc_soc_a = 45
+apu_skin_temp_c = 75
+dgpu_skin_temp_c = 70
+power_mode = "max-performance"
+"#;
+        let tuned = Profile::from_toml_str(tuned_toml).unwrap();
+
+        // 4. Dry-run apply leaves mock APU state untouched
+        let dry_ops = apply_profile(&transport, &hw, &tuned, false, true).unwrap();
+        assert!(!dry_ops.is_empty());
+        let still_baseline = capture_snapshot(&transport, &hw).unwrap();
+        assert_eq!(still_baseline.stapm_w, Some(28));
+        assert_eq!(still_baseline.ppt_w, Some(45));
+        assert_eq!(still_baseline.igpu_co, Some(0));
+
+        // 5. Live apply updates CO, PBO, and all APU DPTC limits
+        let live_ops = apply_profile(&transport, &hw, &tuned, false, false).unwrap();
+        assert!(!live_ops.is_empty());
+        let after = capture_snapshot(&transport, &hw).unwrap();
+        assert_eq!(after.stapm_w, Some(35));
+        assert_eq!(after.ppt_w, Some(54));
+        assert_eq!(after.slow_w, Some(42));
+        assert_eq!(after.apu_slow_w, Some(34));
+        assert_eq!(after.tdc_a, Some(48));
+        assert_eq!(after.edc_a, Some(85));
+        assert_eq!(after.tdc_soc_a, Some(25));
+        assert_eq!(after.edc_soc_a, Some(45));
+        assert_eq!(after.tctl_c, Some(80));
+        assert_eq!(after.apu_skin_temp_c, Some(75));
+        assert_eq!(after.dgpu_skin_temp_c, Some(70));
+        assert_eq!(after.pbo_scalar, Some(2.0));
+        assert_eq!(after.co_per_core.as_ref().unwrap()[0].1, -20);
+        assert_eq!(after.co_per_core.as_ref().unwrap()[1].1, -15);
+        assert_eq!(after.igpu_co, Some(-10));
+
+        // 6. Rollback to baseline snapshot restores all APU limits and CO margins
+        let rb_ops = apply_snapshot(&transport, &hw, &baseline, false, false).unwrap();
+        assert!(!rb_ops.is_empty());
+        let restored = capture_snapshot(&transport, &hw).unwrap();
+        assert_eq!(restored.stapm_w, Some(28));
+        assert_eq!(restored.ppt_w, Some(45));
+        assert_eq!(restored.slow_w, Some(35));
+        assert_eq!(restored.apu_slow_w, Some(30));
+        assert_eq!(restored.tdc_a, Some(40));
+        assert_eq!(restored.edc_a, Some(75));
+        assert_eq!(restored.tdc_soc_a, Some(20));
+        assert_eq!(restored.edc_soc_a, Some(35));
+        assert_eq!(restored.tctl_c, Some(85));
+        assert_eq!(restored.apu_skin_temp_c, Some(70));
+        assert_eq!(restored.dgpu_skin_temp_c, Some(65));
+        assert_eq!(restored.pbo_scalar, Some(1.0));
+        assert_eq!(restored.co_per_core.as_ref().unwrap()[0].1, 0);
+        assert_eq!(restored.co_per_core.as_ref().unwrap()[1].1, 0);
+        assert_eq!(restored.igpu_co, Some(0));
+        assert!(baseline_profile.diff_against(&restored).is_empty());
     }
 }

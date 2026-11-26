@@ -5,6 +5,7 @@
 
 use crate::error::{Error, Result};
 use crate::hw::identity::HardwareContext;
+use crate::safety::map_io_err;
 use crate::transport::SmuTransport;
 use crate::types::Codename;
 use serde::{Deserialize, Serialize};
@@ -102,6 +103,37 @@ struct PmTableLayout {
     cldo_vddg_ccd_v: Option<usize>,
 }
 
+/// Standard mobile APU PM table header offsets (`0x000..=0x054`), shared by
+/// Renoir/Lucienne, Cezanne, Rembrandt, and Phoenix/HawkPoint (`0x004C_0006+`).
+fn apu_std_header(min_size: usize) -> PmTableLayout {
+    PmTableLayout {
+        min_size,
+        stapm_limit_w: Some(0x000),
+        stapm_value_w: Some(0x004),
+        ppt_limit_w: Some(0x008),
+        ppt_value_w: Some(0x00C),
+        slow_limit_w: Some(0x010),
+        slow_value_w: Some(0x014),
+        apu_slow_limit_w: Some(0x018),
+        apu_slow_value_w: Some(0x01C),
+        tdc_limit_a: Some(0x020),
+        tdc_value_a: Some(0x024),
+        tdc_soc_limit_a: Some(0x028),
+        tdc_soc_value_a: Some(0x02C),
+        edc_limit_a: Some(0x030),
+        edc_value_a: Some(0x034),
+        edc_soc_limit_a: Some(0x038),
+        edc_soc_value_a: Some(0x03C),
+        tctl_limit_c: Some(0x040),
+        tctl_value_c: Some(0x044),
+        apu_skin_temp_limit_c: Some(0x048),
+        apu_skin_temp_value_c: Some(0x04C),
+        dgpu_skin_temp_limit_c: Some(0x050),
+        dgpu_skin_temp_value_c: Some(0x054),
+        ..PmTableLayout::default()
+    }
+}
+
 fn layout_for(codename: Codename, version: u32) -> Option<PmTableLayout> {
     match codename {
         Codename::GraniteRidge => {
@@ -135,15 +167,15 @@ fn layout_for(codename: Codename, version: u32) -> Option<PmTableLayout> {
             })
         }
         Codename::Raphael => {
-            let supported = matches!(
-                version,
-                0x0054_0000..=0x0054_0005 | 0x0054_0100..=0x0054_0108 | 0x0054_0208
-            );
-            if !supported {
-                return None;
-            }
+            let (min_size, vsoc, misc, fclk, uclk, mclk, vddp) = match version {
+                0x0054_0000..=0x0054_0005 | 0x0054_0100..=0x0054_0108 => {
+                    (0x434, 0x0D0, 0x0E4, 0x118, 0x128, 0x138, 0x430)
+                }
+                0x0054_0208 => (0x438, 0x0D4, 0x0E8, 0x11C, 0x12C, 0x13C, 0x434),
+                _ => return None,
+            };
             Some(PmTableLayout {
-                min_size: 0x434,
+                min_size,
                 ppt_limit_w: Some(0x008),
                 ppt_value_w: Some(0x00C),
                 tdc_limit_a: Some(0x020),
@@ -152,30 +184,54 @@ fn layout_for(codename: Codename, version: u32) -> Option<PmTableLayout> {
                 tctl_value_c: Some(0x02C),
                 edc_limit_a: Some(0x0FC),
                 edc_value_a: Some(0x100),
-                vddcr_soc_v: Some(0x0D0),
-                vddcr_misc_v: Some(0x0E4),
-                fclk_mhz: Some(0x118),
-                uclk_mhz: Some(0x128),
-                mclk_mhz: Some(0x138),
-                cldo_vddp_v: Some(0x430),
+                vddcr_soc_v: Some(vsoc),
+                vddcr_misc_v: Some(misc),
+                fclk_mhz: Some(fclk),
+                uclk_mhz: Some(uclk),
+                mclk_mhz: Some(mclk),
+                cldo_vddp_v: Some(vddp),
                 ..PmTableLayout::default()
             })
         }
-        Codename::Vermeer => {
-            let supported = matches!(
-                version,
-                0x0038_0505
-                    | 0x0038_0605
-                    | 0x0038_0705
-                    | 0x0038_0804
-                    | 0x0038_0805
-                    | 0x0038_0904
-                    | 0x0038_0905
-            );
-            if !supported {
-                return None;
-            }
+        Codename::StormPeak => {
+            let (min_size, fclk, uclk, mclk, vsoc, misc) = match version {
+                0x005C_0302 => (0xD9C, 0x194, 0x1A8, 0x1BC, 0x120, 0x134),
+                0x005C_0303 | 0x005C_0402 | 0x005C_0403 => {
+                    (0x974, 0x19C, 0x1B0, 0x1C4, 0x128, 0x13C)
+                }
+                _ => return None,
+            };
             Some(PmTableLayout {
+                min_size,
+                fclk_mhz: Some(fclk),
+                uclk_mhz: Some(uclk),
+                mclk_mhz: Some(mclk),
+                vddcr_soc_v: Some(vsoc),
+                vddcr_misc_v: Some(misc),
+                ..PmTableLayout::default()
+            })
+        }
+        Codename::Vermeer | Codename::Chagall => match version {
+            0x002D_0803 | 0x002D_0903 => Some(PmTableLayout {
+                min_size: 0x228,
+                ppt_limit_w: Some(0x000),
+                ppt_value_w: Some(0x004),
+                tdc_limit_a: Some(0x008),
+                tdc_value_a: Some(0x00C),
+                tctl_limit_c: Some(0x010),
+                tctl_value_c: Some(0x014),
+                edc_limit_a: Some(0x020),
+                edc_value_a: Some(0x024),
+                vddcr_soc_v: Some(0x0B0),
+                fclk_mhz: Some(0x0BC),
+                uclk_mhz: Some(0x0C4),
+                mclk_mhz: Some(0x0C8),
+                cldo_vddp_v: Some(0x220),
+                cldo_vddg_iod_v: Some(0x224),
+                ..PmTableLayout::default()
+            }),
+            0x0038_0505 | 0x0038_0605 | 0x0038_0705 | 0x0038_0804 | 0x0038_0805 | 0x0038_0904
+            | 0x0038_0905 => Some(PmTableLayout {
                 min_size: 0x230,
                 ppt_limit_w: Some(0x000),
                 ppt_value_w: Some(0x004),
@@ -193,18 +249,19 @@ fn layout_for(codename: Codename, version: u32) -> Option<PmTableLayout> {
                 cldo_vddg_iod_v: Some(0x228),
                 cldo_vddg_ccd_v: Some(0x22C),
                 ..PmTableLayout::default()
-            })
-        }
-        Codename::Matisse => {
-            let supported = matches!(
-                version,
-                0x0024_0802 | 0x0024_0803 | 0x0024_0902 | 0x0024_0903
-            );
-            if !supported {
-                return None;
-            }
+            }),
+            _ => None,
+        },
+        Codename::Matisse | Codename::CastlePeak => {
+            let (min_size, vsoc, fclk, uclk, mclk, vddp, vddg_iod) = match version {
+                0x0024_0802 | 0x0024_0902 => (0x1F8, 0x0B0, 0x0BC, 0x0C4, 0x0C8, 0x1F0, 0x1F4),
+                0x0024_0503 | 0x0024_0603 | 0x0024_0703 | 0x0024_0803 | 0x0024_0903 => {
+                    (0x1FC, 0x0B4, 0x0C0, 0x0C8, 0x0CC, 0x1F4, 0x1F8)
+                }
+                _ => return None,
+            };
             Some(PmTableLayout {
-                min_size: 0x228,
+                min_size,
                 ppt_limit_w: Some(0x000),
                 ppt_value_w: Some(0x004),
                 tdc_limit_a: Some(0x008),
@@ -213,12 +270,12 @@ fn layout_for(codename: Codename, version: u32) -> Option<PmTableLayout> {
                 tctl_value_c: Some(0x014),
                 edc_limit_a: Some(0x020),
                 edc_value_a: Some(0x024),
-                vddcr_soc_v: Some(0x0B0),
-                fclk_mhz: Some(0x0BC),
-                uclk_mhz: Some(0x0C4),
-                mclk_mhz: Some(0x0C8),
-                cldo_vddp_v: Some(0x220),
-                cldo_vddg_iod_v: Some(0x224),
+                vddcr_soc_v: Some(vsoc),
+                fclk_mhz: Some(fclk),
+                uclk_mhz: Some(uclk),
+                mclk_mhz: Some(mclk),
+                cldo_vddp_v: Some(vddp),
+                cldo_vddg_iod_v: Some(vddg_iod),
                 ..PmTableLayout::default()
             })
         }
@@ -234,34 +291,11 @@ fn layout_for(codename: Codename, version: u32) -> Option<PmTableLayout> {
                 _ => return None,
             };
             Some(PmTableLayout {
-                min_size,
-                stapm_limit_w: Some(0x000),
-                stapm_value_w: Some(0x004),
-                ppt_limit_w: Some(0x008),
-                ppt_value_w: Some(0x00C),
-                slow_limit_w: Some(0x010),
-                slow_value_w: Some(0x014),
-                apu_slow_limit_w: Some(0x018),
-                apu_slow_value_w: Some(0x01C),
-                tdc_limit_a: Some(0x020),
-                tdc_value_a: Some(0x024),
-                tdc_soc_limit_a: Some(0x028),
-                tdc_soc_value_a: Some(0x02C),
-                edc_limit_a: Some(0x030),
-                edc_value_a: Some(0x034),
-                edc_soc_limit_a: Some(0x038),
-                edc_soc_value_a: Some(0x03C),
-                tctl_limit_c: Some(0x040),
-                tctl_value_c: Some(0x044),
-                apu_skin_temp_limit_c: Some(0x048),
-                apu_skin_temp_value_c: Some(0x04C),
-                dgpu_skin_temp_limit_c: Some(0x050),
-                dgpu_skin_temp_value_c: Some(0x054),
                 fclk_mhz: Some(fclk),
                 uclk_mhz: Some(uclk),
                 mclk_mhz: Some(mclk),
                 vddcr_soc_v: Some(vsoc),
-                ..PmTableLayout::default()
+                ..apu_std_header(min_size)
             })
         }
         Codename::Cezanne => {
@@ -273,34 +307,11 @@ fn layout_for(codename: Codename, version: u32) -> Option<PmTableLayout> {
                 _ => return None,
             };
             Some(PmTableLayout {
-                min_size,
-                stapm_limit_w: Some(0x000),
-                stapm_value_w: Some(0x004),
-                ppt_limit_w: Some(0x008),
-                ppt_value_w: Some(0x00C),
-                slow_limit_w: Some(0x010),
-                slow_value_w: Some(0x014),
-                apu_slow_limit_w: Some(0x018),
-                apu_slow_value_w: Some(0x01C),
-                tdc_limit_a: Some(0x020),
-                tdc_value_a: Some(0x024),
-                tdc_soc_limit_a: Some(0x028),
-                tdc_soc_value_a: Some(0x02C),
-                edc_limit_a: Some(0x030),
-                edc_value_a: Some(0x034),
-                edc_soc_limit_a: Some(0x038),
-                edc_soc_value_a: Some(0x03C),
-                tctl_limit_c: Some(0x040),
-                tctl_value_c: Some(0x044),
-                apu_skin_temp_limit_c: Some(0x048),
-                apu_skin_temp_value_c: Some(0x04C),
-                dgpu_skin_temp_limit_c: Some(0x050),
-                dgpu_skin_temp_value_c: Some(0x054),
                 fclk_mhz: Some(fclk),
                 uclk_mhz: Some(uclk),
                 mclk_mhz: Some(mclk),
                 vddcr_soc_v: Some(0x19C),
-                ..PmTableLayout::default()
+                ..apu_std_header(min_size)
             })
         }
         Codename::Rembrandt => {
@@ -310,72 +321,76 @@ fn layout_for(codename: Codename, version: u32) -> Option<PmTableLayout> {
                 _ => return None,
             };
             Some(PmTableLayout {
-                min_size,
-                stapm_limit_w: Some(0x000),
-                stapm_value_w: Some(0x004),
-                ppt_limit_w: Some(0x008),
-                ppt_value_w: Some(0x00C),
-                slow_limit_w: Some(0x010),
-                slow_value_w: Some(0x014),
-                apu_slow_limit_w: Some(0x018),
-                apu_slow_value_w: Some(0x01C),
-                tdc_limit_a: Some(0x020),
-                tdc_value_a: Some(0x024),
-                tdc_soc_limit_a: Some(0x028),
-                tdc_soc_value_a: Some(0x02C),
-                edc_limit_a: Some(0x030),
-                edc_value_a: Some(0x034),
-                edc_soc_limit_a: Some(0x038),
-                edc_soc_value_a: Some(0x03C),
-                tctl_limit_c: Some(0x040),
-                tctl_value_c: Some(0x044),
-                apu_skin_temp_limit_c: Some(0x048),
-                apu_skin_temp_value_c: Some(0x04C),
-                dgpu_skin_temp_limit_c: Some(0x050),
-                dgpu_skin_temp_value_c: Some(0x054),
                 fclk_mhz: Some(fclk),
                 uclk_mhz: Some(uclk),
                 mclk_mhz: Some(mclk),
                 vddcr_soc_v: Some(vsoc),
-                ..PmTableLayout::default()
+                ..apu_std_header(min_size)
             })
         }
         Codename::Phoenix | Codename::HawkPoint => {
-            let supported = matches!(version, 0x004C_0003..=0x004C_0009);
-            if !supported {
-                return None;
-            }
-            let has_std_header = matches!(version, 0x004C_0006..=0x004C_0009);
+            let (min_size, fclk, uclk, mclk, vsoc, vddp) = match version {
+                0x004C_0001..=0x004C_0007 => (0x76C, 0x174, 0x184, 0x194, 0x1C8, 0x768),
+                0x004C_0008 => (0x76C, 0x164, 0x174, 0x184, 0x1B8, 0x768),
+                0x004C_0009 => (0x778, 0x164, 0x174, 0x184, 0x1BC, 0x774),
+                _ => return None,
+            };
+            let base = if matches!(version, 0x004C_0006..=0x004C_0009) {
+                apu_std_header(min_size)
+            } else {
+                PmTableLayout {
+                    min_size,
+                    ..PmTableLayout::default()
+                }
+            };
             Some(PmTableLayout {
-                min_size: 0x778,
-                stapm_limit_w: if has_std_header { Some(0x000) } else { None },
-                stapm_value_w: if has_std_header { Some(0x004) } else { None },
-                ppt_limit_w: if has_std_header { Some(0x008) } else { None },
-                ppt_value_w: if has_std_header { Some(0x00C) } else { None },
-                slow_limit_w: if has_std_header { Some(0x010) } else { None },
-                slow_value_w: if has_std_header { Some(0x014) } else { None },
-                apu_slow_limit_w: if has_std_header { Some(0x018) } else { None },
-                apu_slow_value_w: if has_std_header { Some(0x01C) } else { None },
-                tdc_limit_a: if has_std_header { Some(0x020) } else { None },
-                tdc_value_a: if has_std_header { Some(0x024) } else { None },
-                tdc_soc_limit_a: if has_std_header { Some(0x028) } else { None },
-                tdc_soc_value_a: if has_std_header { Some(0x02C) } else { None },
-                edc_limit_a: if has_std_header { Some(0x030) } else { None },
-                edc_value_a: if has_std_header { Some(0x034) } else { None },
-                edc_soc_limit_a: if has_std_header { Some(0x038) } else { None },
-                edc_soc_value_a: if has_std_header { Some(0x03C) } else { None },
-                tctl_limit_c: if has_std_header { Some(0x040) } else { None },
-                tctl_value_c: if has_std_header { Some(0x044) } else { None },
-                apu_skin_temp_limit_c: if has_std_header { Some(0x048) } else { None },
-                apu_skin_temp_value_c: if has_std_header { Some(0x04C) } else { None },
-                dgpu_skin_temp_limit_c: if has_std_header { Some(0x050) } else { None },
-                dgpu_skin_temp_value_c: if has_std_header { Some(0x054) } else { None },
-                fclk_mhz: Some(0x164),
-                uclk_mhz: Some(0x174),
-                mclk_mhz: Some(0x184),
-                vddcr_soc_v: Some(0x1BC),
-                cldo_vddp_v: Some(0x774),
-                ..PmTableLayout::default()
+                fclk_mhz: Some(fclk),
+                uclk_mhz: Some(uclk),
+                mclk_mhz: Some(mclk),
+                vddcr_soc_v: Some(vsoc),
+                cldo_vddp_v: Some(vddp),
+                ..base
+            })
+        }
+        Codename::StrixPoint => match version {
+            0x005D_0008..=0x005D_000B => Some(PmTableLayout {
+                fclk_mhz: Some(0x4E0),
+                uclk_mhz: Some(0x4E4),
+                mclk_mhz: Some(0x4EC),
+                ..apu_std_header(0xD54)
+            }),
+            _ => None,
+        },
+        Codename::StrixHalo => match version {
+            0x0064_0107..=0x0064_010C => Some(apu_std_header(0xDC0)),
+            _ => None,
+        },
+        Codename::VanGogh => match version {
+            0x003F_0000 => Some(PmTableLayout {
+                fclk_mhz: Some(0x3BC),
+                uclk_mhz: Some(0x3C0),
+                mclk_mhz: Some(0x3C4),
+                vddcr_soc_v: Some(0x1A0),
+                ..apu_std_header(0x7AC)
+            }),
+            _ => None,
+        },
+        Codename::RavenRidge | Codename::RavenRidge2 | Codename::Picasso | Codename::Dali => {
+            let (min_size, fclk, uclk, mclk, vsoc, vddp) = match version {
+                0x001E_0001 => (0x570, 0x460, 0x464, 0x468, 0x10C, 0x0F8),
+                0x001E_0002 => (0x580, 0x474, 0x478, 0x47C, 0x10C, 0x0F8),
+                0x001E_0003..=0x001E_0005 | 0x001E_000A | 0x001E_0101 => {
+                    (0x608, 0x298, 0x29C, 0x2A0, 0x104, 0x0F0)
+                }
+                _ => return None,
+            };
+            Some(PmTableLayout {
+                fclk_mhz: Some(fclk),
+                uclk_mhz: Some(uclk),
+                mclk_mhz: Some(mclk),
+                vddcr_soc_v: Some(vsoc),
+                cldo_vddp_v: Some(vddp),
+                ..apu_std_header(min_size)
             })
         }
         _ => None,
@@ -384,7 +399,8 @@ fn layout_for(codename: Codename, version: u32) -> Option<PmTableLayout> {
 
 fn read_f32_sane(raw: &[u8], offset: Option<usize>, min: f32, max: f32) -> Option<f32> {
     let off = offset?;
-    let bytes: [u8; 4] = raw.get(off..off + 4)?.try_into().ok()?;
+    let end = off.checked_add(4)?;
+    let bytes: [u8; 4] = raw.get(off..end)?.try_into().ok()?;
     let val = f32::from_le_bytes(bytes);
     if val.is_finite() && val >= min && val <= max {
         Some(val)
@@ -398,11 +414,7 @@ fn read_f32_sane(raw: &[u8], offset: Option<usize>, min: f32, max: f32) -> Optio
 /// Refuses unknown versions with [`Error::UnsupportedPmTable`] and buffers
 /// larger than 4096 bytes with [`Error::PmTableTooLarge`]. Non-finite or
 /// physically absurd floats are filtered to `None`.
-pub fn decode_pm_table(
-    codename: Codename,
-    version: u32,
-    raw: &[u8],
-) -> Result<TelemetrySnapshot> {
+pub fn decode_pm_table(codename: Codename, version: u32, raw: &[u8]) -> Result<TelemetrySnapshot> {
     if raw.len() > MAX_SAFE_PM_TABLE_SIZE {
         return Err(Error::PmTableTooLarge { size: raw.len() });
     }
@@ -501,10 +513,7 @@ pub fn dump_raw_pm_table(transport: &dyn SmuTransport, out_path: &Path) -> Resul
     if raw.len() > MAX_SAFE_PM_TABLE_SIZE {
         return Err(Error::PmTableTooLarge { size: raw.len() });
     }
-    std::fs::write(out_path, &raw).map_err(|source| Error::Io {
-        path: out_path.display().to_string(),
-        source,
-    })?;
+    std::fs::write(out_path, &raw).map_err(|source| map_io_err(out_path, source))?;
     Ok(raw.len())
 }
 
@@ -618,13 +627,29 @@ mod tests {
         let mut phoenix = vec![0u8; 0x800];
         write_f32(&mut phoenix, 0x008, 45.0);
         write_f32(&mut phoenix, 0x164, 2000.0);
-        write_f32(&mut phoenix, 0x1BC, 1.15);
-        write_f32(&mut phoenix, 0x774, 0.95);
+        write_f32(&mut phoenix, 0x1B8, 1.15);
+        write_f32(&mut phoenix, 0x768, 0.95);
         let psnap = decode_pm_table(Codename::Phoenix, 0x004C_0008, &phoenix).unwrap();
         assert_eq!(psnap.ppt_limit_w, Some(45.0));
         assert_eq!(psnap.fclk_mhz, Some(2000.0));
         assert_eq!(psnap.vddcr_soc_v, Some(1.15));
         assert_eq!(psnap.cldo_vddp_v, Some(0.95));
+
+        let mut strix = vec![0u8; 0xD54];
+        write_f32(&mut strix, 0x000, 28.0);
+        write_f32(&mut strix, 0x4E0, 2000.0);
+        let ssnap = decode_pm_table(Codename::StrixPoint, 0x005D_0008, &strix).unwrap();
+        assert_eq!(ssnap.stapm_limit_w, Some(28.0));
+        assert_eq!(ssnap.fclk_mhz, Some(2000.0));
+
+        let mut picasso = vec![0u8; 0x608];
+        write_f32(&mut picasso, 0x000, 15.0);
+        write_f32(&mut picasso, 0x298, 1200.0);
+        write_f32(&mut picasso, 0x104, 0.92);
+        let picsnap = decode_pm_table(Codename::Picasso, 0x001E_0004, &picasso).unwrap();
+        assert_eq!(picsnap.stapm_limit_w, Some(15.0));
+        assert_eq!(picsnap.fclk_mhz, Some(1200.0));
+        assert_eq!(picsnap.vddcr_soc_v, Some(0.92));
 
         let mut lucienne = vec![0u8; 0x8C8];
         write_f32(&mut lucienne, 0x008, 30.0);

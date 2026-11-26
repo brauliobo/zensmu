@@ -187,10 +187,16 @@ pub fn capabilities_for(codename: Codename) -> Option<CpuCapabilities> {
         Codename::Raphael | Codename::StormPeak => Some(zen4_desktop(codename)),
         Codename::Vermeer | Codename::Chagall => Some(zen3_desktop(codename)),
         Codename::Matisse | Codename::CastlePeak => Some(zen2_desktop(codename)),
+        Codename::PinnacleRidge => Some(zen_plus_desktop(codename)),
+        Codename::Colfax => Some(zen_plus_colfax(codename)),
+        Codename::SummitRidge | Codename::ThreadRipper => Some(zen1_desktop(codename)),
         Codename::Renoir | Codename::Lucienne | Codename::Cezanne => Some(apu1_base(codename)),
+        Codename::VanGogh => Some(apu1_vangogh(codename)),
         Codename::Rembrandt => Some(apu1_rembrandt(codename)),
         Codename::Phoenix | Codename::HawkPoint => Some(apu1_phoenix(codename)),
         Codename::StrixPoint | Codename::StrixHalo => Some(apu1_strix(codename)),
+        Codename::RavenRidge | Codename::RavenRidge2 | Codename::Dali => Some(apu0_base(codename)),
+        Codename::Picasso => Some(apu0_picasso(codename)),
         _ => None,
     }
 }
@@ -389,8 +395,125 @@ fn zen2_desktop(codename: Codename) -> CpuCapabilities {
     }
 }
 
+fn zen_empty_f17(codename: Codename, rsmu_rsp: u32, mp1_rsp: u32) -> CpuCapabilities {
+    CpuCapabilities {
+        codename,
+        is_family_17h: true,
+        rsp_addrs: MailboxRspAddrs {
+            rsmu_rsp: Some(rsmu_rsp),
+            mp1_rsp: Some(mp1_rsp),
+        },
+        co_bounds: None,
+        test_message_rsmu: Some(OpcodeSpec::rsmu(0x01)),
+        test_message_mp1: Some(OpcodeSpec::mp1(0x01)),
+        get_co_per_core: None,
+        set_co_per_core: None,
+        set_co_all_cores: None,
+        get_igpu_co: None,
+        set_igpu_co: None,
+        get_curve_shaper: None,
+        set_curve_shaper: None,
+        set_ppt: None,
+        set_tdc: None,
+        set_edc: None,
+        set_tctl: None,
+        get_pbo_scalar: None,
+        set_pbo_scalar: None,
+        set_pbo_en: None,
+        get_fmax: None,
+        set_fmax: None,
+        get_is_overclockable: None,
+        get_expo_active: None,
+        get_ln2_mode: None,
+        get_perf_data: None,
+        get_fused_ppt: None,
+        get_fused_slow: None,
+        get_fused_fast: None,
+        get_fused_apu_slow: None,
+        get_fused_vdd_tdc: None,
+        get_fused_edc: None,
+        get_fused_soc_tdc: None,
+        set_stapm_limit: None,
+        set_stapm_time: None,
+        set_slow_limit: None,
+        set_slow_time: None,
+        set_apu_slow_limit: None,
+        set_tdc_soc: None,
+        set_edc_soc: None,
+        set_apu_skin_temp: None,
+        set_dgpu_skin_temp: None,
+        set_max_performance: None,
+        set_power_saving: None,
+    }
+}
+
+fn zen1_desktop(codename: Codename) -> CpuCapabilities {
+    let mut caps = zen_empty_f17(codename, 0x03B1_0568, 0x03B1_0564);
+    caps.set_ppt = Some(DualOpcode::rsmu_then_mp1(0x58, 0x31));
+    caps.set_edc = Some(DualOpcode::mp1_only(0x2A));
+    caps
+}
+
+fn zen_plus_desktop(codename: Codename) -> CpuCapabilities {
+    let mut caps = zen_empty_f17(codename, 0x03B1_0568, 0x03B1_0564);
+    caps.set_ppt = Some(DualOpcode::rsmu_only(0x64));
+    caps.set_tdc = Some(DualOpcode::rsmu_only(0x65));
+    caps.set_edc = Some(DualOpcode::rsmu_only(0x66));
+    caps.set_tctl = Some(DualOpcode::rsmu_only(0x68));
+    caps.set_pbo_scalar = Some(DualOpcode::rsmu_only(0x6A));
+    caps.get_pbo_scalar = Some(OpcodeSpec::rsmu(0x6F));
+    caps
+}
+
+fn zen_plus_colfax(codename: Codename) -> CpuCapabilities {
+    let mut caps = zen_empty_f17(codename, 0x03B1_0568, 0x03B1_0564);
+    caps.set_tdc = Some(DualOpcode::rsmu_only(0x6B));
+    caps.set_edc = Some(DualOpcode::rsmu_only(0x6C));
+    caps.set_tctl = Some(DualOpcode::rsmu_only(0x6E));
+    caps.set_pbo_scalar = Some(DualOpcode::rsmu_only(0x6F));
+    caps.get_pbo_scalar = Some(OpcodeSpec::rsmu(0x70));
+    caps
+}
+
+fn apu0_base(codename: Codename) -> CpuCapabilities {
+    let mut caps = zen_empty_f17(codename, 0x03B1_0A80, 0x03B1_0564);
+    caps.set_stapm_limit = Some(DualOpcode::mp1_then_rsmu(0x1A, 0x2E));
+    caps.set_ppt = Some(DualOpcode::mp1_then_rsmu(0x1B, 0x2F));
+    caps.set_slow_limit = Some(DualOpcode::mp1_then_rsmu(0x1C, 0x30));
+    caps.set_slow_time = Some(DualOpcode::mp1_then_rsmu(0x1D, 0x31));
+    caps.set_stapm_time = Some(DualOpcode::mp1_then_rsmu(0x1E, 0x32));
+    caps.set_tctl = Some(DualOpcode::mp1_then_rsmu(0x1F, 0x33));
+    caps.set_tdc = Some(DualOpcode::mp1_then_rsmu(0x20, 0x34));
+    caps.set_tdc_soc = Some(DualOpcode::mp1_then_rsmu(0x21, 0x35));
+    caps.set_edc = Some(DualOpcode::mp1_then_rsmu(0x22, 0x36));
+    caps.set_edc_soc = Some(DualOpcode::mp1_then_rsmu(0x23, 0x37));
+    caps.set_max_performance = Some(OpcodeSpec::mp1(0x18));
+    caps.set_power_saving = Some(OpcodeSpec::mp1(0x19));
+    caps.get_pbo_scalar = Some(OpcodeSpec::rsmu(0x62));
+    caps.get_is_overclockable = Some(OpcodeSpec::rsmu(0x4C));
+    caps
+}
+
+fn apu0_picasso(codename: Codename) -> CpuCapabilities {
+    let mut caps = apu0_base(codename);
+    caps.set_apu_slow_limit = Some(DualOpcode::mp1_then_rsmu(0x54, 0x75));
+    caps.set_pbo_scalar = Some(DualOpcode::mp1_then_rsmu(0x57, 0x7C));
+    caps.get_is_overclockable = Some(OpcodeSpec::rsmu(0x87));
+    caps.get_fmax = Some(OpcodeSpec::rsmu(0x86));
+    caps.get_fused_ppt = Some(OpcodeSpec::rsmu(0x7F));
+    caps.get_fused_slow = Some(OpcodeSpec::rsmu(0x80));
+    caps.get_fused_fast = Some(OpcodeSpec::rsmu(0x81));
+    caps.get_fused_apu_slow = Some(OpcodeSpec::rsmu(0x82));
+    caps.get_fused_vdd_tdc = Some(OpcodeSpec::rsmu(0x83));
+    caps.get_fused_soc_tdc = Some(OpcodeSpec::rsmu(0x84));
+    caps
+}
+
 fn apu1_base(codename: Codename) -> CpuCapabilities {
-    let is_family_17h = matches!(codename, Codename::Renoir | Codename::Lucienne);
+    let is_family_17h = matches!(
+        codename,
+        Codename::Renoir | Codename::Lucienne | Codename::VanGogh
+    );
     CpuCapabilities {
         codename,
         is_family_17h,
@@ -425,7 +548,11 @@ fn apu1_base(codename: Codename) -> CpuCapabilities {
         } else {
             None
         },
-        get_igpu_co: None,
+        get_igpu_co: if codename == Codename::Cezanne {
+            Some(OpcodeSpec::rsmu(0xC6))
+        } else {
+            None
+        },
         set_igpu_co: if codename == Codename::Cezanne {
             Some(OpcodeSpec::rsmu(0x53))
         } else {
@@ -468,6 +595,23 @@ fn apu1_base(codename: Codename) -> CpuCapabilities {
         set_max_performance: Some(OpcodeSpec::mp1(0x11)),
         set_power_saving: Some(OpcodeSpec::mp1(0x12)),
     }
+}
+
+fn apu1_vangogh(codename: Codename) -> CpuCapabilities {
+    let mut caps = apu1_base(codename);
+    caps.is_family_17h = true;
+    caps.rsp_addrs.mp1_rsp = Some(0x03B1_0578);
+    caps.co_bounds = Some(CoBounds {
+        min: -30,
+        max: 30,
+        soft_min: -25,
+    });
+    caps.set_co_per_core = Some(DualOpcode::mp1_only(0x4B));
+    caps.set_co_all_cores = Some(DualOpcode::mp1_only(0x4C));
+    caps.set_apu_slow_limit = Some(DualOpcode::mp1_then_rsmu(0x23, 0x34));
+    caps.set_apu_skin_temp = Some(DualOpcode::mp1_then_rsmu(0x33, 0x91));
+    caps.set_dgpu_skin_temp = Some(DualOpcode::mp1_then_rsmu(0x34, 0x92));
+    caps
 }
 
 fn apu1_phoenix(codename: Codename) -> CpuCapabilities {
@@ -523,8 +667,14 @@ mod tests {
     fn granite_ridge_opcodes_match_zen5_spec() {
         let caps = capabilities_for(Codename::GraniteRidge).unwrap();
         assert_eq!(caps.get_co_per_core, Some(OpcodeSpec::rsmu(0xD5)));
-        assert_eq!(caps.set_co_per_core, Some(DualOpcode::rsmu_then_mp1(0x06, 0x35)));
-        assert_eq!(caps.set_co_all_cores, Some(DualOpcode::rsmu_then_mp1(0x07, 0x36)));
+        assert_eq!(
+            caps.set_co_per_core,
+            Some(DualOpcode::rsmu_then_mp1(0x06, 0x35))
+        );
+        assert_eq!(
+            caps.set_co_all_cores,
+            Some(DualOpcode::rsmu_then_mp1(0x07, 0x36))
+        );
         assert_eq!(caps.get_curve_shaper, Some(OpcodeSpec::rsmu(0x84)));
         assert_eq!(caps.set_curve_shaper, Some(OpcodeSpec::rsmu(0xA6)));
         assert_eq!(caps.set_ppt, Some(DualOpcode::rsmu_then_mp1(0x56, 0x3E)));
@@ -545,6 +695,41 @@ mod tests {
     #[test]
     fn unknown_codename_returns_none() {
         assert!(capabilities_for(Codename::Undefined).is_none());
-        assert!(capabilities_for(Codename::VanGogh).is_none());
+        assert!(capabilities_for(Codename::Naples).is_none());
+    }
+
+    #[test]
+    fn cezanne_and_extended_zen_profiles_have_verified_opcodes() {
+        let cez = capabilities_for(Codename::Cezanne).unwrap();
+        assert_eq!(cez.get_igpu_co, Some(OpcodeSpec::rsmu(0xC6)));
+
+        let vg = capabilities_for(Codename::VanGogh).unwrap();
+        assert!(vg.is_family_17h);
+        assert_eq!(vg.rsp_addrs.mp1_rsp, Some(0x03B1_0578));
+        assert_eq!(vg.set_co_per_core, Some(DualOpcode::mp1_only(0x4B)));
+        assert_eq!(vg.set_co_all_cores, Some(DualOpcode::mp1_only(0x4C)));
+
+        let pic = capabilities_for(Codename::Picasso).unwrap();
+        assert_eq!(
+            pic.set_stapm_limit,
+            Some(DualOpcode::mp1_then_rsmu(0x1A, 0x2E))
+        );
+        assert_eq!(
+            pic.set_apu_slow_limit,
+            Some(DualOpcode::mp1_then_rsmu(0x54, 0x75))
+        );
+        assert_eq!(pic.get_fmax, Some(OpcodeSpec::rsmu(0x86)));
+
+        let pr = capabilities_for(Codename::PinnacleRidge).unwrap();
+        assert_eq!(pr.rsp_addrs.rsmu_rsp, Some(0x03B1_0568));
+        assert_eq!(pr.set_ppt, Some(DualOpcode::rsmu_only(0x64)));
+
+        let cf = capabilities_for(Codename::Colfax).unwrap();
+        assert_eq!(cf.set_tdc, Some(DualOpcode::rsmu_only(0x6B)));
+        assert_eq!(cf.get_pbo_scalar, Some(OpcodeSpec::rsmu(0x70)));
+
+        let sr = capabilities_for(Codename::SummitRidge).unwrap();
+        assert_eq!(sr.set_ppt, Some(DualOpcode::rsmu_then_mp1(0x58, 0x31)));
+        assert_eq!(sr.set_edc, Some(DualOpcode::mp1_only(0x2A)));
     }
 }

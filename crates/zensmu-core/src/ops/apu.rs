@@ -2,32 +2,33 @@
 
 use crate::error::{Error, Result};
 use crate::hw::identity::HardwareContext;
-use crate::hw::profiles::{DualOpcode, OpcodeSpec};
-use crate::ops::co::{check_mailbox_health, send_dual_verified, send_verified};
+use crate::hw::profiles::DualOpcode;
+use crate::ops::{execute_ops, ExecOp};
+use crate::safety::bounds;
 use crate::transport::SmuTransport;
-use crate::types::{ApuPowerMode, Mailbox, PlannedOp, SmuArgs};
+use crate::types::{ApuPowerMode, PlannedOp, SmuArgs};
 use serde::{Deserialize, Serialize};
 
-// Conservative mobile APU bounds.
-pub const APU_POWER_MIN_W: u32 = 5;
-pub const APU_POWER_MAX_W: u32 = 150;
-pub const APU_POWER_SOFT_MAX_W: u32 = 100;
-pub const APU_FAST_POWER_SOFT_MAX_W: u32 = 120;
+// Conservative mobile APU bounds (unified with `crate::safety::bounds`).
+pub const APU_POWER_MIN_W: u32 = bounds::APU_POWER_MIN_W;
+pub const APU_POWER_MAX_W: u32 = bounds::APU_POWER_MAX_W;
+pub const APU_POWER_SOFT_MAX_W: u32 = bounds::APU_POWER_SOFT_MAX_W;
+pub const APU_FAST_POWER_SOFT_MAX_W: u32 = bounds::APU_FAST_POWER_SOFT_MAX_W;
 
-pub const APU_TIME_MIN_S: u32 = 1;
-pub const APU_TIME_MAX_S: u32 = 600;
+pub const APU_TIME_MIN_S: u32 = bounds::APU_TIME_MIN_S;
+pub const APU_TIME_MAX_S: u32 = bounds::APU_TIME_MAX_S;
 
-pub const APU_SOC_TDC_MIN_A: u32 = 5;
-pub const APU_SOC_TDC_MAX_A: u32 = 100;
-pub const APU_SOC_TDC_SOFT_MAX_A: u32 = 60;
+pub const APU_SOC_TDC_MIN_A: u32 = bounds::APU_SOC_TDC_MIN_A;
+pub const APU_SOC_TDC_MAX_A: u32 = bounds::APU_SOC_TDC_MAX_A;
+pub const APU_SOC_TDC_SOFT_MAX_A: u32 = bounds::APU_SOC_TDC_SOFT_MAX_A;
 
-pub const APU_SOC_EDC_MIN_A: u32 = 5;
-pub const APU_SOC_EDC_MAX_A: u32 = 150;
-pub const APU_SOC_EDC_SOFT_MAX_A: u32 = 90;
+pub const APU_SOC_EDC_MIN_A: u32 = bounds::APU_SOC_EDC_MIN_A;
+pub const APU_SOC_EDC_MAX_A: u32 = bounds::APU_SOC_EDC_MAX_A;
+pub const APU_SOC_EDC_SOFT_MAX_A: u32 = bounds::APU_SOC_EDC_SOFT_MAX_A;
 
-pub const APU_SKIN_TEMP_MIN_C: u32 = 30;
-pub const APU_SKIN_TEMP_MAX_C: u32 = 95;
-pub const APU_SKIN_TEMP_SOFT_MAX_C: u32 = 80;
+pub const APU_SKIN_TEMP_MIN_C: u32 = bounds::SKIN_TEMP_MIN_C;
+pub const APU_SKIN_TEMP_MAX_C: u32 = bounds::SKIN_TEMP_MAX_C;
+pub const APU_SKIN_TEMP_SOFT_MAX_C: u32 = bounds::SKIN_TEMP_SOFT_MAX_C;
 
 /// Request to update one or more mobile APU DPTC parameters.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -62,45 +63,23 @@ impl ApuSetRequest {
     }
 }
 
-fn validate_range(
-    field: &str,
-    value: u32,
-    min: u32,
-    max: u32,
-    soft_max: Option<u32>,
-    allow_extreme: bool,
-) -> Result<()> {
-    if value < min || value > max {
-        return Err(Error::OutOfBounds {
-            field: field.into(),
-            value: value.to_string(),
-            bounds: format!("{min}..={max}"),
-        });
-    }
-    if let Some(soft) = soft_max {
-        if value > soft && !allow_extreme {
-            return Err(Error::ExtremeValueBlocked {
-                field: field.into(),
-                value: value.to_string(),
-                threshold: format!("<= {soft}"),
-            });
-        }
-    }
-    Ok(())
-}
-
-enum ApuExecOp {
-    Single(OpcodeSpec, SmuArgs),
-    Dual(DualOpcode, SmuArgs),
-}
-
-impl ApuExecOp {
-    fn primary_mailbox(&self) -> Mailbox {
-        match self {
-            Self::Single(s, _) => s.mailbox,
-            Self::Dual(d, _) => d.primary.mailbox,
-        }
-    }
+fn push_dual_op(
+    planned: &mut Vec<PlannedOp>,
+    exec_ops: &mut Vec<ExecOp>,
+    op: DualOpcode,
+    args: SmuArgs,
+    description: String,
+    target: String,
+) {
+    planned.push(PlannedOp {
+        description,
+        mailbox: op.primary.mailbox,
+        opcode: op.primary.opcode,
+        args,
+        current: None,
+        target,
+    });
+    exec_ops.push(ExecOp::Dual(op, args));
 }
 
 /// Apply mobile APU DPTC power, current, thermal skin, and power-mode settings.
@@ -128,24 +107,15 @@ pub fn set_apu(
                 capability: "set_stapm_limit",
                 codename: codename.clone(),
             })?;
-        validate_range(
-            "stapm_w",
-            stapm_w,
-            APU_POWER_MIN_W,
-            APU_POWER_MAX_W,
-            Some(APU_POWER_SOFT_MAX_W),
-            allow_extreme,
-        )?;
-        let args = [stapm_w.saturating_mul(1000), 0, 0, 0, 0, 0];
-        planned.push(PlannedOp {
-            description: format!("Set APU STAPM limit to {stapm_w} W"),
-            mailbox: op.primary.mailbox,
-            opcode: op.primary.opcode,
-            args,
-            current: None,
-            target: format!("{stapm_w} W"),
-        });
-        exec_ops.push(ApuExecOp::Dual(op, args));
+        bounds::validate_apu_watts("apu.stapm_w", stapm_w, allow_extreme)?;
+        push_dual_op(
+            &mut planned,
+            &mut exec_ops,
+            op,
+            [stapm_w.saturating_mul(1000), 0, 0, 0, 0, 0],
+            format!("Set APU STAPM limit to {stapm_w} W"),
+            format!("{stapm_w} W"),
+        );
     }
 
     if let Some(stapm_time_s) = req.stapm_time_s {
@@ -155,24 +125,15 @@ pub fn set_apu(
                 capability: "set_stapm_time",
                 codename: codename.clone(),
             })?;
-        validate_range(
-            "stapm_time_s",
-            stapm_time_s,
-            APU_TIME_MIN_S,
-            APU_TIME_MAX_S,
-            None,
-            allow_extreme,
-        )?;
-        let args = [stapm_time_s, 0, 0, 0, 0, 0];
-        planned.push(PlannedOp {
-            description: format!("Set APU STAPM time constant to {stapm_time_s} s"),
-            mailbox: op.primary.mailbox,
-            opcode: op.primary.opcode,
-            args,
-            current: None,
-            target: format!("{stapm_time_s} s"),
-        });
-        exec_ops.push(ApuExecOp::Dual(op, args));
+        bounds::validate_apu_time_secs("apu.stapm_time_s", stapm_time_s)?;
+        push_dual_op(
+            &mut planned,
+            &mut exec_ops,
+            op,
+            [stapm_time_s, 0, 0, 0, 0, 0],
+            format!("Set APU STAPM time constant to {stapm_time_s} s"),
+            format!("{stapm_time_s} s"),
+        );
     }
 
     if let Some(fast_w) = req.fast_w {
@@ -186,51 +147,39 @@ pub fn set_apu(
             capability: "set_apu_fast_limit",
             codename: codename.clone(),
         })?;
-        validate_range(
-            "fast_w",
-            fast_w,
-            APU_POWER_MIN_W,
-            APU_POWER_MAX_W,
-            Some(APU_FAST_POWER_SOFT_MAX_W),
-            allow_extreme,
-        )?;
-        let args = [fast_w.saturating_mul(1000), 0, 0, 0, 0, 0];
-        planned.push(PlannedOp {
-            description: format!("Set APU Fast PPT limit to {fast_w} W"),
-            mailbox: op.primary.mailbox,
-            opcode: op.primary.opcode,
-            args,
-            current: None,
-            target: format!("{fast_w} W"),
-        });
-        exec_ops.push(ApuExecOp::Dual(op, args));
+        bounds::validate_apu_fast_watts("apu.fast_w", fast_w, allow_extreme)?;
+        push_dual_op(
+            &mut planned,
+            &mut exec_ops,
+            op,
+            [fast_w.saturating_mul(1000), 0, 0, 0, 0, 0],
+            format!("Set APU Fast PPT limit to {fast_w} W"),
+            format!("{fast_w} W"),
+        );
     }
 
     if let Some(slow_w) = req.slow_w {
+        if !hw.codename.is_apu() {
+            return Err(Error::UnsupportedCapability {
+                capability: "set_slow_limit",
+                codename: codename.clone(),
+            });
+        }
         let op = caps
             .set_slow_limit
             .ok_or_else(|| Error::UnsupportedCapability {
                 capability: "set_slow_limit",
                 codename: codename.clone(),
             })?;
-        validate_range(
-            "slow_w",
-            slow_w,
-            APU_POWER_MIN_W,
-            APU_POWER_MAX_W,
-            Some(APU_POWER_SOFT_MAX_W),
-            allow_extreme,
-        )?;
-        let args = [slow_w.saturating_mul(1000), 0, 0, 0, 0, 0];
-        planned.push(PlannedOp {
-            description: format!("Set APU Slow PPT limit to {slow_w} W"),
-            mailbox: op.primary.mailbox,
-            opcode: op.primary.opcode,
-            args,
-            current: None,
-            target: format!("{slow_w} W"),
-        });
-        exec_ops.push(ApuExecOp::Dual(op, args));
+        bounds::validate_apu_watts("apu.slow_w", slow_w, allow_extreme)?;
+        push_dual_op(
+            &mut planned,
+            &mut exec_ops,
+            op,
+            [slow_w.saturating_mul(1000), 0, 0, 0, 0, 0],
+            format!("Set APU Slow PPT limit to {slow_w} W"),
+            format!("{slow_w} W"),
+        );
     }
 
     if let Some(slow_time_s) = req.slow_time_s {
@@ -240,24 +189,15 @@ pub fn set_apu(
                 capability: "set_slow_time",
                 codename: codename.clone(),
             })?;
-        validate_range(
-            "slow_time_s",
-            slow_time_s,
-            APU_TIME_MIN_S,
-            APU_TIME_MAX_S,
-            None,
-            allow_extreme,
-        )?;
-        let args = [slow_time_s, 0, 0, 0, 0, 0];
-        planned.push(PlannedOp {
-            description: format!("Set APU Slow PPT time constant to {slow_time_s} s"),
-            mailbox: op.primary.mailbox,
-            opcode: op.primary.opcode,
-            args,
-            current: None,
-            target: format!("{slow_time_s} s"),
-        });
-        exec_ops.push(ApuExecOp::Dual(op, args));
+        bounds::validate_apu_time_secs("apu.slow_time_s", slow_time_s)?;
+        push_dual_op(
+            &mut planned,
+            &mut exec_ops,
+            op,
+            [slow_time_s, 0, 0, 0, 0, 0],
+            format!("Set APU Slow PPT time constant to {slow_time_s} s"),
+            format!("{slow_time_s} s"),
+        );
     }
 
     if let Some(apu_slow_w) = req.apu_slow_w {
@@ -267,24 +207,15 @@ pub fn set_apu(
                 capability: "set_apu_slow_limit",
                 codename: codename.clone(),
             })?;
-        validate_range(
-            "apu_slow_w",
-            apu_slow_w,
-            APU_POWER_MIN_W,
-            APU_POWER_MAX_W,
-            Some(APU_POWER_SOFT_MAX_W),
-            allow_extreme,
-        )?;
-        let args = [apu_slow_w.saturating_mul(1000), 0, 0, 0, 0, 0];
-        planned.push(PlannedOp {
-            description: format!("Set APU-only Slow PPT limit to {apu_slow_w} W"),
-            mailbox: op.primary.mailbox,
-            opcode: op.primary.opcode,
-            args,
-            current: None,
-            target: format!("{apu_slow_w} W"),
-        });
-        exec_ops.push(ApuExecOp::Dual(op, args));
+        bounds::validate_apu_watts("apu.apu_slow_w", apu_slow_w, allow_extreme)?;
+        push_dual_op(
+            &mut planned,
+            &mut exec_ops,
+            op,
+            [apu_slow_w.saturating_mul(1000), 0, 0, 0, 0, 0],
+            format!("Set APU-only Slow PPT limit to {apu_slow_w} W"),
+            format!("{apu_slow_w} W"),
+        );
     }
 
     if let Some(tdc_soc_a) = req.tdc_soc_a {
@@ -294,24 +225,15 @@ pub fn set_apu(
                 capability: "set_tdc_soc",
                 codename: codename.clone(),
             })?;
-        validate_range(
-            "tdc_soc_a",
-            tdc_soc_a,
-            APU_SOC_TDC_MIN_A,
-            APU_SOC_TDC_MAX_A,
-            Some(APU_SOC_TDC_SOFT_MAX_A),
-            allow_extreme,
-        )?;
-        let args = [tdc_soc_a.saturating_mul(1000), 0, 0, 0, 0, 0];
-        planned.push(PlannedOp {
-            description: format!("Set APU SoC TDC limit to {tdc_soc_a} A"),
-            mailbox: op.primary.mailbox,
-            opcode: op.primary.opcode,
-            args,
-            current: None,
-            target: format!("{tdc_soc_a} A"),
-        });
-        exec_ops.push(ApuExecOp::Dual(op, args));
+        bounds::validate_apu_soc_tdc_amps("apu.tdc_soc_a", tdc_soc_a, allow_extreme)?;
+        push_dual_op(
+            &mut planned,
+            &mut exec_ops,
+            op,
+            [tdc_soc_a.saturating_mul(1000), 0, 0, 0, 0, 0],
+            format!("Set APU SoC TDC limit to {tdc_soc_a} A"),
+            format!("{tdc_soc_a} A"),
+        );
     }
 
     if let Some(edc_soc_a) = req.edc_soc_a {
@@ -321,24 +243,15 @@ pub fn set_apu(
                 capability: "set_edc_soc",
                 codename: codename.clone(),
             })?;
-        validate_range(
-            "edc_soc_a",
-            edc_soc_a,
-            APU_SOC_EDC_MIN_A,
-            APU_SOC_EDC_MAX_A,
-            Some(APU_SOC_EDC_SOFT_MAX_A),
-            allow_extreme,
-        )?;
-        let args = [edc_soc_a.saturating_mul(1000), 0, 0, 0, 0, 0];
-        planned.push(PlannedOp {
-            description: format!("Set APU SoC EDC limit to {edc_soc_a} A"),
-            mailbox: op.primary.mailbox,
-            opcode: op.primary.opcode,
-            args,
-            current: None,
-            target: format!("{edc_soc_a} A"),
-        });
-        exec_ops.push(ApuExecOp::Dual(op, args));
+        bounds::validate_apu_soc_edc_amps("apu.edc_soc_a", edc_soc_a, allow_extreme)?;
+        push_dual_op(
+            &mut planned,
+            &mut exec_ops,
+            op,
+            [edc_soc_a.saturating_mul(1000), 0, 0, 0, 0, 0],
+            format!("Set APU SoC EDC limit to {edc_soc_a} A"),
+            format!("{edc_soc_a} A"),
+        );
     }
 
     if let Some(apu_skin_temp_c) = req.apu_skin_temp_c {
@@ -348,25 +261,16 @@ pub fn set_apu(
                 capability: "set_apu_skin_temp",
                 codename: codename.clone(),
             })?;
-        validate_range(
-            "apu_skin_temp_c",
-            apu_skin_temp_c,
-            APU_SKIN_TEMP_MIN_C,
-            APU_SKIN_TEMP_MAX_C,
-            Some(APU_SKIN_TEMP_SOFT_MAX_C),
-            allow_extreme,
-        )?;
+        bounds::validate_skin_temp_celsius("apu.apu_skin_temp_c", apu_skin_temp_c, allow_extreme)?;
         // AMD APU skin temp uses Q8.8 fixed-point encoding (temp_c << 8).
-        let args = [apu_skin_temp_c << 8, 0, 0, 0, 0, 0];
-        planned.push(PlannedOp {
-            description: format!("Set APU skin temperature limit to {apu_skin_temp_c} C"),
-            mailbox: op.primary.mailbox,
-            opcode: op.primary.opcode,
-            args,
-            current: None,
-            target: format!("{apu_skin_temp_c} C"),
-        });
-        exec_ops.push(ApuExecOp::Dual(op, args));
+        push_dual_op(
+            &mut planned,
+            &mut exec_ops,
+            op,
+            [apu_skin_temp_c << 8, 0, 0, 0, 0, 0],
+            format!("Set APU skin temperature limit to {apu_skin_temp_c} C"),
+            format!("{apu_skin_temp_c} C"),
+        );
     }
 
     if let Some(dgpu_skin_temp_c) = req.dgpu_skin_temp_c {
@@ -376,24 +280,19 @@ pub fn set_apu(
                 capability: "set_dgpu_skin_temp",
                 codename: codename.clone(),
             })?;
-        validate_range(
-            "dgpu_skin_temp_c",
+        bounds::validate_skin_temp_celsius(
+            "apu.dgpu_skin_temp_c",
             dgpu_skin_temp_c,
-            APU_SKIN_TEMP_MIN_C,
-            APU_SKIN_TEMP_MAX_C,
-            Some(APU_SKIN_TEMP_SOFT_MAX_C),
             allow_extreme,
         )?;
-        let args = [dgpu_skin_temp_c << 8, 0, 0, 0, 0, 0];
-        planned.push(PlannedOp {
-            description: format!("Set dGPU skin temperature limit to {dgpu_skin_temp_c} C"),
-            mailbox: op.primary.mailbox,
-            opcode: op.primary.opcode,
-            args,
-            current: None,
-            target: format!("{dgpu_skin_temp_c} C"),
-        });
-        exec_ops.push(ApuExecOp::Dual(op, args));
+        push_dual_op(
+            &mut planned,
+            &mut exec_ops,
+            op,
+            [dgpu_skin_temp_c << 8, 0, 0, 0, 0, 0],
+            format!("Set dGPU skin temperature limit to {dgpu_skin_temp_c} C"),
+            format!("{dgpu_skin_temp_c} C"),
+        );
     }
 
     if let Some(mode) = req.power_mode {
@@ -420,39 +319,14 @@ pub fn set_apu(
             current: None,
             target: label.into(),
         });
-        exec_ops.push(ApuExecOp::Single(op, args));
+        exec_ops.push(ExecOp::Single(op, args));
     }
 
     if dry_run || exec_ops.is_empty() {
         return Ok(planned);
     }
 
-    let mut checked_rsmu = false;
-    let mut checked_mp1 = false;
-    for op in &exec_ops {
-        match op.primary_mailbox() {
-            Mailbox::Rsmu if !checked_rsmu => {
-                check_mailbox_health(transport, hw, Mailbox::Rsmu)?;
-                checked_rsmu = true;
-            }
-            Mailbox::Mp1 if !checked_mp1 => {
-                check_mailbox_health(transport, hw, Mailbox::Mp1)?;
-                checked_mp1 = true;
-            }
-            _ => {}
-        }
-    }
-
-    for op in exec_ops {
-        match op {
-            ApuExecOp::Single(spec, args) => {
-                send_verified(transport, hw, spec, args)?;
-            }
-            ApuExecOp::Dual(dual, args) => {
-                send_dual_verified(transport, hw, dual, args)?;
-            }
-        }
-    }
+    execute_ops(transport, hw, exec_ops)?;
 
     Ok(planned)
 }

@@ -4,13 +4,15 @@ use crate::doctor::{CheckStatus, DoctorReport};
 use serde::Serialize;
 use zensmu_core::config::profile::ProfileDiffEntry;
 use zensmu_core::error::Error;
-use zensmu_core::hw::identity::{CpuidInfo, HardwareContext, driver_has_false_ok_bug};
+use zensmu_core::hw::identity::{driver_has_false_ok_bug, CpuidInfo, HardwareContext};
 use zensmu_core::hw::profiles::CoBounds;
 use zensmu_core::hw::topology::CpuTopology;
 use zensmu_core::ops::co::{CoSnapshot, CoreCoMargin};
 use zensmu_core::ops::pbo::PboStatus;
 use zensmu_core::ops::pm_table::TelemetrySnapshot;
-use zensmu_core::safety::persist::{DEFAULT_MODULES_LOAD_PATH, DEFAULT_RESUME_HOOK_PATH, PersistStatus};
+use zensmu_core::safety::persist::{
+    PersistStatus, DEFAULT_MODULES_LOAD_PATH, DEFAULT_RESUME_HOOK_PATH,
+};
 use zensmu_core::transport::DriverSysfsInfo;
 use zensmu_core::types::{Codename, CurveShaperState, FreqTier, PlannedOp};
 
@@ -100,6 +102,17 @@ pub struct ActivePboLimits {
     pub tdc_a: Option<f32>,
     pub edc_a: Option<f32>,
     pub tctl_c: Option<f32>,
+}
+
+impl ActivePboLimits {
+    pub fn from_telemetry(t: &TelemetrySnapshot) -> Self {
+        Self {
+            ppt_w: t.ppt_limit_w,
+            tdc_a: t.tdc_limit_a,
+            edc_a: t.edc_limit_a,
+            tctl_c: t.tctl_limit_c,
+        }
+    }
 }
 
 #[derive(Debug, Serialize)]
@@ -256,7 +269,7 @@ pub fn print_error(err: &Error, json: bool) {
 // Human-Readable Formatters
 // ============================================================================
 
-pub fn format_signed_i16(v: i16) -> String {
+fn format_signed(v: i32) -> String {
     if v > 0 {
         format!("+{v}")
     } else {
@@ -264,12 +277,12 @@ pub fn format_signed_i16(v: i16) -> String {
     }
 }
 
+pub fn format_signed_i16(v: i16) -> String {
+    format_signed(i32::from(v))
+}
+
 pub fn format_signed_i8(v: i8) -> String {
-    if v > 0 {
-        format!("+{v}")
-    } else {
-        v.to_string()
-    }
+    format_signed(i32::from(v))
 }
 
 pub fn format_cpu_list(cpus: &[u32]) -> String {
@@ -364,37 +377,35 @@ pub fn print_doctor(report: &DoctorReport) {
     println!();
 
     for check in &report.checks {
-        println!("[{:4}] {}: {}", check.status.tag(), check.name, check.message);
+        println!(
+            "[{:4}] {}: {}",
+            check.status.tag(),
+            check.name,
+            check.message
+        );
         if let Some(ref rem) = check.remediation {
             println!("       -> {rem}");
         }
     }
 
-    let pass = report
-        .checks
-        .iter()
-        .filter(|c| c.status == CheckStatus::Pass)
-        .count();
-    let warn = report
-        .checks
-        .iter()
-        .filter(|c| c.status == CheckStatus::Warn)
-        .count();
-    let fail = report
-        .checks
-        .iter()
-        .filter(|c| c.status == CheckStatus::Fail)
-        .count();
-    let skip = report
-        .checks
-        .iter()
-        .filter(|c| c.status == CheckStatus::Skip)
-        .count();
+    let (mut pass, mut warn, mut fail, mut skip) = (0usize, 0usize, 0usize, 0usize);
+    for check in &report.checks {
+        match check.status {
+            CheckStatus::Pass => pass += 1,
+            CheckStatus::Warn => warn += 1,
+            CheckStatus::Fail => fail += 1,
+            CheckStatus::Skip => skip += 1,
+        }
+    }
 
     println!();
     println!(
         "Summary: {} ({pass} passed, {warn} warnings, {fail} failed, {skip} skipped)",
-        if report.healthy { "HEALTHY" } else { "ISSUES DETECTED" }
+        if report.healthy {
+            "HEALTHY"
+        } else {
+            "ISSUES DETECTED"
+        }
     );
 }
 
@@ -441,22 +452,16 @@ pub fn print_shaper_matrix(shaper: &CurveShaperState, codename: Codename) {
 }
 
 pub fn print_pbo_status(out: &PboGetOutput) {
-    println!("Precision Boost Overdrive ({})", out.codename.display_name());
+    println!(
+        "Precision Boost Overdrive ({})",
+        out.codename.display_name()
+    );
     println!("==========================================");
 
     println!("Active Limits (PM Table):");
-    println!(
-        "  PPT   : {}",
-        fmt_opt_f32(out.active_limits.ppt_w, 1, "W")
-    );
-    println!(
-        "  TDC   : {}",
-        fmt_opt_f32(out.active_limits.tdc_a, 1, "A")
-    );
-    println!(
-        "  EDC   : {}",
-        fmt_opt_f32(out.active_limits.edc_a, 1, "A")
-    );
+    println!("  PPT   : {}", fmt_opt_f32(out.active_limits.ppt_w, 1, "W"));
+    println!("  TDC   : {}", fmt_opt_f32(out.active_limits.tdc_a, 1, "A"));
+    println!("  EDC   : {}", fmt_opt_f32(out.active_limits.edc_a, 1, "A"));
     println!(
         "  Tctl  : {}",
         fmt_opt_f32(out.active_limits.tctl_c, 1, "°C")
@@ -521,21 +526,9 @@ pub fn print_pbo_status(out: &PboGetOutput) {
     }
 }
 
-pub fn format_telemetry(t: &TelemetrySnapshot) -> String {
-    use std::fmt::Write as _;
-
-    let mut out = String::new();
-    let _ = writeln!(
-        out,
-        "Telemetry — {} (PM Table 0x{:08X}, {} bytes)",
-        t.codename.display_name(),
-        t.table_version,
-        t.table_size
-    );
-    let _ = writeln!(out, "============================================================");
-    let _ = writeln!(out, "Power & Thermals:");
-
-    let has_apu_fields = t.stapm_value_w.is_some()
+/// Returns `true` when any mobile APU DPTC telemetry field is populated.
+pub(crate) fn has_apu_telemetry(t: &TelemetrySnapshot) -> bool {
+    t.stapm_value_w.is_some()
         || t.stapm_limit_w.is_some()
         || t.slow_value_w.is_some()
         || t.slow_limit_w.is_some()
@@ -548,111 +541,85 @@ pub fn format_telemetry(t: &TelemetrySnapshot) -> String {
         || t.apu_skin_temp_value_c.is_some()
         || t.apu_skin_temp_limit_c.is_some()
         || t.dgpu_skin_temp_value_c.is_some()
-        || t.dgpu_skin_temp_limit_c.is_some();
+        || t.dgpu_skin_temp_limit_c.is_some()
+}
 
-    let w = if has_apu_fields { 9 } else { 5 };
-    if t.stapm_value_w.is_some() || t.stapm_limit_w.is_some() {
-        let _ = writeln!(
-            out,
-            "  {:<w$} : {}",
-            "STAPM",
-            fmt_ratio(t.stapm_value_w, t.stapm_limit_w, "W")
-        );
-    }
+pub fn format_telemetry(t: &TelemetrySnapshot) -> String {
+    use std::fmt::Write as _;
+
+    let mut out = String::new();
     let _ = writeln!(
         out,
-        "  {:<w$} : {}",
-        "PPT",
-        fmt_ratio(t.ppt_value_w, t.ppt_limit_w, "W")
+        "Telemetry — {} (PM Table 0x{:08X}, {} bytes)",
+        t.codename.display_name(),
+        t.table_version,
+        t.table_size
     );
-    if t.slow_value_w.is_some() || t.slow_limit_w.is_some() {
-        let _ = writeln!(
-            out,
-            "  {:<w$} : {}",
-            "Slow PPT",
-            fmt_ratio(t.slow_value_w, t.slow_limit_w, "W")
-        );
-    }
-    if t.apu_slow_value_w.is_some() || t.apu_slow_limit_w.is_some() {
-        let _ = writeln!(
-            out,
-            "  {:<w$} : {}",
+    let _ = writeln!(
+        out,
+        "============================================================"
+    );
+    let _ = writeln!(out, "Power & Thermals:");
+
+    let w = if has_apu_telemetry(t) { 9 } else { 5 };
+    let power_thermal_rows = [
+        ("STAPM", t.stapm_value_w, t.stapm_limit_w, "W", false),
+        ("PPT", t.ppt_value_w, t.ppt_limit_w, "W", true),
+        ("Slow PPT", t.slow_value_w, t.slow_limit_w, "W", false),
+        (
             "APU Slow",
-            fmt_ratio(t.apu_slow_value_w, t.apu_slow_limit_w, "W")
-        );
-    }
-    let _ = writeln!(
-        out,
-        "  {:<w$} : {}",
-        "TDC",
-        fmt_ratio(t.tdc_value_a, t.tdc_limit_a, "A")
-    );
-    if t.tdc_soc_value_a.is_some() || t.tdc_soc_limit_a.is_some() {
-        let _ = writeln!(
-            out,
-            "  {:<w$} : {}",
-            "SoC TDC",
-            fmt_ratio(t.tdc_soc_value_a, t.tdc_soc_limit_a, "A")
-        );
-    }
-    let _ = writeln!(
-        out,
-        "  {:<w$} : {}",
-        "EDC",
-        fmt_ratio(t.edc_value_a, t.edc_limit_a, "A")
-    );
-    if t.edc_soc_value_a.is_some() || t.edc_soc_limit_a.is_some() {
-        let _ = writeln!(
-            out,
-            "  {:<w$} : {}",
-            "SoC EDC",
-            fmt_ratio(t.edc_soc_value_a, t.edc_soc_limit_a, "A")
-        );
-    }
-    let _ = writeln!(
-        out,
-        "  {:<w$} : {}",
-        "Tctl",
-        fmt_ratio(t.tctl_value_c, t.tctl_limit_c, "°C")
-    );
-    if t.apu_skin_temp_value_c.is_some() || t.apu_skin_temp_limit_c.is_some() {
-        let _ = writeln!(
-            out,
-            "  {:<w$} : {}",
+            t.apu_slow_value_w,
+            t.apu_slow_limit_w,
+            "W",
+            false,
+        ),
+        ("TDC", t.tdc_value_a, t.tdc_limit_a, "A", true),
+        ("SoC TDC", t.tdc_soc_value_a, t.tdc_soc_limit_a, "A", false),
+        ("EDC", t.edc_value_a, t.edc_limit_a, "A", true),
+        ("SoC EDC", t.edc_soc_value_a, t.edc_soc_limit_a, "A", false),
+        ("Tctl", t.tctl_value_c, t.tctl_limit_c, "°C", true),
+        (
             "APU Skin",
-            fmt_ratio(t.apu_skin_temp_value_c, t.apu_skin_temp_limit_c, "°C")
-        );
-    }
-    if t.dgpu_skin_temp_value_c.is_some() || t.dgpu_skin_temp_limit_c.is_some() {
-        let _ = writeln!(
-            out,
-            "  {:<w$} : {}",
+            t.apu_skin_temp_value_c,
+            t.apu_skin_temp_limit_c,
+            "°C",
+            false,
+        ),
+        (
             "dGPU Skin",
-            fmt_ratio(t.dgpu_skin_temp_value_c, t.dgpu_skin_temp_limit_c, "°C")
-        );
+            t.dgpu_skin_temp_value_c,
+            t.dgpu_skin_temp_limit_c,
+            "°C",
+            false,
+        ),
+    ];
+    for (label, val, lim, unit, always_show) in power_thermal_rows {
+        if always_show || val.is_some() || lim.is_some() {
+            let _ = writeln!(out, "  {label:<w$} : {}", fmt_ratio(val, lim, unit));
+        }
     }
 
     let _ = writeln!(out);
     let _ = writeln!(out, "Fabric & Memory Clocks:");
-    let _ = writeln!(out, "  FCLK  : {}", fmt_opt_f32(t.fclk_mhz, 1, "MHz"));
-    let _ = writeln!(out, "  UCLK  : {}", fmt_opt_f32(t.uclk_mhz, 1, "MHz"));
-    let _ = writeln!(out, "  MCLK  : {}", fmt_opt_f32(t.mclk_mhz, 1, "MHz"));
+    for (label, val) in [
+        ("FCLK", t.fclk_mhz),
+        ("UCLK", t.uclk_mhz),
+        ("MCLK", t.mclk_mhz),
+    ] {
+        let _ = writeln!(out, "  {label:<5} : {}", fmt_opt_f32(val, 1, "MHz"));
+    }
 
     let _ = writeln!(out);
     let _ = writeln!(out, "Voltages:");
-    let _ = writeln!(out, "  VDDCR_SOC     : {}", fmt_opt_f32(t.vddcr_soc_v, 4, "V"));
-    let _ = writeln!(out, "  VDDCR_MISC    : {}", fmt_opt_f32(t.vddcr_misc_v, 4, "V"));
-    let _ = writeln!(out, "  CLDO_VDDP     : {}", fmt_opt_f32(t.cldo_vddp_v, 4, "V"));
-    let _ = writeln!(
-        out,
-        "  CLDO_VDDG_IOD : {}",
-        fmt_opt_f32(t.cldo_vddg_iod_v, 4, "V")
-    );
-    let _ = writeln!(
-        out,
-        "  CLDO_VDDG_CCD : {}",
-        fmt_opt_f32(t.cldo_vddg_ccd_v, 4, "V")
-    );
+    for (label, val) in [
+        ("VDDCR_SOC", t.vddcr_soc_v),
+        ("VDDCR_MISC", t.vddcr_misc_v),
+        ("CLDO_VDDP", t.cldo_vddp_v),
+        ("CLDO_VDDG_IOD", t.cldo_vddg_iod_v),
+        ("CLDO_VDDG_CCD", t.cldo_vddg_ccd_v),
+    ] {
+        let _ = writeln!(out, "  {label:<13} : {}", fmt_opt_f32(val, 4, "V"));
+    }
     out
 }
 
@@ -703,9 +670,7 @@ pub fn print_status(status: &StatusOutput) {
         println!();
         if err.contains("UNKNOWN_CMD (0xFE)") || err.contains("CMD_REJECTED_PREREQ (0xFD)") {
             let code = if err.contains("0xFE") { "0xFE" } else { "0xFD" };
-            println!(
-                "Curve Shaper    : not exposed by BIOS / SMU firmware ({code})"
-            );
+            println!("Curve Shaper    : not exposed by BIOS / SMU firmware ({code})");
         } else {
             println!("Curve Shaper    : unavailable ({err})");
         }
@@ -716,12 +681,7 @@ pub fn print_status(status: &StatusOutput) {
         let active_limits = status
             .telemetry
             .as_ref()
-            .map(|t| ActivePboLimits {
-                ppt_w: t.ppt_limit_w,
-                tdc_a: t.tdc_limit_a,
-                edc_a: t.edc_limit_a,
-                tctl_c: t.tctl_limit_c,
-            })
+            .map(ActivePboLimits::from_telemetry)
             .unwrap_or_default();
         print_pbo_status(&PboGetOutput {
             codename: status.codename,
@@ -759,7 +719,11 @@ pub fn print_planned_ops(ops: &[PlannedOp], header: &str) {
 
 pub fn print_mutation(out: &MutationOutput) {
     let header = if out.dry_run {
-        format!("[DRY-RUN] {} ({} planned operation(s)):", out.action, out.operations.len())
+        format!(
+            "[DRY-RUN] {} ({} planned operation(s)):",
+            out.action,
+            out.operations.len()
+        )
     } else if out.rolled_back {
         format!(
             "[ROLLED BACK] {} ({} operation(s) reverted):",

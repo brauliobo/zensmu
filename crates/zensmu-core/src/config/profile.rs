@@ -1,25 +1,24 @@
 //! Declarative TOML tuning profiles with target validation and state diffing.
 
 use crate::error::{Error, Result};
-use crate::hw::profiles::capabilities_for;
+use crate::hw::profiles::{capabilities_for, CpuCapabilities};
 use crate::safety::bounds::{
-    validate_apu_watts, validate_co_margin, validate_edc_amps, validate_fmax_mhz,
-    validate_pbo_scalar, validate_ppt_watts, validate_shaper_margin, validate_skin_temp_celsius,
-    validate_tctl_celsius, validate_tdc_amps,
+    validate_apu_fast_watts, validate_apu_soc_edc_amps, validate_apu_soc_tdc_amps,
+    validate_apu_time_secs, validate_apu_watts, validate_co_margin, validate_edc_amps,
+    validate_fmax_mhz, validate_igpu_co_margin, validate_pbo_scalar_checked, validate_ppt_watts,
+    validate_shaper_margin, validate_skin_temp_celsius, validate_tctl_celsius, validate_tdc_amps,
+    PBO_SCALAR_MAX, PBO_SCALAR_MIN,
 };
 use crate::safety::snapshot::SmuStateSnapshot;
+use crate::safety::{map_io_err, write_atomic};
 use crate::types::{ApuPowerMode, Codename, FreqTier};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
-use std::fs::{self, File};
-use std::io::{ErrorKind, Write};
+use std::fs;
 use std::path::Path;
-use std::sync::atomic::{AtomicU64, Ordering};
 
 /// Current profile TOML schema version.
 pub const PROFILE_SCHEMA_VERSION: u32 = 1;
-
-static PROFILE_TMP_SEQ: AtomicU64 = AtomicU64::new(0);
 
 /// Declarative Ryzen SMU tuning profile (serialized as TOML).
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
@@ -139,38 +138,10 @@ impl Profile {
         toml::to_string_pretty(self).map_err(|e| Error::Serde(e.to_string()))
     }
 
-    /// Atomically save this profile to disk as TOML (write temp + sync + rename).
+    /// Atomically save this profile to disk as TOML (write temp + sync + rename + dir sync).
     pub fn save(&self, path: &Path) -> Result<()> {
         let content = self.to_toml_string()?;
-        let parent = path
-            .parent()
-            .filter(|p| !p.as_os_str().is_empty())
-            .unwrap_or_else(|| Path::new("."));
-        fs::create_dir_all(parent).map_err(|e| map_io_err(parent, e))?;
-
-        let seq = PROFILE_TMP_SEQ.fetch_add(1, Ordering::Relaxed);
-        let pid = std::process::id();
-        let file_name = path
-            .file_name()
-            .and_then(|n| n.to_str())
-            .unwrap_or("profile.toml");
-        let tmp_path = parent.join(format!(".{file_name}.{pid}.{seq}.tmp"));
-
-        let mut file = File::create(&tmp_path).map_err(|e| map_io_err(&tmp_path, e))?;
-        if let Err(e) = file
-            .write_all(content.as_bytes())
-            .and_then(|()| file.sync_all())
-        {
-            let _ = fs::remove_file(&tmp_path);
-            return Err(map_io_err(&tmp_path, e));
-        }
-        drop(file);
-
-        fs::rename(&tmp_path, path).map_err(|e| {
-            let _ = fs::remove_file(&tmp_path);
-            map_io_err(path, e)
-        })?;
-        Ok(())
+        write_atomic(path, content.as_bytes())
     }
 
     /// Validate schema, target hardware match, capability support, core indices, and safety bounds.
@@ -217,20 +188,20 @@ impl Profile {
                 })?;
 
                 if let Some(all_margin) = co.all {
-                    if caps.set_co_all_cores.is_none() && caps.set_co_per_core.is_none() {
-                        return Err(Error::UnsupportedCapability {
-                            capability: "curve_optimizer",
-                            codename: codename.to_string(),
-                        });
-                    }
+                    require_cap(
+                        caps.set_co_all_cores.is_some() || caps.set_co_per_core.is_some(),
+                        "curve_optimizer",
+                        codename,
+                    )?;
                     validate_co_margin("curve_optimizer.all", all_margin, bounds, allow_extreme)?;
                 }
 
-                if !co.per_core.is_empty() && caps.set_co_per_core.is_none() {
-                    return Err(Error::UnsupportedCapability {
-                        capability: "curve_optimizer_per_core",
-                        codename: codename.to_string(),
-                    });
+                if !co.per_core.is_empty() {
+                    require_cap(
+                        caps.set_co_per_core.is_some(),
+                        "curve_optimizer_per_core",
+                        codename,
+                    )?;
                 }
 
                 for (&core_idx, &margin) in &co.per_core {
@@ -250,13 +221,8 @@ impl Profile {
                 }
 
                 if let Some(igpu_margin) = co.igpu {
-                    if caps.set_igpu_co.is_none() {
-                        return Err(Error::UnsupportedCapability {
-                            capability: "igpu_co",
-                            codename: codename.to_string(),
-                        });
-                    }
-                    validate_co_margin("curve_optimizer.igpu", igpu_margin, bounds, allow_extreme)?;
+                    require_cap(caps.set_igpu_co.is_some(), "igpu_co", codename)?;
+                    validate_igpu_co_margin("curve_optimizer.igpu", igpu_margin, allow_extreme)?;
                 }
             }
         }
@@ -266,33 +232,20 @@ impl Profile {
                 .values()
                 .any(|t| t.low.is_some() || t.med.is_some() || t.high.is_some());
             if has_any_shaper {
-                if caps.set_curve_shaper.is_none() {
-                    return Err(Error::UnsupportedCapability {
-                        capability: "curve_shaper",
-                        codename: codename.to_string(),
-                    });
-                }
+                require_cap(caps.set_curve_shaper.is_some(), "curve_shaper", codename)?;
                 for (&tier, margins) in shaper {
-                    if let Some(v) = margins.low {
-                        validate_shaper_margin(
-                            &format!("curve_shaper.{}.low", tier.label()),
-                            i32::from(v),
-                            allow_extreme,
-                        )?;
-                    }
-                    if let Some(v) = margins.med {
-                        validate_shaper_margin(
-                            &format!("curve_shaper.{}.med", tier.label()),
-                            i32::from(v),
-                            allow_extreme,
-                        )?;
-                    }
-                    if let Some(v) = margins.high {
-                        validate_shaper_margin(
-                            &format!("curve_shaper.{}.high", tier.label()),
-                            i32::from(v),
-                            allow_extreme,
-                        )?;
+                    for (band, val) in [
+                        ("low", margins.low),
+                        ("med", margins.med),
+                        ("high", margins.high),
+                    ] {
+                        if let Some(v) = val {
+                            validate_shaper_margin(
+                                &format!("curve_shaper.{}.{band}", tier.label()),
+                                i32::from(v),
+                                allow_extreme,
+                            )?;
+                        }
                     }
                 }
             }
@@ -300,219 +253,94 @@ impl Profile {
 
         if let Some(pbo) = &self.pbo {
             if let Some(ppt) = pbo.ppt_w {
-                if caps.set_ppt.is_none() {
-                    return Err(Error::UnsupportedCapability {
-                        capability: "pbo_ppt",
-                        codename: codename.to_string(),
-                    });
-                }
+                require_cap(caps.set_ppt.is_some(), "pbo_ppt", codename)?;
                 validate_ppt_watts(ppt, allow_extreme)?;
             }
             if let Some(tdc) = pbo.tdc_a {
-                if caps.set_tdc.is_none() {
-                    return Err(Error::UnsupportedCapability {
-                        capability: "pbo_tdc",
-                        codename: codename.to_string(),
-                    });
-                }
+                require_cap(caps.set_tdc.is_some(), "pbo_tdc", codename)?;
                 validate_tdc_amps(tdc, allow_extreme)?;
             }
             if let Some(edc) = pbo.edc_a {
-                if caps.set_edc.is_none() {
-                    return Err(Error::UnsupportedCapability {
-                        capability: "pbo_edc",
-                        codename: codename.to_string(),
-                    });
-                }
+                require_cap(caps.set_edc.is_some(), "pbo_edc", codename)?;
                 validate_edc_amps(edc, allow_extreme)?;
             }
             if let Some(tctl) = pbo.tctl_c {
-                if caps.set_tctl.is_none() {
-                    return Err(Error::UnsupportedCapability {
-                        capability: "pbo_tctl",
-                        codename: codename.to_string(),
-                    });
-                }
+                require_cap(caps.set_tctl.is_some(), "pbo_tctl", codename)?;
                 validate_tctl_celsius(tctl, allow_extreme)?;
             }
             if let Some(scalar) = pbo.scalar {
-                if caps.set_pbo_scalar.is_none() {
-                    return Err(Error::UnsupportedCapability {
-                        capability: "pbo_scalar",
-                        codename: codename.to_string(),
-                    });
-                }
-                validate_pbo_scalar(scalar)?;
+                require_cap(caps.set_pbo_scalar.is_some(), "pbo_scalar", codename)?;
+                validate_pbo_scalar_checked(scalar, allow_extreme)?;
             }
             if let Some(fmax) = pbo.fmax_mhz {
-                if caps.set_fmax.is_none() {
-                    return Err(Error::UnsupportedCapability {
-                        capability: "fmax_boost_limit",
-                        codename: codename.to_string(),
-                    });
-                }
+                require_cap(caps.set_fmax.is_some(), "fmax_boost_limit", codename)?;
                 validate_fmax_mhz(fmax, allow_extreme)?;
             }
         }
 
         if let Some(apu) = &self.apu {
             if let Some(w) = apu.stapm_w {
-                if caps.set_stapm_limit.is_none() {
-                    return Err(Error::UnsupportedCapability {
-                        capability: "apu_stapm",
-                        codename: codename.to_string(),
-                    });
-                }
+                require_cap(caps.set_stapm_limit.is_some(), "apu_stapm", codename)?;
                 validate_apu_watts("apu.stapm_w", w, allow_extreme)?;
             }
             if let Some(w) = apu.fast_w {
-                if !codename.is_apu() || caps.set_ppt.is_none() {
-                    return Err(Error::UnsupportedCapability {
-                        capability: "apu_fast_limit",
-                        codename: codename.to_string(),
-                    });
-                }
-                validate_apu_watts("apu.fast_w", w, allow_extreme)?;
+                require_cap(
+                    codename.is_apu() && caps.set_ppt.is_some(),
+                    "apu_fast_limit",
+                    codename,
+                )?;
+                validate_apu_fast_watts("apu.fast_w", w, allow_extreme)?;
             }
             if let Some(w) = apu.slow_w {
-                if !codename.is_apu() || caps.set_slow_limit.is_none() {
-                    return Err(Error::UnsupportedCapability {
-                        capability: "apu_slow_limit",
-                        codename: codename.to_string(),
-                    });
-                }
+                require_cap(
+                    codename.is_apu() && caps.set_slow_limit.is_some(),
+                    "apu_slow_limit",
+                    codename,
+                )?;
                 validate_apu_watts("apu.slow_w", w, allow_extreme)?;
             }
             if let Some(w) = apu.apu_slow_w {
-                if caps.set_apu_slow_limit.is_none() {
-                    return Err(Error::UnsupportedCapability {
-                        capability: "apu_slow_limit",
-                        codename: codename.to_string(),
-                    });
-                }
+                require_cap(
+                    caps.set_apu_slow_limit.is_some(),
+                    "apu_slow_limit",
+                    codename,
+                )?;
                 validate_apu_watts("apu.apu_slow_w", w, allow_extreme)?;
             }
             if let Some(s) = apu.stapm_time_s {
-                if caps.set_stapm_time.is_none() {
-                    return Err(Error::UnsupportedCapability {
-                        capability: "apu_stapm_time",
-                        codename: codename.to_string(),
-                    });
-                }
-                if !(crate::ops::apu::APU_TIME_MIN_S..=crate::ops::apu::APU_TIME_MAX_S).contains(&s)
-                {
-                    return Err(Error::OutOfBounds {
-                        field: "apu.stapm_time_s".into(),
-                        value: s.to_string(),
-                        bounds: format!(
-                            "{}..={}",
-                            crate::ops::apu::APU_TIME_MIN_S,
-                            crate::ops::apu::APU_TIME_MAX_S
-                        ),
-                    });
-                }
+                require_cap(caps.set_stapm_time.is_some(), "apu_stapm_time", codename)?;
+                validate_apu_time_secs("apu.stapm_time_s", s)?;
             }
             if let Some(s) = apu.slow_time_s {
-                if caps.set_slow_time.is_none() {
-                    return Err(Error::UnsupportedCapability {
-                        capability: "apu_slow_time",
-                        codename: codename.to_string(),
-                    });
-                }
-                if !(crate::ops::apu::APU_TIME_MIN_S..=crate::ops::apu::APU_TIME_MAX_S).contains(&s)
-                {
-                    return Err(Error::OutOfBounds {
-                        field: "apu.slow_time_s".into(),
-                        value: s.to_string(),
-                        bounds: format!(
-                            "{}..={}",
-                            crate::ops::apu::APU_TIME_MIN_S,
-                            crate::ops::apu::APU_TIME_MAX_S
-                        ),
-                    });
-                }
+                require_cap(caps.set_slow_time.is_some(), "apu_slow_time", codename)?;
+                validate_apu_time_secs("apu.slow_time_s", s)?;
             }
             if let Some(a) = apu.tdc_soc_a {
-                if caps.set_tdc_soc.is_none() {
-                    return Err(Error::UnsupportedCapability {
-                        capability: "apu_tdc_soc",
-                        codename: codename.to_string(),
-                    });
-                }
-                if !(crate::ops::apu::APU_SOC_TDC_MIN_A..=crate::ops::apu::APU_SOC_TDC_MAX_A)
-                    .contains(&a)
-                {
-                    return Err(Error::OutOfBounds {
-                        field: "apu.tdc_soc_a".into(),
-                        value: a.to_string(),
-                        bounds: format!(
-                            "{}..={}",
-                            crate::ops::apu::APU_SOC_TDC_MIN_A,
-                            crate::ops::apu::APU_SOC_TDC_MAX_A
-                        ),
-                    });
-                }
-                if a > crate::ops::apu::APU_SOC_TDC_SOFT_MAX_A && !allow_extreme {
-                    return Err(Error::ExtremeValueBlocked {
-                        field: "apu.tdc_soc_a".into(),
-                        value: format!("{a}A"),
-                        threshold: format!("<= {}A", crate::ops::apu::APU_SOC_TDC_SOFT_MAX_A),
-                    });
-                }
+                require_cap(caps.set_tdc_soc.is_some(), "apu_tdc_soc", codename)?;
+                validate_apu_soc_tdc_amps("apu.tdc_soc_a", a, allow_extreme)?;
             }
             if let Some(a) = apu.edc_soc_a {
-                if caps.set_edc_soc.is_none() {
-                    return Err(Error::UnsupportedCapability {
-                        capability: "apu_edc_soc",
-                        codename: codename.to_string(),
-                    });
-                }
-                if !(crate::ops::apu::APU_SOC_EDC_MIN_A..=crate::ops::apu::APU_SOC_EDC_MAX_A)
-                    .contains(&a)
-                {
-                    return Err(Error::OutOfBounds {
-                        field: "apu.edc_soc_a".into(),
-                        value: a.to_string(),
-                        bounds: format!(
-                            "{}..={}",
-                            crate::ops::apu::APU_SOC_EDC_MIN_A,
-                            crate::ops::apu::APU_SOC_EDC_MAX_A
-                        ),
-                    });
-                }
-                if a > crate::ops::apu::APU_SOC_EDC_SOFT_MAX_A && !allow_extreme {
-                    return Err(Error::ExtremeValueBlocked {
-                        field: "apu.edc_soc_a".into(),
-                        value: format!("{a}A"),
-                        threshold: format!("<= {}A", crate::ops::apu::APU_SOC_EDC_SOFT_MAX_A),
-                    });
-                }
+                require_cap(caps.set_edc_soc.is_some(), "apu_edc_soc", codename)?;
+                validate_apu_soc_edc_amps("apu.edc_soc_a", a, allow_extreme)?;
             }
             if let Some(c) = apu.apu_skin_temp_c {
-                if caps.set_apu_skin_temp.is_none() {
-                    return Err(Error::UnsupportedCapability {
-                        capability: "apu_skin_temp",
-                        codename: codename.to_string(),
-                    });
-                }
+                require_cap(caps.set_apu_skin_temp.is_some(), "apu_skin_temp", codename)?;
                 validate_skin_temp_celsius("apu.apu_skin_temp_c", c, allow_extreme)?;
             }
             if let Some(c) = apu.dgpu_skin_temp_c {
-                if caps.set_dgpu_skin_temp.is_none() {
-                    return Err(Error::UnsupportedCapability {
-                        capability: "dgpu_skin_temp",
-                        codename: codename.to_string(),
-                    });
-                }
+                require_cap(
+                    caps.set_dgpu_skin_temp.is_some(),
+                    "dgpu_skin_temp",
+                    codename,
+                )?;
                 validate_skin_temp_celsius("apu.dgpu_skin_temp_c", c, allow_extreme)?;
             }
-            if apu.power_mode.is_some()
-                && (caps.set_max_performance.is_none() || caps.set_power_saving.is_none())
-            {
-                return Err(Error::UnsupportedCapability {
-                    capability: "apu_power_mode",
-                    codename: codename.to_string(),
-                });
+            if let Some(mode) = apu.power_mode {
+                let supported = match mode {
+                    ApuPowerMode::MaxPerformance => caps.set_max_performance.is_some(),
+                    ApuPowerMode::PowerSaving => caps.set_power_saving.is_some(),
+                };
+                require_cap(supported, "apu_power_mode", codename)?;
             }
         }
 
@@ -522,38 +350,25 @@ impl Profile {
     /// Construct a declarative profile from a captured hardware [`SmuStateSnapshot`].
     ///
     /// Only fields that are actually writable on `snap.codename` (according to
-    /// [`capabilities_for`]) are included, so read-only telemetry/queries such as
-    /// `fmax_mhz` on Zen 2/3 or Lucienne never fail validation or apply.
+    /// [`capabilities_for`]) and contain valid non-zero values are included, so
+    /// read-only telemetry/queries such as `fmax_mhz` on Zen 2/3 or Lucienne
+    /// never fail validation or apply.
     pub fn from_snapshot(snap: &SmuStateSnapshot) -> Self {
         let caps = capabilities_for(snap.codename);
-        let can_set_co = caps
-            .as_ref()
-            .map(|c| c.set_co_per_core.is_some())
-            .unwrap_or(true);
-        let can_set_igpu = caps
-            .as_ref()
-            .map(|c| c.set_igpu_co.is_some())
-            .unwrap_or(true);
-        let can_set_shaper = caps
-            .as_ref()
-            .map(|c| c.set_curve_shaper.is_some())
-            .unwrap_or(true);
-        let can_set_ppt = caps.as_ref().map(|c| c.set_ppt.is_some()).unwrap_or(true);
-        let can_set_tdc = caps.as_ref().map(|c| c.set_tdc.is_some()).unwrap_or(true);
-        let can_set_edc = caps.as_ref().map(|c| c.set_edc.is_some()).unwrap_or(true);
-        let can_set_tctl = caps.as_ref().map(|c| c.set_tctl.is_some()).unwrap_or(true);
-        let can_set_scalar = caps
-            .as_ref()
-            .map(|c| c.set_pbo_scalar.is_some())
-            .unwrap_or(true);
-        let can_set_fmax = caps.as_ref().map(|c| c.set_fmax.is_some()).unwrap_or(true);
-
-        let co_cores = if can_set_co {
-            snap.co_per_core.as_ref()
-        } else {
-            None
+        let can = |f: fn(&CpuCapabilities) -> bool| caps.as_ref().is_some_and(f);
+        let cap_pos = |val: Option<u32>, f: fn(&CpuCapabilities) -> bool| {
+            if can(f) {
+                val.filter(|&v| v > 0)
+            } else {
+                None
+            }
         };
-        let igpu = if can_set_igpu {
+
+        let co_cores = snap
+            .co_per_core
+            .as_deref()
+            .filter(|cores| can(|c| c.set_co_per_core.is_some()) && !cores.is_empty());
+        let igpu = if can(|c| c.set_igpu_co.is_some()) {
             snap.igpu_co.map(i32::from)
         } else {
             None
@@ -575,7 +390,7 @@ impl Profile {
             None
         };
 
-        let curve_shaper = if can_set_shaper {
+        let curve_shaper = if can(|c| c.set_curve_shaper.is_some()) {
             snap.curve_shaper.map(|cs| {
                 let mut map = BTreeMap::new();
                 for tier in FreqTier::ALL {
@@ -595,22 +410,19 @@ impl Profile {
             None
         };
 
-        let ppt_w = if can_set_ppt { snap.ppt_w } else { None };
-        let tdc_a = if can_set_tdc { snap.tdc_a } else { None };
-        let edc_a = if can_set_edc { snap.edc_a } else { None };
-        let tctl_c = if can_set_tctl { snap.tctl_c } else { None };
-        let scalar = if can_set_scalar {
-            snap.pbo_scalar.and_then(|s| {
-                if s.is_finite() && s >= 1.0 {
-                    Some(s.round() as u32)
-                } else {
-                    None
-                }
-            })
+        let ppt_w = cap_pos(snap.ppt_w, |c| c.set_ppt.is_some());
+        let tdc_a = cap_pos(snap.tdc_a, |c| c.set_tdc.is_some());
+        let edc_a = cap_pos(snap.edc_a, |c| c.set_edc.is_some());
+        let tctl_c = cap_pos(snap.tctl_c, |c| c.set_tctl.is_some());
+        let scalar = if can(|c| c.set_pbo_scalar.is_some()) {
+            snap.pbo_scalar
+                .filter(|s| s.is_finite() && *s >= PBO_SCALAR_MIN as f32)
+                .map(|s| s.round() as u32)
+                .filter(|s| (PBO_SCALAR_MIN..=PBO_SCALAR_MAX).contains(s))
         } else {
             None
         };
-        let fmax_mhz = if can_set_fmax { snap.fmax_mhz } else { None };
+        let fmax_mhz = cap_pos(snap.fmax_mhz, |c| c.set_fmax.is_some());
 
         let pbo = if ppt_w.is_some()
             || tdc_a.is_some()
@@ -631,63 +443,15 @@ impl Profile {
             None
         };
 
-        let can_set_stapm = caps
-            .as_ref()
-            .map(|c| c.set_stapm_limit.is_some())
-            .unwrap_or(false);
-        let can_set_slow = caps
-            .as_ref()
-            .map(|c| c.set_slow_limit.is_some())
-            .unwrap_or(false);
-        let can_set_apu_slow = caps
-            .as_ref()
-            .map(|c| c.set_apu_slow_limit.is_some())
-            .unwrap_or(false);
-        let can_set_tdc_soc = caps
-            .as_ref()
-            .map(|c| c.set_tdc_soc.is_some())
-            .unwrap_or(false);
-        let can_set_edc_soc = caps
-            .as_ref()
-            .map(|c| c.set_edc_soc.is_some())
-            .unwrap_or(false);
-        let can_set_apu_skin = caps
-            .as_ref()
-            .map(|c| c.set_apu_skin_temp.is_some())
-            .unwrap_or(false);
-        let can_set_dgpu_skin = caps
-            .as_ref()
-            .map(|c| c.set_dgpu_skin_temp.is_some())
-            .unwrap_or(false);
-
         let apu = if snap.codename.is_apu() {
-            let stapm_w = if can_set_stapm { snap.stapm_w } else { None };
-            let slow_w = if can_set_slow { snap.slow_w } else { None };
-            let apu_slow_w = if can_set_apu_slow {
-                snap.apu_slow_w
-            } else {
-                None
-            };
-            let tdc_soc_a = if can_set_tdc_soc {
-                snap.tdc_soc_a
-            } else {
-                None
-            };
-            let edc_soc_a = if can_set_edc_soc {
-                snap.edc_soc_a
-            } else {
-                None
-            };
-            let apu_skin_temp_c = if can_set_apu_skin {
-                snap.apu_skin_temp_c
-            } else {
-                None
-            };
-            let dgpu_skin_temp_c = if can_set_dgpu_skin {
-                snap.dgpu_skin_temp_c
-            } else {
-                None
-            };
+            let stapm_w = cap_pos(snap.stapm_w, |c| c.set_stapm_limit.is_some());
+            let slow_w = cap_pos(snap.slow_w, |c| c.set_slow_limit.is_some());
+            let apu_slow_w = cap_pos(snap.apu_slow_w, |c| c.set_apu_slow_limit.is_some());
+            let tdc_soc_a = cap_pos(snap.tdc_soc_a, |c| c.set_tdc_soc.is_some());
+            let edc_soc_a = cap_pos(snap.edc_soc_a, |c| c.set_edc_soc.is_some());
+            let apu_skin_temp_c = cap_pos(snap.apu_skin_temp_c, |c| c.set_apu_skin_temp.is_some());
+            let dgpu_skin_temp_c =
+                cap_pos(snap.dgpu_skin_temp_c, |c| c.set_dgpu_skin_temp.is_some());
 
             if stapm_w.is_some()
                 || slow_w.is_some()
@@ -735,12 +499,13 @@ impl Profile {
         let mut diffs = Vec::new();
 
         if let Some(co) = &self.curve_optimizer {
-            let mut current_cores: BTreeMap<u32, i32> = BTreeMap::new();
-            if let Some(cores) = &current.co_per_core {
-                for &(idx, val) in cores {
-                    current_cores.insert(idx, i32::from(val));
-                }
-            }
+            let current_cores: BTreeMap<u32, i32> = current
+                .co_per_core
+                .as_deref()
+                .unwrap_or(&[])
+                .iter()
+                .map(|&(idx, val)| (idx, i32::from(val)))
+                .collect();
 
             if let Some(all_val) = co.all {
                 let core_count = current.physical_cores as u32;
@@ -761,233 +526,119 @@ impl Profile {
                 } else {
                     for core_idx in core_indices {
                         let desired = co.per_core.get(&core_idx).copied().unwrap_or(all_val);
-                        let cur = current_cores.get(&core_idx).copied();
-                        if cur != Some(desired) {
-                            diffs.push(ProfileDiffEntry {
-                                field: format!("curve_optimizer.core.{core_idx}"),
-                                current: cur.map(format_signed).unwrap_or_else(|| "unknown".into()),
-                                desired: format_signed(desired),
-                            });
-                        }
+                        push_diff_signed(
+                            &mut diffs,
+                            format!("curve_optimizer.core.{core_idx}"),
+                            current_cores.get(&core_idx).copied(),
+                            desired,
+                        );
                     }
                 }
             } else {
                 for (&core_idx, &desired) in &co.per_core {
-                    let cur = current_cores.get(&core_idx).copied();
-                    if cur != Some(desired) {
-                        diffs.push(ProfileDiffEntry {
-                            field: format!("curve_optimizer.core.{core_idx}"),
-                            current: cur.map(format_signed).unwrap_or_else(|| "unknown".into()),
-                            desired: format_signed(desired),
-                        });
-                    }
+                    push_diff_signed(
+                        &mut diffs,
+                        format!("curve_optimizer.core.{core_idx}"),
+                        current_cores.get(&core_idx).copied(),
+                        desired,
+                    );
                 }
             }
 
             if let Some(desired_igpu) = co.igpu {
-                let cur_igpu = current.igpu_co.map(i32::from);
-                if cur_igpu != Some(desired_igpu) {
-                    diffs.push(ProfileDiffEntry {
-                        field: "curve_optimizer.igpu".into(),
-                        current: cur_igpu
-                            .map(format_signed)
-                            .unwrap_or_else(|| "unknown".into()),
-                        desired: format_signed(desired_igpu),
-                    });
-                }
+                push_diff_signed(
+                    &mut diffs,
+                    "curve_optimizer.igpu".into(),
+                    current.igpu_co.map(i32::from),
+                    desired_igpu,
+                );
             }
         }
 
         if let Some(shaper) = &self.curve_shaper {
             for (&tier, desired_tier) in shaper {
                 let cur_tier = current.curve_shaper.map(|cs| cs.tier(tier));
-                if let Some(d) = desired_tier.low {
-                    let cur = cur_tier.map(|m| m.low);
-                    if cur != Some(d) {
-                        diffs.push(ProfileDiffEntry {
-                            field: format!("curve_shaper.{}.low", tier.label()),
-                            current: cur
-                                .map(|v| format_signed(i32::from(v)))
-                                .unwrap_or_else(|| "unknown".into()),
-                            desired: format_signed(i32::from(d)),
-                        });
-                    }
-                }
-                if let Some(d) = desired_tier.med {
-                    let cur = cur_tier.map(|m| m.med);
-                    if cur != Some(d) {
-                        diffs.push(ProfileDiffEntry {
-                            field: format!("curve_shaper.{}.med", tier.label()),
-                            current: cur
-                                .map(|v| format_signed(i32::from(v)))
-                                .unwrap_or_else(|| "unknown".into()),
-                            desired: format_signed(i32::from(d)),
-                        });
-                    }
-                }
-                if let Some(d) = desired_tier.high {
-                    let cur = cur_tier.map(|m| m.high);
-                    if cur != Some(d) {
-                        diffs.push(ProfileDiffEntry {
-                            field: format!("curve_shaper.{}.high", tier.label()),
-                            current: cur
-                                .map(|v| format_signed(i32::from(v)))
-                                .unwrap_or_else(|| "unknown".into()),
-                            desired: format_signed(i32::from(d)),
-                        });
+                for (band, cur_val, des_val) in [
+                    ("low", cur_tier.map(|m| i32::from(m.low)), desired_tier.low),
+                    ("med", cur_tier.map(|m| i32::from(m.med)), desired_tier.med),
+                    (
+                        "high",
+                        cur_tier.map(|m| i32::from(m.high)),
+                        desired_tier.high,
+                    ),
+                ] {
+                    if let Some(d) = des_val {
+                        push_diff_signed(
+                            &mut diffs,
+                            format!("curve_shaper.{}.{band}", tier.label()),
+                            cur_val,
+                            i32::from(d),
+                        );
                     }
                 }
             }
         }
 
         if let Some(pbo) = &self.pbo {
-            if let Some(d) = pbo.ppt_w {
-                if current.ppt_w != Some(d) {
-                    diffs.push(ProfileDiffEntry {
-                        field: "pbo.ppt_w".into(),
-                        current: fmt_opt_unit(current.ppt_w, "W"),
-                        desired: format!("{d}W"),
-                    });
-                }
-            }
-            if let Some(d) = pbo.tdc_a {
-                if current.tdc_a != Some(d) {
-                    diffs.push(ProfileDiffEntry {
-                        field: "pbo.tdc_a".into(),
-                        current: fmt_opt_unit(current.tdc_a, "A"),
-                        desired: format!("{d}A"),
-                    });
-                }
-            }
-            if let Some(d) = pbo.edc_a {
-                if current.edc_a != Some(d) {
-                    diffs.push(ProfileDiffEntry {
-                        field: "pbo.edc_a".into(),
-                        current: fmt_opt_unit(current.edc_a, "A"),
-                        desired: format!("{d}A"),
-                    });
-                }
-            }
-            if let Some(d) = pbo.tctl_c {
-                if current.tctl_c != Some(d) {
-                    diffs.push(ProfileDiffEntry {
-                        field: "pbo.tctl_c".into(),
-                        current: fmt_opt_unit(current.tctl_c, "°C"),
-                        desired: format!("{d}°C"),
-                    });
-                }
-            }
-            if let Some(d) = pbo.scalar {
-                let cur = current
-                    .pbo_scalar
-                    .filter(|s| s.is_finite() && *s >= 0.0)
-                    .map(|s| s.round() as u32);
-                if cur != Some(d) {
-                    diffs.push(ProfileDiffEntry {
-                        field: "pbo.scalar".into(),
-                        current: fmt_opt_unit(cur, "x"),
-                        desired: format!("{d}x"),
-                    });
-                }
-            }
-            if let Some(d) = pbo.fmax_mhz {
-                if current.fmax_mhz != Some(d) {
-                    diffs.push(ProfileDiffEntry {
-                        field: "pbo.fmax_mhz".into(),
-                        current: fmt_opt_unit(current.fmax_mhz, "MHz"),
-                        desired: format!("{d}MHz"),
-                    });
-                }
-            }
+            push_diff_u32(&mut diffs, "pbo.ppt_w", current.ppt_w, pbo.ppt_w, "W");
+            push_diff_u32(&mut diffs, "pbo.tdc_a", current.tdc_a, pbo.tdc_a, "A");
+            push_diff_u32(&mut diffs, "pbo.edc_a", current.edc_a, pbo.edc_a, "A");
+            push_diff_u32(&mut diffs, "pbo.tctl_c", current.tctl_c, pbo.tctl_c, "°C");
+            let cur_scalar = current
+                .pbo_scalar
+                .filter(|s| s.is_finite() && *s >= 0.0)
+                .map(|s| s.round() as u32);
+            push_diff_u32(&mut diffs, "pbo.scalar", cur_scalar, pbo.scalar, "x");
+            push_diff_u32(
+                &mut diffs,
+                "pbo.fmax_mhz",
+                current.fmax_mhz,
+                pbo.fmax_mhz,
+                "MHz",
+            );
         }
 
         if let Some(apu) = &self.apu {
-            if let Some(w) = apu.stapm_w {
-                if current.stapm_w != Some(w) {
-                    diffs.push(ProfileDiffEntry {
-                        field: "apu.stapm_w".into(),
-                        current: fmt_opt_unit(current.stapm_w, "W"),
-                        desired: format!("{w}W"),
-                    });
-                }
-            }
-            if let Some(s) = apu.stapm_time_s {
-                diffs.push(ProfileDiffEntry {
-                    field: "apu.stapm_time_s".into(),
-                    current: "unknown".into(),
-                    desired: format!("{s}s"),
-                });
-            }
-            if let Some(w) = apu.fast_w {
-                if current.ppt_w != Some(w) {
-                    diffs.push(ProfileDiffEntry {
-                        field: "apu.fast_w".into(),
-                        current: fmt_opt_unit(current.ppt_w, "W"),
-                        desired: format!("{w}W"),
-                    });
-                }
-            }
-            if let Some(w) = apu.slow_w {
-                if current.slow_w != Some(w) {
-                    diffs.push(ProfileDiffEntry {
-                        field: "apu.slow_w".into(),
-                        current: fmt_opt_unit(current.slow_w, "W"),
-                        desired: format!("{w}W"),
-                    });
-                }
-            }
-            if let Some(s) = apu.slow_time_s {
-                diffs.push(ProfileDiffEntry {
-                    field: "apu.slow_time_s".into(),
-                    current: "unknown".into(),
-                    desired: format!("{s}s"),
-                });
-            }
-            if let Some(w) = apu.apu_slow_w {
-                if current.apu_slow_w != Some(w) {
-                    diffs.push(ProfileDiffEntry {
-                        field: "apu.apu_slow_w".into(),
-                        current: fmt_opt_unit(current.apu_slow_w, "W"),
-                        desired: format!("{w}W"),
-                    });
-                }
-            }
-            if let Some(a) = apu.tdc_soc_a {
-                if current.tdc_soc_a != Some(a) {
-                    diffs.push(ProfileDiffEntry {
-                        field: "apu.tdc_soc_a".into(),
-                        current: fmt_opt_unit(current.tdc_soc_a, "A"),
-                        desired: format!("{a}A"),
-                    });
-                }
-            }
-            if let Some(a) = apu.edc_soc_a {
-                if current.edc_soc_a != Some(a) {
-                    diffs.push(ProfileDiffEntry {
-                        field: "apu.edc_soc_a".into(),
-                        current: fmt_opt_unit(current.edc_soc_a, "A"),
-                        desired: format!("{a}A"),
-                    });
-                }
-            }
-            if let Some(c) = apu.apu_skin_temp_c {
-                if current.apu_skin_temp_c != Some(c) {
-                    diffs.push(ProfileDiffEntry {
-                        field: "apu.apu_skin_temp_c".into(),
-                        current: fmt_opt_unit(current.apu_skin_temp_c, "°C"),
-                        desired: format!("{c}°C"),
-                    });
-                }
-            }
-            if let Some(c) = apu.dgpu_skin_temp_c {
-                if current.dgpu_skin_temp_c != Some(c) {
-                    diffs.push(ProfileDiffEntry {
-                        field: "apu.dgpu_skin_temp_c".into(),
-                        current: fmt_opt_unit(current.dgpu_skin_temp_c, "°C"),
-                        desired: format!("{c}°C"),
-                    });
-                }
-            }
+            push_diff_u32(&mut diffs, "apu.stapm_w", current.stapm_w, apu.stapm_w, "W");
+            push_diff_u32(&mut diffs, "apu.stapm_time_s", None, apu.stapm_time_s, "s");
+            push_diff_u32(&mut diffs, "apu.fast_w", current.ppt_w, apu.fast_w, "W");
+            push_diff_u32(&mut diffs, "apu.slow_w", current.slow_w, apu.slow_w, "W");
+            push_diff_u32(&mut diffs, "apu.slow_time_s", None, apu.slow_time_s, "s");
+            push_diff_u32(
+                &mut diffs,
+                "apu.apu_slow_w",
+                current.apu_slow_w,
+                apu.apu_slow_w,
+                "W",
+            );
+            push_diff_u32(
+                &mut diffs,
+                "apu.tdc_soc_a",
+                current.tdc_soc_a,
+                apu.tdc_soc_a,
+                "A",
+            );
+            push_diff_u32(
+                &mut diffs,
+                "apu.edc_soc_a",
+                current.edc_soc_a,
+                apu.edc_soc_a,
+                "A",
+            );
+            push_diff_u32(
+                &mut diffs,
+                "apu.apu_skin_temp_c",
+                current.apu_skin_temp_c,
+                apu.apu_skin_temp_c,
+                "°C",
+            );
+            push_diff_u32(
+                &mut diffs,
+                "apu.dgpu_skin_temp_c",
+                current.dgpu_skin_temp_c,
+                apu.dgpu_skin_temp_c,
+                "°C",
+            );
             if let Some(mode) = apu.power_mode {
                 let label = match mode {
                     ApuPowerMode::MaxPerformance => "max-performance",
@@ -1005,6 +656,51 @@ impl Profile {
     }
 }
 
+fn require_cap(supported: bool, capability: &'static str, codename: Codename) -> Result<()> {
+    if !supported {
+        return Err(Error::UnsupportedCapability {
+            capability,
+            codename: codename.to_string(),
+        });
+    }
+    Ok(())
+}
+
+fn push_diff_signed(
+    diffs: &mut Vec<ProfileDiffEntry>,
+    field: String,
+    current: Option<i32>,
+    desired: i32,
+) {
+    if current != Some(desired) {
+        diffs.push(ProfileDiffEntry {
+            field,
+            current: current
+                .map(format_signed)
+                .unwrap_or_else(|| "unknown".into()),
+            desired: format_signed(desired),
+        });
+    }
+}
+
+fn push_diff_u32(
+    diffs: &mut Vec<ProfileDiffEntry>,
+    field: &str,
+    current: Option<u32>,
+    desired: Option<u32>,
+    unit: &str,
+) {
+    if let Some(d) = desired {
+        if current != Some(d) {
+            diffs.push(ProfileDiffEntry {
+                field: field.into(),
+                current: fmt_opt_unit(current, unit),
+                desired: format!("{d}{unit}"),
+            });
+        }
+    }
+}
+
 fn format_signed(v: i32) -> String {
     if v > 0 {
         format!("+{v}")
@@ -1017,19 +713,6 @@ fn fmt_opt_unit(val: Option<u32>, unit: &str) -> String {
     match val {
         Some(v) => format!("{v}{unit}"),
         None => "unknown".into(),
-    }
-}
-
-fn map_io_err(path: &Path, source: std::io::Error) -> Error {
-    if source.kind() == ErrorKind::PermissionDenied {
-        Error::PermissionDenied {
-            path: path.display().to_string(),
-        }
-    } else {
-        Error::Io {
-            path: path.display().to_string(),
-            source,
-        }
     }
 }
 
@@ -1055,9 +738,7 @@ mod u32_map_serde {
         s.end()
     }
 
-    pub fn deserialize<'de, D>(
-        deserializer: D,
-    ) -> std::result::Result<BTreeMap<u32, i32>, D::Error>
+    pub fn deserialize<'de, D>(deserializer: D) -> std::result::Result<BTreeMap<u32, i32>, D::Error>
     where
         D: Deserializer<'de>,
     {
@@ -1193,7 +874,9 @@ fmax_mhz = 5550
             profile.curve_optimizer.as_ref().unwrap().per_core.get(&0),
             Some(&-25)
         );
-        assert!(profile.validate_for(Codename::GraniteRidge, 8, false).is_ok());
+        assert!(profile
+            .validate_for(Codename::GraniteRidge, 8, false)
+            .is_ok());
     }
 
     #[test]
@@ -1234,7 +917,12 @@ fmax_mhz = 5550
 
         // Out-of-bounds core index
         let mut bad_core = sample_zen5_profile();
-        bad_core.curve_optimizer.as_mut().unwrap().per_core.insert(8, -10);
+        bad_core
+            .curve_optimizer
+            .as_mut()
+            .unwrap()
+            .per_core
+            .insert(8, -10);
         assert!(matches!(
             bad_core.validate_for(Codename::GraniteRidge, 8, false),
             Err(Error::OutOfBounds { .. })
@@ -1247,7 +935,9 @@ fmax_mhz = 5550
             extreme.validate_for(Codename::GraniteRidge, 8, false),
             Err(Error::ExtremeValueBlocked { .. })
         ));
-        assert!(extreme.validate_for(Codename::GraniteRidge, 8, true).is_ok());
+        assert!(extreme
+            .validate_for(Codename::GraniteRidge, 8, true)
+            .is_ok());
     }
 
     #[test]
@@ -1271,7 +961,9 @@ fmax_mhz = 5550
         snap.tctl_c = Some(85);
 
         let profile = Profile::from_snapshot(&snap);
-        assert!(profile.validate_for(Codename::GraniteRidge, 4, false).is_ok());
+        assert!(profile
+            .validate_for(Codename::GraniteRidge, 4, false)
+            .is_ok());
         assert!(profile.diff_against(&snap).is_empty());
     }
 
@@ -1354,7 +1046,9 @@ fmax_mhz = 5550
             }),
         };
 
-        assert!(apu_profile.validate_for(Codename::Phoenix, 8, false).is_ok());
+        assert!(apu_profile
+            .validate_for(Codename::Phoenix, 8, false)
+            .is_ok());
 
         let mut desktop_apu = apu_profile.clone();
         desktop_apu.target.codename = Codename::GraniteRidge;
@@ -1420,5 +1114,79 @@ fmax_mhz = 5550
         assert!(profile.apu.is_none());
         assert!(profile.validate_for(Codename::Vermeer, 16, true).is_ok());
         assert!(profile.diff_against(&snap).is_empty());
+    }
+
+    #[test]
+    fn from_snapshot_filters_zero_nan_empty_and_unsupported_fields() {
+        let mut snap = SmuStateSnapshot::new(Codename::GraniteRidge, 8);
+        snap.co_per_core = Some(vec![]);
+        snap.pbo_scalar = Some(f32::NAN);
+        snap.ppt_w = Some(0);
+        snap.fmax_mhz = Some(0);
+
+        let profile = Profile::from_snapshot(&snap);
+        assert!(profile.curve_optimizer.is_none());
+        assert!(profile.pbo.is_none());
+        assert!(profile
+            .validate_for(Codename::GraniteRidge, 8, false)
+            .is_ok());
+
+        // Non-finite or out-of-range scalar values are dropped cleanly
+        snap.pbo_scalar = Some(99.0);
+        let p2 = Profile::from_snapshot(&snap);
+        assert!(p2.pbo.is_none());
+
+        // Unsupported codename emits no writable sections
+        let mut unknown = SmuStateSnapshot::new(Codename::Undefined, 4);
+        unknown.ppt_w = Some(88);
+        let p3 = Profile::from_snapshot(&unknown);
+        assert!(p3.pbo.is_none());
+        assert!(p3.apu.is_none());
+    }
+
+    #[test]
+    fn validate_for_matches_live_op_bounds_on_edge_cases() {
+        // Hard Tctl ceiling 95°C cannot be bypassed with allow_extreme
+        let mut p = sample_zen5_profile();
+        p.pbo.as_mut().unwrap().tctl_c = Some(96);
+        assert!(matches!(
+            p.validate_for(Codename::GraniteRidge, 8, true),
+            Err(Error::OutOfBounds { .. })
+        ));
+
+        // iGPU CO enforces -30..=30 (soft -25), even on Zen 5 where CPU CO is -50..=50
+        let mut p = sample_zen5_profile();
+        p.curve_optimizer.as_mut().unwrap().igpu = Some(-28);
+        assert!(matches!(
+            p.validate_for(Codename::GraniteRidge, 8, false),
+            Err(Error::ExtremeValueBlocked { .. })
+        ));
+        p.curve_optimizer.as_mut().unwrap().igpu = Some(-35);
+        assert!(matches!(
+            p.validate_for(Codename::GraniteRidge, 8, true),
+            Err(Error::OutOfBounds { .. })
+        ));
+
+        // PBO scalar > 4x requires allow_extreme
+        let mut p = sample_zen5_profile();
+        p.pbo.as_mut().unwrap().scalar = Some(6);
+        assert!(matches!(
+            p.validate_for(Codename::GraniteRidge, 8, false),
+            Err(Error::ExtremeValueBlocked { .. })
+        ));
+        assert!(p.validate_for(Codename::GraniteRidge, 8, true).is_ok());
+
+        // Curve Shaper hard max is +30 (not +50)
+        let mut p = sample_zen5_profile();
+        p.curve_shaper
+            .as_mut()
+            .unwrap()
+            .get_mut(&FreqTier::High)
+            .unwrap()
+            .high = Some(31);
+        assert!(matches!(
+            p.validate_for(Codename::GraniteRidge, 8, true),
+            Err(Error::OutOfBounds { .. })
+        ));
     }
 }

@@ -6,16 +6,18 @@
 
 use crate::error::{Error, Result};
 use crate::hw::identity::HardwareContext;
+use crate::hw::profiles::OpcodeSpec;
 use crate::ops::co::{check_mailbox_health, send_verified};
+use crate::safety::bounds;
 use crate::transport::SmuTransport;
 use crate::types::{CurveShaperState, FreqTier, PlannedOp, ShaperTierMargins};
 
-/// Hard minimum Curve Shaper margin.
-pub const SHAPER_MIN: i8 = -50;
-/// Hard maximum Curve Shaper margin.
-pub const SHAPER_MAX: i8 = 30;
+/// Hard minimum Curve Shaper margin (unified with [`crate::safety::bounds`]).
+pub const SHAPER_MIN: i8 = bounds::SHAPER_MIN as i8;
+/// Hard maximum Curve Shaper margin (unified with [`crate::safety::bounds`]).
+pub const SHAPER_MAX: i8 = bounds::SHAPER_MAX as i8;
 /// Conservative soft minimum below which `--allow-extreme` is required.
-pub const SHAPER_SOFT_MIN: i8 = -35;
+pub const SHAPER_SOFT_MIN: i8 = bounds::SHAPER_SOFT_MIN as i8;
 
 /// Pack a frequency tier and its 3 signed temperature-band margins into the
 /// 32-bit RSMU `SetCurveShaperMargin` argument format.
@@ -39,20 +41,7 @@ pub fn decode_shaper_tier(raw: u32) -> ShaperTierMargins {
 
 /// Validate a single Curve Shaper band margin against hard and soft limits.
 pub fn validate_shaper_margin(margin: i32, allow_extreme: bool) -> Result<i8> {
-    if margin < i32::from(SHAPER_MIN) || margin > i32::from(SHAPER_MAX) {
-        return Err(Error::OutOfBounds {
-            field: "shaper_margin".into(),
-            value: margin.to_string(),
-            bounds: format!("{SHAPER_MIN}..={SHAPER_MAX}"),
-        });
-    }
-    if margin < i32::from(SHAPER_SOFT_MIN) && !allow_extreme {
-        return Err(Error::ExtremeValueBlocked {
-            field: "shaper_margin".into(),
-            value: margin.to_string(),
-            threshold: format!(">= {SHAPER_SOFT_MIN}"),
-        });
-    }
+    bounds::validate_shaper_margin("shaper_margin", margin, allow_extreme)?;
     Ok(margin as i8)
 }
 
@@ -65,6 +54,19 @@ fn validate_tier_margins(margins: ShaperTierMargins, allow_extreme: bool) -> Res
 
 fn format_tier_margins(m: ShaperTierMargins) -> String {
     format!("low={},med={},high={}", m.low, m.med, m.high)
+}
+
+fn plan_tier_op(op: OpcodeSpec, tier: FreqTier, margins: ShaperTierMargins) -> PlannedOp {
+    let packed = encode_shaper_tier(tier, margins);
+    let formatted = format_tier_margins(margins);
+    PlannedOp {
+        description: format!("Set Curve Shaper tier '{}' to ({formatted})", tier.label()),
+        mailbox: op.mailbox,
+        opcode: op.opcode,
+        args: [packed, 0, 0, 0, 0, 0],
+        current: None,
+        target: formatted,
+    }
 }
 
 /// Read the complete 5x3 Zen 5 Curve Shaper matrix from hardware.
@@ -112,19 +114,7 @@ pub fn set_curve_shaper_tier(
 
     validate_tier_margins(margins, allow_extreme)?;
 
-    let packed = encode_shaper_tier(tier, margins);
-    let planned = PlannedOp {
-        description: format!(
-            "Set Curve Shaper tier '{}' to ({})",
-            tier.label(),
-            format_tier_margins(margins)
-        ),
-        mailbox: op.mailbox,
-        opcode: op.opcode,
-        args: [packed, 0, 0, 0, 0, 0],
-        current: None,
-        target: format_tier_margins(margins),
-    };
+    let planned = plan_tier_op(op, tier, margins);
 
     if dry_run {
         return Ok(planned);
@@ -171,19 +161,7 @@ pub fn set_curve_shaper_all(
     for tier in FreqTier::ALL {
         let margins = state.tier(tier);
         validate_tier_margins(margins, allow_extreme)?;
-        let packed = encode_shaper_tier(tier, margins);
-        planned.push(PlannedOp {
-            description: format!(
-                "Set Curve Shaper tier '{}' to ({})",
-                tier.label(),
-                format_tier_margins(margins)
-            ),
-            mailbox: op.mailbox,
-            opcode: op.opcode,
-            args: [packed, 0, 0, 0, 0, 0],
-            current: None,
-            target: format_tier_margins(margins),
-        });
+        planned.push(plan_tier_op(op, tier, margins));
     }
 
     if dry_run {
@@ -254,11 +232,31 @@ mod tests {
     fn shaper_roundtrip_single_and_all_tiers() {
         let (transport, hw) = mock_9700x_ctx();
         let desired = CurveShaperState {
-            min: ShaperTierMargins { low: -10, med: -5, high: 0 },
-            low: ShaperTierMargins { low: -15, med: -10, high: -5 },
-            med: ShaperTierMargins { low: -20, med: -15, high: -10 },
-            high: ShaperTierMargins { low: -25, med: -20, high: -10 },
-            max: ShaperTierMargins { low: -15, med: -10, high: 5 },
+            min: ShaperTierMargins {
+                low: -10,
+                med: -5,
+                high: 0,
+            },
+            low: ShaperTierMargins {
+                low: -15,
+                med: -10,
+                high: -5,
+            },
+            med: ShaperTierMargins {
+                low: -20,
+                med: -15,
+                high: -10,
+            },
+            high: ShaperTierMargins {
+                low: -25,
+                med: -20,
+                high: -10,
+            },
+            max: ShaperTierMargins {
+                low: -15,
+                med: -10,
+                high: 5,
+            },
         };
 
         let ops = set_curve_shaper_all(&transport, &hw, &desired, false, false).unwrap();
@@ -268,7 +266,11 @@ mod tests {
         assert_eq!(readback, desired);
 
         // Update a single tier
-        let new_high = ShaperTierMargins { low: -30, med: -25, high: -15 };
+        let new_high = ShaperTierMargins {
+            low: -30,
+            med: -25,
+            high: -15,
+        };
         set_curve_shaper_tier(&transport, &hw, FreqTier::High, new_high, false, false).unwrap();
         let readback2 = get_curve_shaper(&transport, &hw).unwrap();
         assert_eq!(readback2.high, new_high);
@@ -290,7 +292,11 @@ mod tests {
         ));
 
         // Soft limit (-35) blocked without allow_extreme
-        let extreme = ShaperTierMargins { low: -40, med: 0, high: 0 };
+        let extreme = ShaperTierMargins {
+            low: -40,
+            med: 0,
+            high: 0,
+        };
         assert!(matches!(
             set_curve_shaper_tier(&transport, &hw, FreqTier::Max, extreme, false, false),
             Err(Error::ExtremeValueBlocked { .. })
@@ -312,7 +318,10 @@ mod tests {
 
         assert!(matches!(
             get_curve_shaper(&transport, &hw),
-            Err(Error::UnsupportedCapability { capability: "get_curve_shaper", .. })
+            Err(Error::UnsupportedCapability {
+                capability: "get_curve_shaper",
+                ..
+            })
         ));
         assert!(matches!(
             set_curve_shaper_tier(
@@ -323,7 +332,10 @@ mod tests {
                 false,
                 false
             ),
-            Err(Error::UnsupportedCapability { capability: "set_curve_shaper", .. })
+            Err(Error::UnsupportedCapability {
+                capability: "set_curve_shaper",
+                ..
+            })
         ));
     }
 
@@ -337,7 +349,11 @@ mod tests {
             &transport,
             &hw,
             FreqTier::Med,
-            ShaperTierMargins { low: -10, med: -10, high: -10 },
+            ShaperTierMargins {
+                low: -10,
+                med: -10,
+                high: -10,
+            },
             false,
             false,
         )

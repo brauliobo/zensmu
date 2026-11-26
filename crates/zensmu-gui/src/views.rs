@@ -28,7 +28,7 @@ use zensmu_core::safety::persist::{
     DEFAULT_SERVICE_NAME,
 };
 use zensmu_core::transport::sysfs::{DEFAULT_LOCK_PATH, DEFAULT_SYSFS_PATH};
-use zensmu_core::types::{ApuPowerMode, CoreInfo, CurveShaperState, FreqTier};
+use zensmu_core::types::{ApuPowerMode, CoreInfo, FreqTier};
 
 // Dark cockpit palette
 pub const BG_CANVAS: Color32 = Color32::from_rgb(13, 16, 23);
@@ -50,6 +50,13 @@ fn card_frame() -> egui::Frame {
         .inner_margin(egui::Margin::same(14))
 }
 
+fn panel_frame(margin: egui::Margin) -> egui::Frame {
+    egui::Frame::NONE
+        .fill(BG_PANEL)
+        .stroke(Stroke::new(1.0_f32, BORDER_SUBTLE))
+        .inner_margin(margin)
+}
+
 fn pill(ui: &mut Ui, text: &str, fg: Color32, bg: Color32) {
     egui::Frame::NONE
         .fill(bg)
@@ -61,15 +68,128 @@ fn pill(ui: &mut Ui, text: &str, fg: Color32, bg: Color32) {
         });
 }
 
+fn tinted_pill(ui: &mut Ui, text: &str, fg: Color32, alpha: u8) {
+    let [r, g, b, _] = fg.to_array();
+    pill(
+        ui,
+        text,
+        fg,
+        Color32::from_rgba_unmultiplied(r, g, b, alpha),
+    );
+}
+
+fn muted_pill(ui: &mut Ui, text: &str) {
+    pill(ui, text, TEXT_MUTED, Color32::from_rgb(30, 36, 48));
+}
+
+fn optional_fused_pill(ui: &mut Ui, label: &str, value: Option<u32>, unit: &str) {
+    if let Some(v) = value {
+        tinted_pill(ui, &format!("{label}: {v} {unit}"), ACCENT_CYAN, 20);
+    }
+}
+
+fn render_tab_header(ui: &mut Ui, title: &str, subtitle: &str) {
+    ui.heading(title);
+    ui.label(RichText::new(subtitle).small().color(TEXT_MUTED));
+    ui.add_space(10.0);
+}
+
+fn render_unsupported_feature_card(ui: &mut Ui, feature: &str, cpu_name: &str, detail: &str) {
+    card_frame().show(ui, |ui| {
+        ui.set_width(ui.available_width());
+        ui.label(
+            RichText::new(format!("{feature} is not supported on {cpu_name}."))
+                .strong()
+                .color(ACCENT_AMBER),
+        );
+        ui.add_space(4.0);
+        ui.label(detail);
+    });
+}
+
+fn render_extreme_warning(ui: &mut Ui, msg: &str) {
+    ui.label(RichText::new(msg).small().color(ACCENT_AMBER));
+}
+
+fn utilization_color(frac: f32, default_accent: Color32) -> Color32 {
+    if frac >= 0.90 {
+        ACCENT_CRIMSON
+    } else if frac >= 0.75 {
+        ACCENT_AMBER
+    } else {
+        default_accent
+    }
+}
+
+fn capability_disabled_hint(readable: bool) -> &'static str {
+    if readable {
+        "(read-only on this CPU)"
+    } else {
+        "(unsupported on this CPU)"
+    }
+}
+
+fn fused_soft_note(fused: Option<u32>, fused_prefix: &str, soft_max: u32, unit: &str) -> String {
+    fused
+        .map(|v| format!("{fused_prefix}: {v} {unit} · soft ≤ {soft_max} {unit}"))
+        .unwrap_or_else(|| format!("Soft max ≤ {soft_max} {unit}"))
+}
+
+fn grid_header_row(ui: &mut Ui, headers: &[&str]) {
+    for &h in headers {
+        ui.label(RichText::new(h).strong().color(TEXT_MUTED));
+    }
+    ui.end_row();
+}
+
+struct LimitSliderRow<'a> {
+    label: &'a str,
+    supported: bool,
+    enabled: &'a mut bool,
+    value: &'a mut u32,
+    dirty: Option<&'a mut bool>,
+    range: std::ops::RangeInclusive<u32>,
+    step_by: Option<f64>,
+    suffix: &'a str,
+    live_display: String,
+    live_is_muted: bool,
+    note: String,
+    note_color: Color32,
+}
+
+fn render_limit_slider_row(ui: &mut Ui, row: LimitSliderRow<'_>) {
+    if !row.supported {
+        *row.enabled = false;
+    }
+    ui.add_enabled(row.supported, egui::Checkbox::new(row.enabled, row.label));
+
+    let mut slider = egui::Slider::new(row.value, row.range).suffix(row.suffix);
+    if let Some(step) = row.step_by {
+        slider = slider.step_by(step);
+    }
+    if ui
+        .add_enabled(row.supported && *row.enabled, slider)
+        .changed()
+    {
+        if let Some(dirty) = row.dirty {
+            *dirty = true;
+        }
+    }
+
+    let mut live_text = RichText::new(row.live_display).monospace();
+    if row.live_is_muted {
+        live_text = live_text.color(TEXT_MUTED);
+    }
+    ui.label(live_text);
+
+    ui.label(RichText::new(row.note).small().color(row.note_color));
+    ui.end_row();
+}
+
 /// Top command bar with identity pill, privilege badge, polling controls, and global actions.
 pub fn render_top_bar(app: &mut ZensmuApp, ctx: &egui::Context) {
     egui::TopBottomPanel::top("top_bar")
-        .frame(
-            egui::Frame::NONE
-                .fill(BG_PANEL)
-                .stroke(Stroke::new(1.0_f32, BORDER_SUBTLE))
-                .inner_margin(egui::Margin::symmetric(14, 9)),
-        )
+        .frame(panel_frame(egui::Margin::symmetric(14, 9)))
         .show(ctx, |ui| {
             ui.horizontal_wrapped(|ui| {
                 ui.label(
@@ -253,7 +373,7 @@ pub fn render_top_bar(app: &mut ZensmuApp, ctx: &egui::Context) {
 }
 
 fn format_interval_label(ms: u64) -> String {
-    if ms >= 1000 && ms % 1000 == 0 {
+    if ms >= 1000 && ms.is_multiple_of(1000) {
         format!("{}s", ms / 1000)
     } else {
         format!("{ms}ms")
@@ -263,12 +383,7 @@ fn format_interval_label(ms: u64) -> String {
 /// Bottom status bar showing last command toast / spinner and telemetry sampling status.
 pub fn render_bottom_bar(app: &mut ZensmuApp, ctx: &egui::Context) {
     egui::TopBottomPanel::bottom("bottom_bar")
-        .frame(
-            egui::Frame::NONE
-                .fill(BG_PANEL)
-                .stroke(Stroke::new(1.0_f32, BORDER_SUBTLE))
-                .inner_margin(egui::Margin::symmetric(14, 6)),
-        )
+        .frame(panel_frame(egui::Margin::symmetric(14, 6)))
         .show(ctx, |ui| {
             ui.horizontal(|ui| {
                 if let Some(label) = app.runner.in_flight_label() {
@@ -315,7 +430,12 @@ pub fn render_bottom_bar(app: &mut ZensmuApp, ctx: &egui::Context) {
                             TELEMETRY_RING_CAPACITY
                         )
                     };
-                    ui.label(RichText::new(rate_text).small().monospace().color(TEXT_MUTED));
+                    ui.label(
+                        RichText::new(rate_text)
+                            .small()
+                            .monospace()
+                            .color(TEXT_MUTED),
+                    );
                 });
             });
         });
@@ -326,12 +446,7 @@ pub fn render_sidebar(app: &mut ZensmuApp, ctx: &egui::Context) {
     egui::SidePanel::left("sidebar")
         .resizable(false)
         .exact_width(245.0)
-        .frame(
-            egui::Frame::NONE
-                .fill(BG_PANEL)
-                .stroke(Stroke::new(1.0_f32, BORDER_SUBTLE))
-                .inner_margin(egui::Margin::same(12)),
-        )
+        .frame(panel_frame(egui::Margin::same(12)))
         .show(ctx, |ui| {
             ui.label(
                 RichText::new("NAVIGATION")
@@ -341,18 +456,21 @@ pub fn render_sidebar(app: &mut ZensmuApp, ctx: &egui::Context) {
             );
             ui.add_space(6.0);
 
-            let pbo_subtitle = if app
-                .hw
-                .as_ref()
-                .is_some_and(|h| h.codename.is_apu() || h.capabilities.set_stapm_limit.is_some())
-            {
-                "PPT / TDC / EDC / APU DPTC"
-            } else {
-                "PPT / TDC / EDC / Fmax"
-            };
+            let pbo_subtitle =
+                if app.hw.as_ref().is_some_and(|h| {
+                    h.codename.is_apu() || h.capabilities.set_stapm_limit.is_some()
+                }) {
+                    "PPT / TDC / EDC / APU DPTC"
+                } else {
+                    "PPT / TDC / EDC / Fmax"
+                };
             let tabs = [
                 (Tab::Dashboard, "Dashboard", "Live telemetry"),
-                (Tab::CurveOptimizer, "Curve Optimizer", "All-core & per-core"),
+                (
+                    Tab::CurveOptimizer,
+                    "Curve Optimizer",
+                    "All-core & per-core",
+                ),
                 (Tab::CurveShaper, "Curve Shaper", "Zen 5 5×3 matrix"),
                 (Tab::PboLimits, "PBO Limits", pbo_subtitle),
                 (
@@ -383,15 +501,11 @@ pub fn render_sidebar(app: &mut ZensmuApp, ctx: &egui::Context) {
                     .show(ui, |ui| {
                         ui.set_width(ui.available_width());
                         ui.vertical(|ui| {
-                            ui.label(
-                                RichText::new(title)
-                                    .strong()
-                                    .color(if selected {
-                                        Color32::WHITE
-                                    } else {
-                                        Color32::from_rgb(203, 213, 225)
-                                    }),
-                            );
+                            ui.label(RichText::new(title).strong().color(if selected {
+                                Color32::WHITE
+                            } else {
+                                Color32::from_rgb(203, 213, 225)
+                            }));
                             ui.label(RichText::new(subtitle).small().color(TEXT_MUTED));
                         });
                     })
@@ -411,12 +525,7 @@ pub fn render_sidebar(app: &mut ZensmuApp, ctx: &egui::Context) {
             ui.with_layout(egui::Layout::bottom_up(egui::Align::LEFT), |ui| {
                 card_frame().show(ui, |ui| {
                     ui.set_width(ui.available_width());
-                    ui.label(
-                        RichText::new("SYSTEM")
-                            .small()
-                            .strong()
-                            .color(TEXT_MUTED),
-                    );
+                    ui.label(RichText::new("SYSTEM").small().strong().color(TEXT_MUTED));
                     ui.add_space(4.0);
                     if let Some(hw) = &app.hw {
                         kv_small(ui, "Codename", hw.codename.slug());
@@ -499,7 +608,11 @@ pub fn render_banners(app: &mut ZensmuApp, ui: &mut Ui, ctx: &egui::Context) {
                                 .strong()
                                 .color(ACCENT_AMBER),
                         );
-                        ui.label(RichText::new(&err).small().color(Color32::from_rgb(226, 232, 240)));
+                        ui.label(
+                            RichText::new(&err)
+                                .small()
+                                .color(Color32::from_rgb(226, 232, 240)),
+                        );
                         ui.add_space(4.0);
                         ui.horizontal(|ui| {
                             ui.label("Load the driver with:");
@@ -519,13 +632,11 @@ pub fn render_banners(app: &mut ZensmuApp, ui: &mut Ui, ctx: &egui::Context) {
 
 /// Tab 1: Live Dashboard with rolling plots, limit progress bars, clocks, and voltage rails.
 pub fn render_dashboard(app: &mut ZensmuApp, ui: &mut Ui) {
-    ui.heading("Live SMU Telemetry Dashboard");
-    ui.label(
-        RichText::new("Unprivileged 0444 PM table polling from /sys/kernel/ryzen_smu_drv/pm_table")
-            .small()
-            .color(TEXT_MUTED),
+    render_tab_header(
+        ui,
+        "Live SMU Telemetry Dashboard",
+        "Unprivileged 0444 PM table polling from /sys/kernel/ryzen_smu_drv/pm_table",
     );
-    ui.add_space(10.0);
 
     if let Some(err) = &app.telemetry_error {
         card_frame().show(ui, |ui| {
@@ -688,92 +799,57 @@ pub fn render_dashboard(app: &mut ZensmuApp, ui: &mut Ui) {
     let ppt_points: PlotPoints<'_> = app
         .samples
         .iter()
-        .filter_map(|s| s.snapshot.ppt_value_w.map(|v| [s.elapsed_s - latest_t, v as f64]))
+        .filter_map(|s| {
+            s.snapshot
+                .ppt_value_w
+                .map(|v| [s.elapsed_s - latest_t, v as f64])
+        })
         .collect();
     let tctl_points: PlotPoints<'_> = app
         .samples
         .iter()
-        .filter_map(|s| s.snapshot.tctl_value_c.map(|v| [s.elapsed_s - latest_t, v as f64]))
+        .filter_map(|s| {
+            s.snapshot
+                .tctl_value_c
+                .map(|v| [s.elapsed_s - latest_t, v as f64])
+        })
         .collect();
 
     let ppt_limit = snap.and_then(|s| s.ppt_limit_w).map(f64::from);
     let tctl_limit = snap.and_then(|s| s.tctl_limit_c).map(f64::from);
 
     ui.columns(2, |cols| {
-        card_frame().show(&mut cols[0], |ui| {
-            ui.horizontal(|ui| {
-                ui.label(RichText::new("Package Power (PPT)").strong());
-                if let Some(v) = snap.and_then(|s| s.ppt_value_w) {
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        ui.label(RichText::new(format!("{v:.1} W")).monospace().strong().color(ACCENT_CYAN));
-                    });
-                }
-            });
-            ui.add_space(4.0);
-            Plot::new("ppt_plot")
-                .height(185.0)
-                .allow_drag(false)
-                .allow_zoom(false)
-                .allow_scroll(false)
-                .allow_boxed_zoom(false)
-                .include_y(0.0)
-                .y_axis_label("W")
-                .x_axis_label("seconds ago")
-                .show(ui, |plot_ui| {
-                    plot_ui.line(
-                        Line::new(ppt_points)
-                            .name("PPT (W)")
-                            .color(ACCENT_CYAN)
-                            .width(2.0_f32),
-                    );
-                    if let Some(lim) = ppt_limit {
-                        plot_ui.hline(
-                            HLine::new(lim)
-                                .name("PPT Limit")
-                                .color(ACCENT_CRIMSON.linear_multiply(0.7))
-                                .style(egui_plot::LineStyle::Dashed { length: 6.0 }),
-                        );
-                    }
-                });
-        });
+        render_rolling_plot_card(
+            &mut cols[0],
+            RollingPlotSpec {
+                plot_id: "ppt_plot",
+                title: "Package Power (PPT)",
+                series_name: "PPT (W)",
+                limit_name: "PPT Limit",
+                unit: "W",
+                accent: ACCENT_CYAN,
+                current: snap.and_then(|s| s.ppt_value_w),
+                limit: ppt_limit,
+                include_y: &[0.0],
+                points: ppt_points,
+            },
+        );
 
-        card_frame().show(&mut cols[1], |ui| {
-            ui.horizontal(|ui| {
-                ui.label(RichText::new("CPU Temperature (Tctl)").strong());
-                if let Some(v) = snap.and_then(|s| s.tctl_value_c) {
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        ui.label(RichText::new(format!("{v:.1} °C")).monospace().strong().color(ACCENT_AMBER));
-                    });
-                }
-            });
-            ui.add_space(4.0);
-            Plot::new("tctl_plot")
-                .height(185.0)
-                .allow_drag(false)
-                .allow_zoom(false)
-                .allow_scroll(false)
-                .allow_boxed_zoom(false)
-                .include_y(20.0)
-                .include_y(100.0)
-                .y_axis_label("°C")
-                .x_axis_label("seconds ago")
-                .show(ui, |plot_ui| {
-                    plot_ui.line(
-                        Line::new(tctl_points)
-                            .name("Tctl (°C)")
-                            .color(ACCENT_AMBER)
-                            .width(2.0_f32),
-                    );
-                    if let Some(lim) = tctl_limit {
-                        plot_ui.hline(
-                            HLine::new(lim)
-                                .name("Tctl Limit")
-                                .color(ACCENT_CRIMSON.linear_multiply(0.7))
-                                .style(egui_plot::LineStyle::Dashed { length: 6.0 }),
-                        );
-                    }
-                });
-        });
+        render_rolling_plot_card(
+            &mut cols[1],
+            RollingPlotSpec {
+                plot_id: "tctl_plot",
+                title: "CPU Temperature (Tctl)",
+                series_name: "Tctl (°C)",
+                limit_name: "Tctl Limit",
+                unit: "°C",
+                accent: ACCENT_AMBER,
+                current: snap.and_then(|s| s.tctl_value_c),
+                limit: tctl_limit,
+                include_y: &[20.0, 100.0],
+                points: tctl_points,
+            },
+        );
     });
 
     ui.add_space(12.0);
@@ -784,10 +860,9 @@ pub fn render_dashboard(app: &mut ZensmuApp, ui: &mut Ui) {
             ui.set_width(ui.available_width());
             ui.horizontal(|ui| {
                 ui.label(RichText::new("Fabric & Memory Clocks").strong());
-                if let (Some(uclk), Some(mclk)) = (
-                    snap.and_then(|s| s.uclk_mhz),
-                    snap.and_then(|s| s.mclk_mhz),
-                ) {
+                if let (Some(uclk), Some(mclk)) =
+                    (snap.and_then(|s| s.uclk_mhz), snap.and_then(|s| s.mclk_mhz))
+                {
                     let ratio = if (uclk - mclk).abs() < 25.0 {
                         "UCLK:MCLK 1:1"
                     } else if (uclk * 2.0 - mclk).abs() < 50.0 {
@@ -811,9 +886,27 @@ pub fn render_dashboard(app: &mut ZensmuApp, ui: &mut Ui) {
                 .striped(true)
                 .min_col_width(180.0)
                 .show(ui, |ui| {
-                    metric_row(ui, "FCLK (Infinity Fabric)", snap.and_then(|s| s.fclk_mhz), "MHz", 0);
-                    metric_row(ui, "UCLK (Memory Controller)", snap.and_then(|s| s.uclk_mhz), "MHz", 0);
-                    metric_row(ui, "MCLK (Memory Clock)", snap.and_then(|s| s.mclk_mhz), "MHz", 0);
+                    metric_row(
+                        ui,
+                        "FCLK (Infinity Fabric)",
+                        snap.and_then(|s| s.fclk_mhz),
+                        "MHz",
+                        0,
+                    );
+                    metric_row(
+                        ui,
+                        "UCLK (Memory Controller)",
+                        snap.and_then(|s| s.uclk_mhz),
+                        "MHz",
+                        0,
+                    );
+                    metric_row(
+                        ui,
+                        "MCLK (Memory Clock)",
+                        snap.and_then(|s| s.mclk_mhz),
+                        "MHz",
+                        0,
+                    );
                 });
         });
 
@@ -836,6 +929,65 @@ pub fn render_dashboard(app: &mut ZensmuApp, ui: &mut Ui) {
     });
 }
 
+struct RollingPlotSpec<'a> {
+    plot_id: &'a str,
+    title: &'a str,
+    series_name: &'a str,
+    limit_name: &'a str,
+    unit: &'a str,
+    accent: Color32,
+    current: Option<f32>,
+    limit: Option<f64>,
+    include_y: &'a [f64],
+    points: PlotPoints<'a>,
+}
+
+fn render_rolling_plot_card(ui: &mut Ui, spec: RollingPlotSpec<'_>) {
+    card_frame().show(ui, |ui| {
+        ui.horizontal(|ui| {
+            ui.label(RichText::new(spec.title).strong());
+            if let Some(v) = spec.current {
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    ui.label(
+                        RichText::new(format!("{v:.1} {}", spec.unit))
+                            .monospace()
+                            .strong()
+                            .color(spec.accent),
+                    );
+                });
+            }
+        });
+        ui.add_space(4.0);
+        let mut plot = Plot::new(spec.plot_id)
+            .height(185.0)
+            .allow_drag(false)
+            .allow_zoom(false)
+            .allow_scroll(false)
+            .allow_boxed_zoom(false)
+            .y_axis_label(spec.unit)
+            .x_axis_label("seconds ago");
+        for &y in spec.include_y {
+            plot = plot.include_y(y);
+        }
+        plot.show(ui, |plot_ui| {
+            plot_ui.line(
+                Line::new(spec.points)
+                    .name(spec.series_name)
+                    .color(spec.accent)
+                    .width(2.0_f32),
+            );
+            if let Some(lim) = spec.limit {
+                plot_ui.hline(
+                    HLine::new(lim)
+                        .name(spec.limit_name)
+                        .color(ACCENT_CRIMSON.linear_multiply(0.7))
+                        .style(egui_plot::LineStyle::Dashed { length: 6.0 }),
+                );
+            }
+        });
+    });
+}
+
 fn render_gauge_card(
     ui: &mut Ui,
     title: &str,
@@ -851,13 +1003,7 @@ fn render_gauge_card(
         match (value, limit) {
             (Some(val), Some(lim)) if lim > 0.0 => {
                 let frac = (val / lim).clamp(0.0, 1.0);
-                let fill = if frac >= 0.90 {
-                    ACCENT_CRIMSON
-                } else if frac >= 0.75 {
-                    ACCENT_AMBER
-                } else {
-                    accent
-                };
+                let fill = utilization_color(frac, accent);
                 ui.label(
                     RichText::new(format!("{val:.1} {unit}"))
                         .size(24.0)
@@ -865,11 +1011,11 @@ fn render_gauge_card(
                         .monospace(),
                 );
                 ui.add_space(4.0);
-                ui.add(
-                    egui::ProgressBar::new(frac)
-                        .fill(fill)
-                        .text(format!("{:.0}% of {:.0} {unit}", frac * 100.0, lim)),
-                );
+                ui.add(egui::ProgressBar::new(frac).fill(fill).text(format!(
+                    "{:.0}% of {:.0} {unit}",
+                    frac * 100.0,
+                    lim
+                )));
             }
             (Some(val), _) => {
                 ui.label(
@@ -908,13 +1054,7 @@ fn render_apu_limit_row(
     match (value, limit) {
         (Some(val), Some(lim)) if lim > 0.0 => {
             let frac = (val / lim).clamp(0.0, 1.0);
-            let fill = if frac >= 0.90 {
-                ACCENT_CRIMSON
-            } else if frac >= 0.75 {
-                ACCENT_AMBER
-            } else {
-                accent
-            };
+            let fill = utilization_color(frac, accent);
             ui.label(
                 RichText::new(format!("{val:.1} / {lim:.0} {unit}"))
                     .monospace()
@@ -979,15 +1119,11 @@ fn metric_row(ui: &mut Ui, label: &str, value: Option<f32>, unit: &str, decimals
 
 /// Tab 2: Curve Optimizer (All-Core, Per-Core grouped by CCD, and iGPU CO).
 pub fn render_curve_optimizer(app: &mut ZensmuApp, ui: &mut Ui, ctx: &egui::Context) {
-    ui.heading("Curve Optimizer");
-    ui.label(
-        RichText::new(
-            "Adjust voltage-frequency curve margins safely. Every write runs --dry-run first and verifies readback.",
-        )
-        .small()
-        .color(TEXT_MUTED),
+    render_tab_header(
+        ui,
+        "Curve Optimizer",
+        "Adjust voltage-frequency curve margins safely. Every write runs --dry-run first and verifies readback.",
     );
-    ui.add_space(10.0);
 
     let Some(hw) = app.hw.clone() else {
         render_no_hardware_placeholder(ui);
@@ -995,18 +1131,12 @@ pub fn render_curve_optimizer(app: &mut ZensmuApp, ui: &mut Ui, ctx: &egui::Cont
     };
 
     let Some(bounds) = hw.capabilities.co_bounds else {
-        card_frame().show(ui, |ui| {
-            ui.set_width(ui.available_width());
-            ui.label(
-                RichText::new(format!(
-                    "Curve Optimizer is not supported on {}.",
-                    hw.codename.display_name()
-                ))
-                .strong()
-                .color(ACCENT_AMBER),
-            );
-            ui.label("Zen 2 and unsupported platforms do not expose Curve Optimizer SMU opcodes.");
-        });
+        render_unsupported_feature_card(
+            ui,
+            "Curve Optimizer",
+            hw.codename.display_name(),
+            "Zen 2 and unsupported platforms do not expose Curve Optimizer SMU opcodes.",
+        );
         return;
     };
 
@@ -1046,9 +1176,7 @@ pub fn render_curve_optimizer(app: &mut ZensmuApp, ui: &mut Ui, ctx: &egui::Cont
             );
 
             if ui.button("Copy to All Per-Core Sliders").clicked() {
-                for slot in &mut app.co_editor.per_core {
-                    *slot = app.co_editor.all_core;
-                }
+                app.co_editor.per_core.fill(app.co_editor.all_core);
             }
         });
 
@@ -1064,13 +1192,12 @@ pub fn render_curve_optimizer(app: &mut ZensmuApp, ui: &mut Ui, ctx: &egui::Cont
         });
 
         if app.co_editor.all_core < bounds.soft_min && !app.co_editor.allow_extreme {
-            ui.label(
-                RichText::new(format!(
+            render_extreme_warning(
+                ui,
+                &format!(
                     "Value {} is below conservative soft floor ({}); enable 'Allow Extreme' to proceed.",
                     app.co_editor.all_core, bounds.soft_min
-                ))
-                .small()
-                .color(ACCENT_AMBER),
+                ),
             );
         }
 
@@ -1106,11 +1233,6 @@ pub fn render_curve_optimizer(app: &mut ZensmuApp, ui: &mut Ui, ctx: &egui::Cont
                 )
                 .clicked()
             {
-                app.co_editor.all_core = 0;
-                for slot in &mut app.co_editor.per_core {
-                    *slot = 0;
-                }
-                app.co_editor.igpu = 0;
                 app.dispatch_cli(CliAction::CoReset { dry_run: true }, ctx);
             }
         });
@@ -1126,9 +1248,7 @@ pub fn render_curve_optimizer(app: &mut ZensmuApp, ui: &mut Ui, ctx: &egui::Cont
         }
 
         if app.co_editor.per_core.len() < hw.topology.physical_cores {
-            app.co_editor
-                .per_core
-                .resize(hw.topology.physical_cores, 0);
+            app.co_editor.per_core.resize(hw.topology.physical_cores, 0);
         }
 
         card_frame().show(ui, |ui| {
@@ -1136,13 +1256,9 @@ pub fn render_curve_optimizer(app: &mut ZensmuApp, ui: &mut Ui, ctx: &egui::Cont
             ui.horizontal_wrapped(|ui| {
                 ui.label(RichText::new("Per-Core Curve Optimizer (by CCD)").strong());
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    let any_below_soft = app
-                        .co_editor
-                        .per_core
-                        .iter()
-                        .any(|&v| v < bounds.soft_min);
-                    let can_apply =
-                        !busy && (!any_below_soft || app.co_editor.allow_extreme);
+                    let any_below_soft =
+                        app.co_editor.per_core.iter().any(|&v| v < bounds.soft_min);
+                    let can_apply = !busy && (!any_below_soft || app.co_editor.allow_extreme);
                     if ui
                         .add_enabled(
                             can_apply,
@@ -1242,9 +1358,7 @@ pub fn render_curve_optimizer(app: &mut ZensmuApp, ui: &mut Ui, ctx: &egui::Cont
                                     ui.add(egui::Slider::new(val, bounds.min..=bounds.max));
                                     if *val < bounds.soft_min {
                                         ui.label(
-                                            RichText::new("extreme")
-                                                .small()
-                                                .color(ACCENT_AMBER),
+                                            RichText::new("extreme").small().color(ACCENT_AMBER),
                                         );
                                     }
                                 });
@@ -1302,15 +1416,11 @@ pub fn render_curve_optimizer(app: &mut ZensmuApp, ui: &mut Ui, ctx: &egui::Cont
 
 /// Tab 3: Zen 5 Curve Shaper (5 frequency tiers × 3 temperature bands).
 pub fn render_curve_shaper(app: &mut ZensmuApp, ui: &mut Ui, ctx: &egui::Context) {
-    ui.heading("Curve Shaper (Zen 5)");
-    ui.label(
-        RichText::new(
-            "15-point frequency × temperature voltage curve shaping (-50..=+30, soft floor -35).",
-        )
-        .small()
-        .color(TEXT_MUTED),
+    render_tab_header(
+        ui,
+        "Curve Shaper (Zen 5)",
+        "15-point frequency × temperature voltage curve shaping (-50..=+30, soft floor -35).",
     );
-    ui.add_space(10.0);
 
     let Some(hw) = app.hw.clone() else {
         render_no_hardware_placeholder(ui);
@@ -1318,21 +1428,12 @@ pub fn render_curve_shaper(app: &mut ZensmuApp, ui: &mut Ui, ctx: &egui::Context
     };
 
     if hw.capabilities.set_curve_shaper.is_none() {
-        card_frame().show(ui, |ui| {
-            ui.set_width(ui.available_width());
-            ui.label(
-                RichText::new(format!(
-                    "Curve Shaper is not supported on {}.",
-                    hw.codename.display_name()
-                ))
-                .strong()
-                .color(ACCENT_AMBER),
-            );
-            ui.add_space(4.0);
-            ui.label(
-                "Curve Shaper (5 frequency tiers × 3 temperature bands) requires a Zen 5 processor such as Granite Ridge (Ryzen 9000 series). zensmu disables these controls on non-Zen-5 CPUs so invalid SMU opcodes are never emitted.",
-            );
-        });
+        render_unsupported_feature_card(
+            ui,
+            "Curve Shaper",
+            hw.codename.display_name(),
+            "Curve Shaper (5 frequency tiers × 3 temperature bands) requires a Zen 5 processor such as Granite Ridge (Ryzen 9000 series). zensmu disables these controls on non-Zen-5 CPUs so invalid SMU opcodes are never emitted.",
+        );
         return;
     }
 
@@ -1452,7 +1553,6 @@ pub fn render_curve_shaper(app: &mut ZensmuApp, ui: &mut Ui, ctx: &egui::Context
                 .add_enabled(!busy, egui::Button::new("Reset Shaper to 0"))
                 .clicked()
             {
-                app.shaper_editor.draft = CurveShaperState::default();
                 app.dispatch_cli(CliAction::ShaperReset { dry_run: true }, ctx);
             }
         });
@@ -1476,7 +1576,12 @@ fn shaper_cell(ui: &mut Ui, val: &mut i8, current: Option<i8>) {
                 .range(SHAPER_MIN..=SHAPER_MAX)
                 .speed(0.5),
         );
-        ui.label(RichText::new(format!("{:+}", *val)).small().monospace().color(tint));
+        ui.label(
+            RichText::new(format!("{:+}", *val))
+                .small()
+                .monospace()
+                .color(tint),
+        );
         if let Some(cur) = current {
             if cur != *val {
                 ui.label(
@@ -1491,15 +1596,11 @@ fn shaper_cell(ui: &mut Ui, val: &mut i8, current: Option<i8>) {
 
 /// Tab 4: PBO Power/Thermal Limits, Scalar, Fmax Boost Limit, and Fused Factory Limits.
 pub fn render_pbo_limits(app: &mut ZensmuApp, ui: &mut Ui, ctx: &egui::Context) {
-    ui.heading("Precision Boost Overdrive (PBO) Limits");
-    ui.label(
-        RichText::new(
-            "Configure package power, VRM current, thermal ceiling (hard max 95°C), scalar, and Fmax boost limit.",
-        )
-        .small()
-        .color(TEXT_MUTED),
+    render_tab_header(
+        ui,
+        "Precision Boost Overdrive (PBO) Limits",
+        "Configure package power, VRM current, thermal ceiling (hard max 95°C), scalar, and Fmax boost limit.",
     );
-    ui.add_space(10.0);
 
     let Some(hw) = app.hw.clone() else {
         render_no_hardware_placeholder(ui);
@@ -1509,6 +1610,7 @@ pub fn render_pbo_limits(app: &mut ZensmuApp, ui: &mut Ui, ctx: &egui::Context) 
     let busy = app.runner.is_busy();
     let fused = app.pbo_status.as_ref().map(|s| s.fused.clone());
     let telem = app.latest_telemetry.clone();
+    let caps = &hw.capabilities;
 
     card_frame().show(ui, |ui| {
         ui.set_width(ui.available_width());
@@ -1521,6 +1623,19 @@ pub fn render_pbo_limits(app: &mut ZensmuApp, ui: &mut Ui, ctx: &egui::Context) 
                 {
                     app.dispatch_cli(CliAction::PboGet, ctx);
                 }
+                if ui
+                    .button("Sync from Live")
+                    .on_hover_text("Reset edited PBO sliders to live telemetry and mailbox values")
+                    .clicked()
+                {
+                    app.pbo_editor.clear_dirty();
+                    if let Some(snap) = app.latest_telemetry.clone() {
+                        app.pbo_editor.sync_from_telemetry(&snap);
+                    }
+                    if let Some(status) = app.pbo_status.clone() {
+                        app.pbo_editor.sync_from_status(&status, true);
+                    }
+                }
             });
         });
 
@@ -1531,220 +1646,194 @@ pub fn render_pbo_limits(app: &mut ZensmuApp, ui: &mut Ui, ctx: &egui::Context) 
             .striped(true)
             .spacing([14.0, 10.0])
             .show(ui, |ui| {
-                ui.label(RichText::new("Parameter").strong().color(TEXT_MUTED));
-                ui.label(RichText::new("Target Value").strong().color(TEXT_MUTED));
-                ui.label(RichText::new("Current Live").strong().color(TEXT_MUTED));
-                ui.label(RichText::new("Fused Factory / Guard").strong().color(TEXT_MUTED));
-                ui.end_row();
+                grid_header_row(
+                    ui,
+                    &[
+                        "Parameter",
+                        "Target Value",
+                        "Current Live",
+                        "Fused Factory / Guard",
+                    ],
+                );
 
                 // PPT
-                {
-                    let supported = hw.capabilities.set_ppt.is_some();
-                    if !supported {
-                        app.pbo_editor.ppt_enabled = false;
-                    }
-                    let live_val = telem.as_ref().and_then(|t| t.ppt_limit_w);
-                    ui.add_enabled(
-                        supported,
-                        egui::Checkbox::new(&mut app.pbo_editor.ppt_enabled, "PPT Limit (W)"),
-                    );
-                    ui.add_enabled(
-                        supported && app.pbo_editor.ppt_enabled,
-                        egui::Slider::new(&mut app.pbo_editor.ppt_w, PPT_MIN_W..=PPT_MAX_W)
-                            .suffix(" W"),
-                    );
-                    ui.label(RichText::new(opt_f32(live_val, "W")).monospace());
-                    let note = if supported {
-                        fused
-                            .as_ref()
-                            .and_then(|f| f.ppt_w)
-                            .map(|w| format!("Fused: {w} W · soft ≤ {PPT_SOFT_MAX_W} W"))
-                            .unwrap_or_else(|| format!("Soft max ≤ {PPT_SOFT_MAX_W} W"))
-                    } else if live_val.is_some() {
-                        "(read-only on this CPU)".into()
-                    } else {
-                        "(unsupported on this CPU)".into()
-                    };
-                    ui.label(RichText::new(note).small().color(TEXT_MUTED));
-                    ui.end_row();
-                }
+                let ppt_supported = caps.set_ppt.is_some();
+                let ppt_live = telem.as_ref().and_then(|t| t.ppt_limit_w);
+                render_limit_slider_row(
+                    ui,
+                    LimitSliderRow {
+                        label: "PPT Limit (W)",
+                        supported: ppt_supported,
+                        enabled: &mut app.pbo_editor.ppt_enabled,
+                        value: &mut app.pbo_editor.ppt_w,
+                        dirty: Some(&mut app.pbo_editor.ppt_dirty),
+                        range: PPT_MIN_W..=PPT_MAX_W,
+                        step_by: None,
+                        suffix: " W",
+                        live_display: opt_f32(ppt_live, "W"),
+                        live_is_muted: false,
+                        note: if ppt_supported {
+                            fused_soft_note(
+                                fused.as_ref().and_then(|f| f.ppt_w),
+                                "Fused",
+                                PPT_SOFT_MAX_W,
+                                "W",
+                            )
+                        } else {
+                            capability_disabled_hint(ppt_live.is_some()).into()
+                        },
+                        note_color: TEXT_MUTED,
+                    },
+                );
 
                 // TDC
-                {
-                    let supported = hw.capabilities.set_tdc.is_some();
-                    if !supported {
-                        app.pbo_editor.tdc_enabled = false;
-                    }
-                    let live_val = telem.as_ref().and_then(|t| t.tdc_limit_a);
-                    ui.add_enabled(
-                        supported,
-                        egui::Checkbox::new(&mut app.pbo_editor.tdc_enabled, "TDC Limit (A)"),
-                    );
-                    ui.add_enabled(
-                        supported && app.pbo_editor.tdc_enabled,
-                        egui::Slider::new(&mut app.pbo_editor.tdc_a, TDC_MIN_A..=TDC_MAX_A)
-                            .suffix(" A"),
-                    );
-                    ui.label(RichText::new(opt_f32(live_val, "A")).monospace());
-                    let note = if supported {
-                        fused
-                            .as_ref()
-                            .and_then(|f| f.vdd_tdc_a)
-                            .map(|a| format!("Fused VDD: {a} A · soft ≤ {TDC_SOFT_MAX_A} A"))
-                            .unwrap_or_else(|| format!("Soft max ≤ {TDC_SOFT_MAX_A} A"))
-                    } else if live_val.is_some() {
-                        "(read-only on this CPU)".into()
-                    } else {
-                        "(unsupported on this CPU)".into()
-                    };
-                    ui.label(RichText::new(note).small().color(TEXT_MUTED));
-                    ui.end_row();
-                }
+                let tdc_supported = caps.set_tdc.is_some();
+                let tdc_live = telem.as_ref().and_then(|t| t.tdc_limit_a);
+                render_limit_slider_row(
+                    ui,
+                    LimitSliderRow {
+                        label: "TDC Limit (A)",
+                        supported: tdc_supported,
+                        enabled: &mut app.pbo_editor.tdc_enabled,
+                        value: &mut app.pbo_editor.tdc_a,
+                        dirty: Some(&mut app.pbo_editor.tdc_dirty),
+                        range: TDC_MIN_A..=TDC_MAX_A,
+                        step_by: None,
+                        suffix: " A",
+                        live_display: opt_f32(tdc_live, "A"),
+                        live_is_muted: false,
+                        note: if tdc_supported {
+                            fused_soft_note(
+                                fused.as_ref().and_then(|f| f.vdd_tdc_a),
+                                "Fused VDD",
+                                TDC_SOFT_MAX_A,
+                                "A",
+                            )
+                        } else {
+                            capability_disabled_hint(tdc_live.is_some()).into()
+                        },
+                        note_color: TEXT_MUTED,
+                    },
+                );
 
                 // EDC
-                {
-                    let supported = hw.capabilities.set_edc.is_some();
-                    if !supported {
-                        app.pbo_editor.edc_enabled = false;
-                    }
-                    let live_val = telem.as_ref().and_then(|t| t.edc_limit_a);
-                    ui.add_enabled(
-                        supported,
-                        egui::Checkbox::new(&mut app.pbo_editor.edc_enabled, "EDC Limit (A)"),
-                    );
-                    ui.add_enabled(
-                        supported && app.pbo_editor.edc_enabled,
-                        egui::Slider::new(&mut app.pbo_editor.edc_a, EDC_MIN_A..=EDC_MAX_A)
-                            .suffix(" A"),
-                    );
-                    ui.label(RichText::new(opt_f32(live_val, "A")).monospace());
-                    let note = if supported {
-                        fused
-                            .as_ref()
-                            .and_then(|f| f.edc_a)
-                            .map(|a| format!("Fused EDC: {a} A · soft ≤ {EDC_SOFT_MAX_A} A"))
-                            .unwrap_or_else(|| format!("Soft max ≤ {EDC_SOFT_MAX_A} A"))
-                    } else if live_val.is_some() {
-                        "(read-only on this CPU)".into()
-                    } else {
-                        "(unsupported on this CPU)".into()
-                    };
-                    ui.label(RichText::new(note).small().color(TEXT_MUTED));
-                    ui.end_row();
-                }
+                let edc_supported = caps.set_edc.is_some();
+                let edc_live = telem.as_ref().and_then(|t| t.edc_limit_a);
+                render_limit_slider_row(
+                    ui,
+                    LimitSliderRow {
+                        label: "EDC Limit (A)",
+                        supported: edc_supported,
+                        enabled: &mut app.pbo_editor.edc_enabled,
+                        value: &mut app.pbo_editor.edc_a,
+                        dirty: Some(&mut app.pbo_editor.edc_dirty),
+                        range: EDC_MIN_A..=EDC_MAX_A,
+                        step_by: None,
+                        suffix: " A",
+                        live_display: opt_f32(edc_live, "A"),
+                        live_is_muted: false,
+                        note: if edc_supported {
+                            fused_soft_note(
+                                fused.as_ref().and_then(|f| f.edc_a),
+                                "Fused EDC",
+                                EDC_SOFT_MAX_A,
+                                "A",
+                            )
+                        } else {
+                            capability_disabled_hint(edc_live.is_some()).into()
+                        },
+                        note_color: TEXT_MUTED,
+                    },
+                );
 
                 // Tctl Max (Hard ceiling 95C)
-                {
-                    let supported = hw.capabilities.set_tctl.is_some();
-                    if !supported {
-                        app.pbo_editor.tctl_enabled = false;
-                    }
-                    let live_val = telem.as_ref().and_then(|t| t.tctl_limit_c);
-                    ui.add_enabled(
-                        supported,
-                        egui::Checkbox::new(
-                            &mut app.pbo_editor.tctl_enabled,
-                            "Tctl Thermal Max (°C)",
-                        ),
-                    );
-                    ui.add_enabled(
-                        supported && app.pbo_editor.tctl_enabled,
-                        egui::Slider::new(&mut app.pbo_editor.tctl_c, TCTL_MIN_C..=TCTL_MAX_C)
-                            .suffix(" °C"),
-                    );
-                    ui.label(RichText::new(opt_f32(live_val, "°C")).monospace());
-                    if supported {
-                        ui.label(
-                            RichText::new("Hard safety ceiling: 95 °C (non-overridable)")
-                                .small()
-                                .color(ACCENT_AMBER),
-                        );
-                    } else {
-                        let note = if live_val.is_some() {
-                            "(read-only on this CPU)"
+                let tctl_supported = caps.set_tctl.is_some();
+                let tctl_live = telem.as_ref().and_then(|t| t.tctl_limit_c);
+                render_limit_slider_row(
+                    ui,
+                    LimitSliderRow {
+                        label: "Tctl Thermal Max (°C)",
+                        supported: tctl_supported,
+                        enabled: &mut app.pbo_editor.tctl_enabled,
+                        value: &mut app.pbo_editor.tctl_c,
+                        dirty: Some(&mut app.pbo_editor.tctl_dirty),
+                        range: TCTL_MIN_C..=TCTL_MAX_C,
+                        step_by: None,
+                        suffix: " °C",
+                        live_display: opt_f32(tctl_live, "°C"),
+                        live_is_muted: false,
+                        note: if tctl_supported {
+                            "Hard safety ceiling: 95 °C (non-overridable)".into()
                         } else {
-                            "(unsupported on this CPU)"
-                        };
-                        ui.label(RichText::new(note).small().color(TEXT_MUTED));
-                    }
-                    ui.end_row();
-                }
+                            capability_disabled_hint(tctl_live.is_some()).into()
+                        },
+                        note_color: if tctl_supported {
+                            ACCENT_AMBER
+                        } else {
+                            TEXT_MUTED
+                        },
+                    },
+                );
 
                 // PBO Scalar
-                {
-                    let supported = hw.capabilities.set_pbo_scalar.is_some();
-                    if !supported {
-                        app.pbo_editor.scalar_enabled = false;
-                    }
-                    ui.add_enabled(
-                        supported,
-                        egui::Checkbox::new(
-                            &mut app.pbo_editor.scalar_enabled,
-                            "PBO Scalar (1–10x)",
-                        ),
-                    );
-                    ui.add_enabled(
-                        supported && app.pbo_editor.scalar_enabled,
-                        egui::Slider::new(&mut app.pbo_editor.scalar, SCALAR_MIN..=SCALAR_MAX)
-                            .suffix("x"),
-                    );
-                    let cur = app
-                        .pbo_status
-                        .as_ref()
-                        .and_then(|s| s.scalar)
-                        .map(|s| format!("{s:.1}x"))
-                        .unwrap_or_else(|| "—".into());
-                    ui.label(RichText::new(cur).monospace());
-                    let note = if supported {
-                        format!("Soft max ≤ {SCALAR_SOFT_MAX}x")
-                    } else if hw.capabilities.get_pbo_scalar.is_some() {
-                        "(read-only on this CPU)".into()
-                    } else {
-                        "(unsupported on this CPU)".into()
-                    };
-                    ui.label(RichText::new(note).small().color(TEXT_MUTED));
-                    ui.end_row();
-                }
+                let scalar_supported = caps.set_pbo_scalar.is_some();
+                let scalar_live = app
+                    .pbo_status
+                    .as_ref()
+                    .and_then(|s| s.scalar)
+                    .map(|s| format!("{s:.1}x"))
+                    .unwrap_or_else(|| "—".into());
+                render_limit_slider_row(
+                    ui,
+                    LimitSliderRow {
+                        label: "PBO Scalar (1–10x)",
+                        supported: scalar_supported,
+                        enabled: &mut app.pbo_editor.scalar_enabled,
+                        value: &mut app.pbo_editor.scalar,
+                        dirty: Some(&mut app.pbo_editor.scalar_dirty),
+                        range: SCALAR_MIN..=SCALAR_MAX,
+                        step_by: None,
+                        suffix: "x",
+                        live_display: scalar_live,
+                        live_is_muted: false,
+                        note: if scalar_supported {
+                            format!("Soft max ≤ {SCALAR_SOFT_MAX}x")
+                        } else {
+                            capability_disabled_hint(caps.get_pbo_scalar.is_some()).into()
+                        },
+                        note_color: TEXT_MUTED,
+                    },
+                );
 
                 // Fmax Boost Limit
-                {
-                    let supported = hw.capabilities.set_fmax.is_some();
-                    if !supported {
-                        app.pbo_editor.fmax_enabled = false;
-                    }
-                    ui.add_enabled(
-                        supported,
-                        egui::Checkbox::new(
-                            &mut app.pbo_editor.fmax_enabled,
-                            "Fmax Boost Limit (MHz)",
-                        ),
-                    );
-                    ui.add_enabled(
-                        supported && app.pbo_editor.fmax_enabled,
-                        egui::Slider::new(
-                            &mut app.pbo_editor.fmax_mhz,
-                            FMAX_MIN_MHZ..=FMAX_MAX_MHZ,
-                        )
-                        .step_by(25.0)
-                        .suffix(" MHz"),
-                    );
-                    let cur = app
-                        .pbo_status
-                        .as_ref()
-                        .and_then(|s| s.fmax_mhz)
-                        .map(|m| format!("{m} MHz"))
-                        .unwrap_or_else(|| "—".into());
-                    ui.label(RichText::new(cur).monospace());
-                    let note = if supported {
-                        "Soft delta ≤ +200 MHz above current"
-                    } else if hw.capabilities.get_fmax.is_some() {
-                        "(read-only on this CPU)"
-                    } else {
-                        "(unsupported on this CPU)"
-                    };
-                    ui.label(RichText::new(note).small().color(TEXT_MUTED));
-                    ui.end_row();
-                }
+                let fmax_supported = caps.set_fmax.is_some();
+                let fmax_live = app
+                    .pbo_status
+                    .as_ref()
+                    .and_then(|s| s.fmax_mhz)
+                    .map(|m| format!("{m} MHz"))
+                    .unwrap_or_else(|| "—".into());
+                render_limit_slider_row(
+                    ui,
+                    LimitSliderRow {
+                        label: "Fmax Boost Limit (MHz)",
+                        supported: fmax_supported,
+                        enabled: &mut app.pbo_editor.fmax_enabled,
+                        value: &mut app.pbo_editor.fmax_mhz,
+                        dirty: Some(&mut app.pbo_editor.fmax_dirty),
+                        range: FMAX_MIN_MHZ..=FMAX_MAX_MHZ,
+                        step_by: Some(25.0),
+                        suffix: " MHz",
+                        live_display: fmax_live,
+                        live_is_muted: false,
+                        note: if fmax_supported {
+                            "Soft delta ≤ +200 MHz above current".into()
+                        } else {
+                            capability_disabled_hint(caps.get_fmax.is_some()).into()
+                        },
+                        note_color: TEXT_MUTED,
+                    },
+                );
             });
 
         ui.add_space(10.0);
@@ -1753,9 +1842,16 @@ pub fn render_pbo_limits(app: &mut ZensmuApp, ui: &mut Ui, ctx: &egui::Context) 
             "Allow Extreme PBO values (above conservative soft limits; 95°C Tctl ceiling still enforced)",
         );
 
+        if app.pbo_editor.has_any_extreme_for(caps) && !app.pbo_editor.allow_extreme {
+            render_extreme_warning(
+                ui,
+                "One or more enabled PBO values exceed conservative soft limits; enable 'Allow Extreme' to override.",
+            );
+        }
+
         ui.add_space(8.0);
         ui.horizontal_wrapped(|ui| {
-            let can_apply = !busy && app.pbo_editor.has_any_enabled_for(&hw.capabilities);
+            let can_apply = !busy && app.pbo_editor.has_any_enabled_for(caps);
             if ui
                 .add_enabled(
                     can_apply,
@@ -1765,7 +1861,7 @@ pub fn render_pbo_limits(app: &mut ZensmuApp, ui: &mut Ui, ctx: &egui::Context) 
             {
                 app.dispatch_cli(
                     CliAction::PboSet {
-                        req: app.pbo_editor.build_request_for(&hw.capabilities),
+                        req: app.pbo_editor.build_request_for(caps),
                         allow_extreme: app.pbo_editor.allow_extreme,
                         dry_run: true,
                     },
@@ -1783,7 +1879,7 @@ pub fn render_pbo_limits(app: &mut ZensmuApp, ui: &mut Ui, ctx: &egui::Context) 
         });
     });
 
-    if hw.codename.is_apu() || hw.capabilities.set_stapm_limit.is_some() {
+    if hw.codename.is_apu() || caps.set_stapm_limit.is_some() {
         ui.add_space(12.0);
         render_apu_dptc_card(app, ui, ctx, &hw, fused.as_ref(), busy);
     }
@@ -1798,46 +1894,11 @@ pub fn render_pbo_limits(app: &mut ZensmuApp, ui: &mut Ui, ctx: &egui::Context) 
                 flag_pill(ui, "Overclockable", status.flags.overclockable);
                 flag_pill(ui, "EXPO Active", status.flags.expo_active);
                 flag_pill(ui, "LN2 Mode", status.flags.ln2_mode);
-                if let Some(w) = status.fused.ppt_w {
-                    pill(
-                        ui,
-                        &format!("Fused PPT: {w} W"),
-                        ACCENT_CYAN,
-                        Color32::from_rgba_unmultiplied(56, 189, 248, 20),
-                    );
-                }
-                if let Some(w) = status.fused.fast_w {
-                    pill(
-                        ui,
-                        &format!("Fused Fast: {w} W"),
-                        ACCENT_CYAN,
-                        Color32::from_rgba_unmultiplied(56, 189, 248, 20),
-                    );
-                }
-                if let Some(w) = status.fused.slow_w {
-                    pill(
-                        ui,
-                        &format!("Fused Slow: {w} W"),
-                        ACCENT_CYAN,
-                        Color32::from_rgba_unmultiplied(56, 189, 248, 20),
-                    );
-                }
-                if let Some(a) = status.fused.soc_tdc_a {
-                    pill(
-                        ui,
-                        &format!("Fused SoC TDC: {a} A"),
-                        ACCENT_CYAN,
-                        Color32::from_rgba_unmultiplied(56, 189, 248, 20),
-                    );
-                }
-                if let Some(w) = status.fused.apu_slow_w {
-                    pill(
-                        ui,
-                        &format!("Fused APU Slow: {w} W"),
-                        ACCENT_CYAN,
-                        Color32::from_rgba_unmultiplied(56, 189, 248, 20),
-                    );
-                }
+                optional_fused_pill(ui, "Fused PPT", status.fused.ppt_w, "W");
+                optional_fused_pill(ui, "Fused Fast", status.fused.fast_w, "W");
+                optional_fused_pill(ui, "Fused Slow", status.fused.slow_w, "W");
+                optional_fused_pill(ui, "Fused SoC TDC", status.fused.soc_tdc_a, "A");
+                optional_fused_pill(ui, "Fused APU Slow", status.fused.apu_slow_w, "W");
             });
         });
     }
@@ -1856,11 +1917,11 @@ fn render_apu_dptc_card(
         ui.set_width(ui.available_width());
         ui.horizontal_wrapped(|ui| {
             ui.label(RichText::new("APU DPTC Limits").strong());
-            pill(
+            tinted_pill(
                 ui,
                 &format!("{} · Mobile Power & Thermal", hw.codename.display_name()),
                 ACCENT_CYAN,
-                Color32::from_rgba_unmultiplied(56, 189, 248, 22),
+                22,
             );
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 if ui
@@ -1883,373 +1944,275 @@ fn render_apu_dptc_card(
             .striped(true)
             .spacing([14.0, 10.0])
             .show(ui, |ui| {
-                ui.label(RichText::new("Parameter").strong().color(TEXT_MUTED));
-                ui.label(RichText::new("Target Value").strong().color(TEXT_MUTED));
-                ui.label(RichText::new("Current Live").strong().color(TEXT_MUTED));
-                ui.label(RichText::new("Fused / Guard").strong().color(TEXT_MUTED));
-                ui.end_row();
+                grid_header_row(
+                    ui,
+                    &["Parameter", "Target Value", "Current Live", "Fused / Guard"],
+                );
 
                 // STAPM Limit (W)
-                {
-                    let supported = caps.set_stapm_limit.is_some();
-                    if !supported {
-                        app.apu_editor.stapm_enabled = false;
-                    }
-                    ui.add_enabled(
-                        supported,
-                        egui::Checkbox::new(&mut app.apu_editor.stapm_enabled, "STAPM Limit (W)"),
-                    );
-                    if ui
-                        .add_enabled(
-                            supported && app.apu_editor.stapm_enabled,
-                            egui::Slider::new(
-                                &mut app.apu_editor.stapm_w,
-                                APU_POWER_MIN_W..=APU_POWER_MAX_W,
-                            )
-                            .suffix(" W"),
-                        )
-                        .changed()
-                    {
-                        app.apu_editor.stapm_dirty = true;
-                    }
-                    ui.label(RichText::new(opt_f32(app.apu_editor.live_stapm_w, "W")).monospace());
-                    let note = if supported {
-                        format!("Soft max ≤ {APU_POWER_SOFT_MAX_W} W")
-                    } else {
-                        "(unsupported on this CPU)".into()
-                    };
-                    ui.label(RichText::new(note).small().color(TEXT_MUTED));
-                    ui.end_row();
-                }
+                let stapm_supported = caps.set_stapm_limit.is_some();
+                render_limit_slider_row(
+                    ui,
+                    LimitSliderRow {
+                        label: "STAPM Limit (W)",
+                        supported: stapm_supported,
+                        enabled: &mut app.apu_editor.stapm_enabled,
+                        value: &mut app.apu_editor.stapm_w,
+                        dirty: Some(&mut app.apu_editor.stapm_dirty),
+                        range: APU_POWER_MIN_W..=APU_POWER_MAX_W,
+                        step_by: None,
+                        suffix: " W",
+                        live_display: opt_f32(app.apu_editor.live_stapm_w, "W"),
+                        live_is_muted: false,
+                        note: if stapm_supported {
+                            format!("Soft max ≤ {APU_POWER_SOFT_MAX_W} W")
+                        } else {
+                            capability_disabled_hint(app.apu_editor.live_stapm_w.is_some()).into()
+                        },
+                        note_color: TEXT_MUTED,
+                    },
+                );
 
                 // Fast PPT (W)
-                {
-                    let supported = hw.codename.is_apu() && caps.set_ppt.is_some();
-                    if !supported {
-                        app.apu_editor.fast_enabled = false;
-                    }
-                    ui.add_enabled(
-                        supported,
-                        egui::Checkbox::new(&mut app.apu_editor.fast_enabled, "Fast PPT (W)"),
-                    );
-                    if ui
-                        .add_enabled(
-                            supported && app.apu_editor.fast_enabled,
-                            egui::Slider::new(
-                                &mut app.apu_editor.fast_w,
-                                APU_POWER_MIN_W..=APU_POWER_MAX_W,
+                let fast_supported = hw.codename.is_apu() && caps.set_ppt.is_some();
+                render_limit_slider_row(
+                    ui,
+                    LimitSliderRow {
+                        label: "Fast PPT (W)",
+                        supported: fast_supported,
+                        enabled: &mut app.apu_editor.fast_enabled,
+                        value: &mut app.apu_editor.fast_w,
+                        dirty: Some(&mut app.apu_editor.fast_dirty),
+                        range: APU_POWER_MIN_W..=APU_POWER_MAX_W,
+                        step_by: None,
+                        suffix: " W",
+                        live_display: opt_f32(app.apu_editor.live_fast_w, "W"),
+                        live_is_muted: false,
+                        note: if fast_supported {
+                            fused_soft_note(
+                                fused.and_then(|f| f.fast_w),
+                                "Fused",
+                                APU_FAST_POWER_SOFT_MAX_W,
+                                "W",
                             )
-                            .suffix(" W"),
-                        )
-                        .changed()
-                    {
-                        app.apu_editor.fast_dirty = true;
-                    }
-                    ui.label(RichText::new(opt_f32(app.apu_editor.live_fast_w, "W")).monospace());
-                    let note = if supported {
-                        fused
-                            .and_then(|f| f.fast_w)
-                            .map(|w| format!("Fused: {w} W · soft ≤ {APU_FAST_POWER_SOFT_MAX_W} W"))
-                            .unwrap_or_else(|| format!("Soft max ≤ {APU_FAST_POWER_SOFT_MAX_W} W"))
-                    } else {
-                        "(unsupported on this CPU)".into()
-                    };
-                    ui.label(RichText::new(note).small().color(TEXT_MUTED));
-                    ui.end_row();
-                }
+                        } else {
+                            capability_disabled_hint(app.apu_editor.live_fast_w.is_some()).into()
+                        },
+                        note_color: TEXT_MUTED,
+                    },
+                );
 
                 // Slow PPT (W)
-                {
-                    let supported = caps.set_slow_limit.is_some();
-                    if !supported {
-                        app.apu_editor.slow_enabled = false;
-                    }
-                    ui.add_enabled(
-                        supported,
-                        egui::Checkbox::new(&mut app.apu_editor.slow_enabled, "Slow PPT (W)"),
-                    );
-                    if ui
-                        .add_enabled(
-                            supported && app.apu_editor.slow_enabled,
-                            egui::Slider::new(
-                                &mut app.apu_editor.slow_w,
-                                APU_POWER_MIN_W..=APU_POWER_MAX_W,
+                let slow_supported = caps.set_slow_limit.is_some();
+                render_limit_slider_row(
+                    ui,
+                    LimitSliderRow {
+                        label: "Slow PPT (W)",
+                        supported: slow_supported,
+                        enabled: &mut app.apu_editor.slow_enabled,
+                        value: &mut app.apu_editor.slow_w,
+                        dirty: Some(&mut app.apu_editor.slow_dirty),
+                        range: APU_POWER_MIN_W..=APU_POWER_MAX_W,
+                        step_by: None,
+                        suffix: " W",
+                        live_display: opt_f32(app.apu_editor.live_slow_w, "W"),
+                        live_is_muted: false,
+                        note: if slow_supported {
+                            fused_soft_note(
+                                fused.and_then(|f| f.slow_w),
+                                "Fused",
+                                APU_POWER_SOFT_MAX_W,
+                                "W",
                             )
-                            .suffix(" W"),
-                        )
-                        .changed()
-                    {
-                        app.apu_editor.slow_dirty = true;
-                    }
-                    ui.label(RichText::new(opt_f32(app.apu_editor.live_slow_w, "W")).monospace());
-                    let note = if supported {
-                        fused
-                            .and_then(|f| f.slow_w)
-                            .map(|w| format!("Fused: {w} W · soft ≤ {APU_POWER_SOFT_MAX_W} W"))
-                            .unwrap_or_else(|| format!("Soft max ≤ {APU_POWER_SOFT_MAX_W} W"))
-                    } else {
-                        "(unsupported on this CPU)".into()
-                    };
-                    ui.label(RichText::new(note).small().color(TEXT_MUTED));
-                    ui.end_row();
-                }
+                        } else {
+                            capability_disabled_hint(app.apu_editor.live_slow_w.is_some()).into()
+                        },
+                        note_color: TEXT_MUTED,
+                    },
+                );
 
                 // APU Slow (W)
-                {
-                    let supported = caps.set_apu_slow_limit.is_some();
-                    if !supported {
-                        app.apu_editor.apu_slow_enabled = false;
-                    }
-                    ui.add_enabled(
-                        supported,
-                        egui::Checkbox::new(&mut app.apu_editor.apu_slow_enabled, "APU Slow (W)"),
-                    );
-                    if ui
-                        .add_enabled(
-                            supported && app.apu_editor.apu_slow_enabled,
-                            egui::Slider::new(
-                                &mut app.apu_editor.apu_slow_w,
-                                APU_POWER_MIN_W..=APU_POWER_MAX_W,
+                let apu_slow_supported = caps.set_apu_slow_limit.is_some();
+                render_limit_slider_row(
+                    ui,
+                    LimitSliderRow {
+                        label: "APU Slow (W)",
+                        supported: apu_slow_supported,
+                        enabled: &mut app.apu_editor.apu_slow_enabled,
+                        value: &mut app.apu_editor.apu_slow_w,
+                        dirty: Some(&mut app.apu_editor.apu_slow_dirty),
+                        range: APU_POWER_MIN_W..=APU_POWER_MAX_W,
+                        step_by: None,
+                        suffix: " W",
+                        live_display: opt_f32(app.apu_editor.live_apu_slow_w, "W"),
+                        live_is_muted: false,
+                        note: if apu_slow_supported {
+                            fused_soft_note(
+                                fused.and_then(|f| f.apu_slow_w),
+                                "Fused",
+                                APU_POWER_SOFT_MAX_W,
+                                "W",
                             )
-                            .suffix(" W"),
-                        )
-                        .changed()
-                    {
-                        app.apu_editor.apu_slow_dirty = true;
-                    }
-                    ui.label(
-                        RichText::new(opt_f32(app.apu_editor.live_apu_slow_w, "W")).monospace(),
-                    );
-                    let note = if supported {
-                        fused
-                            .and_then(|f| f.apu_slow_w)
-                            .map(|w| format!("Fused: {w} W · soft ≤ {APU_POWER_SOFT_MAX_W} W"))
-                            .unwrap_or_else(|| format!("Soft max ≤ {APU_POWER_SOFT_MAX_W} W"))
-                    } else {
-                        "(unsupported on this CPU)".into()
-                    };
-                    ui.label(RichText::new(note).small().color(TEXT_MUTED));
-                    ui.end_row();
-                }
+                        } else {
+                            capability_disabled_hint(app.apu_editor.live_apu_slow_w.is_some())
+                                .into()
+                        },
+                        note_color: TEXT_MUTED,
+                    },
+                );
 
                 // STAPM Time Constant (s)
-                {
-                    let supported = caps.set_stapm_time.is_some();
-                    if !supported {
-                        app.apu_editor.stapm_time_enabled = false;
-                    }
-                    ui.add_enabled(
-                        supported,
-                        egui::Checkbox::new(
-                            &mut app.apu_editor.stapm_time_enabled,
-                            "STAPM Time Constant (s)",
-                        ),
-                    );
-                    ui.add_enabled(
-                        supported && app.apu_editor.stapm_time_enabled,
-                        egui::Slider::new(
-                            &mut app.apu_editor.stapm_time_s,
-                            APU_TIME_MIN_S..=APU_TIME_MAX_S,
-                        )
-                        .suffix(" s"),
-                    );
-                    ui.label(RichText::new("—").monospace().color(TEXT_MUTED));
-                    let note = if supported {
-                        format!("Range {APU_TIME_MIN_S}–{APU_TIME_MAX_S} s")
-                    } else {
-                        "(unsupported on this CPU)".into()
-                    };
-                    ui.label(RichText::new(note).small().color(TEXT_MUTED));
-                    ui.end_row();
-                }
+                let stapm_time_supported = caps.set_stapm_time.is_some();
+                render_limit_slider_row(
+                    ui,
+                    LimitSliderRow {
+                        label: "STAPM Time Constant (s)",
+                        supported: stapm_time_supported,
+                        enabled: &mut app.apu_editor.stapm_time_enabled,
+                        value: &mut app.apu_editor.stapm_time_s,
+                        dirty: None,
+                        range: APU_TIME_MIN_S..=APU_TIME_MAX_S,
+                        step_by: None,
+                        suffix: " s",
+                        live_display: "—".into(),
+                        live_is_muted: true,
+                        note: if stapm_time_supported {
+                            format!("Range {APU_TIME_MIN_S}–{APU_TIME_MAX_S} s")
+                        } else {
+                            capability_disabled_hint(false).into()
+                        },
+                        note_color: TEXT_MUTED,
+                    },
+                );
 
                 // Slow Time Constant (s)
-                {
-                    let supported = caps.set_slow_time.is_some();
-                    if !supported {
-                        app.apu_editor.slow_time_enabled = false;
-                    }
-                    ui.add_enabled(
-                        supported,
-                        egui::Checkbox::new(
-                            &mut app.apu_editor.slow_time_enabled,
-                            "Slow Time Constant (s)",
-                        ),
-                    );
-                    ui.add_enabled(
-                        supported && app.apu_editor.slow_time_enabled,
-                        egui::Slider::new(
-                            &mut app.apu_editor.slow_time_s,
-                            APU_TIME_MIN_S..=APU_TIME_MAX_S,
-                        )
-                        .suffix(" s"),
-                    );
-                    ui.label(RichText::new("—").monospace().color(TEXT_MUTED));
-                    let note = if supported {
-                        format!("Range {APU_TIME_MIN_S}–{APU_TIME_MAX_S} s")
-                    } else {
-                        "(unsupported on this CPU)".into()
-                    };
-                    ui.label(RichText::new(note).small().color(TEXT_MUTED));
-                    ui.end_row();
-                }
+                let slow_time_supported = caps.set_slow_time.is_some();
+                render_limit_slider_row(
+                    ui,
+                    LimitSliderRow {
+                        label: "Slow Time Constant (s)",
+                        supported: slow_time_supported,
+                        enabled: &mut app.apu_editor.slow_time_enabled,
+                        value: &mut app.apu_editor.slow_time_s,
+                        dirty: None,
+                        range: APU_TIME_MIN_S..=APU_TIME_MAX_S,
+                        step_by: None,
+                        suffix: " s",
+                        live_display: "—".into(),
+                        live_is_muted: true,
+                        note: if slow_time_supported {
+                            format!("Range {APU_TIME_MIN_S}–{APU_TIME_MAX_S} s")
+                        } else {
+                            capability_disabled_hint(false).into()
+                        },
+                        note_color: TEXT_MUTED,
+                    },
+                );
 
                 // SoC TDC Limit (A)
-                {
-                    let supported = caps.set_tdc_soc.is_some();
-                    if !supported {
-                        app.apu_editor.tdc_soc_enabled = false;
-                    }
-                    ui.add_enabled(
-                        supported,
-                        egui::Checkbox::new(
-                            &mut app.apu_editor.tdc_soc_enabled,
-                            "SoC TDC Limit (A)",
-                        ),
-                    );
-                    if ui
-                        .add_enabled(
-                            supported && app.apu_editor.tdc_soc_enabled,
-                            egui::Slider::new(
-                                &mut app.apu_editor.tdc_soc_a,
-                                APU_SOC_TDC_MIN_A..=APU_SOC_TDC_MAX_A,
+                let tdc_soc_supported = caps.set_tdc_soc.is_some();
+                render_limit_slider_row(
+                    ui,
+                    LimitSliderRow {
+                        label: "SoC TDC Limit (A)",
+                        supported: tdc_soc_supported,
+                        enabled: &mut app.apu_editor.tdc_soc_enabled,
+                        value: &mut app.apu_editor.tdc_soc_a,
+                        dirty: Some(&mut app.apu_editor.tdc_soc_dirty),
+                        range: APU_SOC_TDC_MIN_A..=APU_SOC_TDC_MAX_A,
+                        step_by: None,
+                        suffix: " A",
+                        live_display: opt_f32(app.apu_editor.live_tdc_soc_a, "A"),
+                        live_is_muted: false,
+                        note: if tdc_soc_supported {
+                            fused_soft_note(
+                                fused.and_then(|f| f.soc_tdc_a),
+                                "Fused SoC",
+                                APU_SOC_TDC_SOFT_MAX_A,
+                                "A",
                             )
-                            .suffix(" A"),
-                        )
-                        .changed()
-                    {
-                        app.apu_editor.tdc_soc_dirty = true;
-                    }
-                    ui.label(
-                        RichText::new(opt_f32(app.apu_editor.live_tdc_soc_a, "A")).monospace(),
-                    );
-                    let note = if supported {
-                        fused
-                            .and_then(|f| f.soc_tdc_a)
-                            .map(|a| format!("Fused SoC: {a} A · soft ≤ {APU_SOC_TDC_SOFT_MAX_A} A"))
-                            .unwrap_or_else(|| format!("Soft max ≤ {APU_SOC_TDC_SOFT_MAX_A} A"))
-                    } else {
-                        "(unsupported on this CPU)".into()
-                    };
-                    ui.label(RichText::new(note).small().color(TEXT_MUTED));
-                    ui.end_row();
-                }
+                        } else {
+                            capability_disabled_hint(app.apu_editor.live_tdc_soc_a.is_some()).into()
+                        },
+                        note_color: TEXT_MUTED,
+                    },
+                );
 
                 // SoC EDC Limit (A)
-                {
-                    let supported = caps.set_edc_soc.is_some();
-                    if !supported {
-                        app.apu_editor.edc_soc_enabled = false;
-                    }
-                    ui.add_enabled(
-                        supported,
-                        egui::Checkbox::new(
-                            &mut app.apu_editor.edc_soc_enabled,
-                            "SoC EDC Limit (A)",
-                        ),
-                    );
-                    if ui
-                        .add_enabled(
-                            supported && app.apu_editor.edc_soc_enabled,
-                            egui::Slider::new(
-                                &mut app.apu_editor.edc_soc_a,
-                                APU_SOC_EDC_MIN_A..=APU_SOC_EDC_MAX_A,
-                            )
-                            .suffix(" A"),
-                        )
-                        .changed()
-                    {
-                        app.apu_editor.edc_soc_dirty = true;
-                    }
-                    ui.label(
-                        RichText::new(opt_f32(app.apu_editor.live_edc_soc_a, "A")).monospace(),
-                    );
-                    let note = if supported {
-                        format!("Soft max ≤ {APU_SOC_EDC_SOFT_MAX_A} A")
-                    } else {
-                        "(unsupported on this CPU)".into()
-                    };
-                    ui.label(RichText::new(note).small().color(TEXT_MUTED));
-                    ui.end_row();
-                }
+                let edc_soc_supported = caps.set_edc_soc.is_some();
+                render_limit_slider_row(
+                    ui,
+                    LimitSliderRow {
+                        label: "SoC EDC Limit (A)",
+                        supported: edc_soc_supported,
+                        enabled: &mut app.apu_editor.edc_soc_enabled,
+                        value: &mut app.apu_editor.edc_soc_a,
+                        dirty: Some(&mut app.apu_editor.edc_soc_dirty),
+                        range: APU_SOC_EDC_MIN_A..=APU_SOC_EDC_MAX_A,
+                        step_by: None,
+                        suffix: " A",
+                        live_display: opt_f32(app.apu_editor.live_edc_soc_a, "A"),
+                        live_is_muted: false,
+                        note: if edc_soc_supported {
+                            format!("Soft max ≤ {APU_SOC_EDC_SOFT_MAX_A} A")
+                        } else {
+                            capability_disabled_hint(app.apu_editor.live_edc_soc_a.is_some()).into()
+                        },
+                        note_color: TEXT_MUTED,
+                    },
+                );
 
                 // APU Skin Temp (°C)
-                {
-                    let supported = caps.set_apu_skin_temp.is_some();
-                    if !supported {
-                        app.apu_editor.apu_skin_temp_enabled = false;
-                    }
-                    ui.add_enabled(
-                        supported,
-                        egui::Checkbox::new(
-                            &mut app.apu_editor.apu_skin_temp_enabled,
-                            "APU Skin Temp (°C)",
-                        ),
-                    );
-                    if ui
-                        .add_enabled(
-                            supported && app.apu_editor.apu_skin_temp_enabled,
-                            egui::Slider::new(
-                                &mut app.apu_editor.apu_skin_temp_c,
-                                APU_SKIN_TEMP_MIN_C..=APU_SKIN_TEMP_MAX_C,
-                            )
-                            .suffix(" °C"),
-                        )
-                        .changed()
-                    {
-                        app.apu_editor.apu_skin_temp_dirty = true;
-                    }
-                    ui.label(
-                        RichText::new(opt_f32(app.apu_editor.live_apu_skin_temp_c, "°C"))
-                            .monospace(),
-                    );
-                    let note = if supported {
-                        format!("Soft max ≤ {APU_SKIN_TEMP_SOFT_MAX_C} °C")
-                    } else {
-                        "(unsupported on this CPU)".into()
-                    };
-                    ui.label(RichText::new(note).small().color(TEXT_MUTED));
-                    ui.end_row();
-                }
+                let apu_skin_supported = caps.set_apu_skin_temp.is_some();
+                render_limit_slider_row(
+                    ui,
+                    LimitSliderRow {
+                        label: "APU Skin Temp (°C)",
+                        supported: apu_skin_supported,
+                        enabled: &mut app.apu_editor.apu_skin_temp_enabled,
+                        value: &mut app.apu_editor.apu_skin_temp_c,
+                        dirty: Some(&mut app.apu_editor.apu_skin_temp_dirty),
+                        range: APU_SKIN_TEMP_MIN_C..=APU_SKIN_TEMP_MAX_C,
+                        step_by: None,
+                        suffix: " °C",
+                        live_display: opt_f32(app.apu_editor.live_apu_skin_temp_c, "°C"),
+                        live_is_muted: false,
+                        note: if apu_skin_supported {
+                            format!("Soft max ≤ {APU_SKIN_TEMP_SOFT_MAX_C} °C")
+                        } else {
+                            capability_disabled_hint(app.apu_editor.live_apu_skin_temp_c.is_some())
+                                .into()
+                        },
+                        note_color: TEXT_MUTED,
+                    },
+                );
 
                 // dGPU Skin Temp (°C)
-                {
-                    let supported = caps.set_dgpu_skin_temp.is_some();
-                    if !supported {
-                        app.apu_editor.dgpu_skin_temp_enabled = false;
-                    }
-                    ui.add_enabled(
-                        supported,
-                        egui::Checkbox::new(
-                            &mut app.apu_editor.dgpu_skin_temp_enabled,
-                            "dGPU Skin Temp (°C)",
-                        ),
-                    );
-                    if ui
-                        .add_enabled(
-                            supported && app.apu_editor.dgpu_skin_temp_enabled,
-                            egui::Slider::new(
-                                &mut app.apu_editor.dgpu_skin_temp_c,
-                                APU_SKIN_TEMP_MIN_C..=APU_SKIN_TEMP_MAX_C,
+                let dgpu_skin_supported = caps.set_dgpu_skin_temp.is_some();
+                render_limit_slider_row(
+                    ui,
+                    LimitSliderRow {
+                        label: "dGPU Skin Temp (°C)",
+                        supported: dgpu_skin_supported,
+                        enabled: &mut app.apu_editor.dgpu_skin_temp_enabled,
+                        value: &mut app.apu_editor.dgpu_skin_temp_c,
+                        dirty: Some(&mut app.apu_editor.dgpu_skin_temp_dirty),
+                        range: APU_SKIN_TEMP_MIN_C..=APU_SKIN_TEMP_MAX_C,
+                        step_by: None,
+                        suffix: " °C",
+                        live_display: opt_f32(app.apu_editor.live_dgpu_skin_temp_c, "°C"),
+                        live_is_muted: false,
+                        note: if dgpu_skin_supported {
+                            format!("Soft max ≤ {APU_SKIN_TEMP_SOFT_MAX_C} °C")
+                        } else {
+                            capability_disabled_hint(
+                                app.apu_editor.live_dgpu_skin_temp_c.is_some(),
                             )
-                            .suffix(" °C"),
-                        )
-                        .changed()
-                    {
-                        app.apu_editor.dgpu_skin_temp_dirty = true;
-                    }
-                    ui.label(
-                        RichText::new(opt_f32(app.apu_editor.live_dgpu_skin_temp_c, "°C"))
-                            .monospace(),
-                    );
-                    let note = if supported {
-                        format!("Soft max ≤ {APU_SKIN_TEMP_SOFT_MAX_C} °C")
-                    } else {
-                        "(unsupported on this CPU)".into()
-                    };
-                    ui.label(RichText::new(note).small().color(TEXT_MUTED));
-                    ui.end_row();
-                }
+                            .into()
+                        },
+                        note_color: TEXT_MUTED,
+                    },
+                );
 
                 // Power Mode selector
                 {
@@ -2299,7 +2262,7 @@ fn render_apu_dptc_card(
                     let note = if supported {
                         "SMU performance / efficiency bias"
                     } else {
-                        "(unsupported on this CPU)"
+                        capability_disabled_hint(false)
                     };
                     ui.label(RichText::new(note).small().color(TEXT_MUTED));
                     ui.end_row();
@@ -2314,12 +2277,9 @@ fn render_apu_dptc_card(
 
         let any_extreme = app.apu_editor.has_any_extreme_for(hw);
         if any_extreme && !app.apu_editor.allow_extreme {
-            ui.label(
-                RichText::new(
-                    "One or more enabled APU values exceed conservative soft limits; enable 'Allow Extreme' to proceed.",
-                )
-                .small()
-                .color(ACCENT_AMBER),
+            render_extreme_warning(
+                ui,
+                "One or more enabled APU values exceed conservative soft limits; enable 'Allow Extreme' to proceed.",
             );
         }
 
@@ -2350,33 +2310,19 @@ fn opt_f32(v: Option<f32>, unit: &str) -> String {
 
 fn flag_pill(ui: &mut Ui, label: &str, val: Option<bool>) {
     match val {
-        Some(true) => pill(
-            ui,
-            &format!("{label}: Yes"),
-            ACCENT_EMERALD,
-            Color32::from_rgba_unmultiplied(34, 197, 94, 24),
-        ),
-        Some(false) => pill(
-            ui,
-            &format!("{label}: No"),
-            TEXT_MUTED,
-            Color32::from_rgb(30, 36, 48),
-        ),
+        Some(true) => tinted_pill(ui, &format!("{label}: Yes"), ACCENT_EMERALD, 24),
+        Some(false) => muted_pill(ui, &format!("{label}: No")),
         None => {}
     }
 }
 
 /// Tab 5: Declarative TOML Profiles, Rollback/Reset, Boot-Loop Guard, and Driver Safety Status.
 pub fn render_profiles_and_safety(app: &mut ZensmuApp, ui: &mut Ui, ctx: &egui::Context) {
-    ui.heading("Profiles & Safety");
-    ui.label(
-        RichText::new(
-            "Load, validate, diff, export, and apply declarative TOML profiles, or manage rollback and driver safety guards.",
-        )
-        .small()
-        .color(TEXT_MUTED),
+    render_tab_header(
+        ui,
+        "Profiles & Safety",
+        "Load, validate, diff, export, and apply declarative TOML profiles, or manage rollback and driver safety guards.",
     );
-    ui.add_space(10.0);
 
     let busy = app.runner.is_busy();
     let has_hw = app.hw.is_some();
@@ -2913,21 +2859,20 @@ fn render_persistence_card(
                     "Validate the TOML editor below, install it to /etc/zensmu/active.toml, and enable zensmu-apply.service",
                 )
                 .clicked()
+                && app.validate_editor_toml_for_persist()
             {
-                if app.validate_editor_toml_for_persist() {
-                    app.persist_confirm = Some(PersistConfirmModal {
-                        title: "Persist Editor TOML & Enable Boot Service".into(),
-                        summary: "This will install the validated TOML from the editor below as the active boot profile.".into(),
-                        changes: vec![
-                            format!("Install validated editor TOML to {active_path}"),
-                            format!("Ensure `ryzen_smu` is configured in {DEFAULT_MODULES_LOAD_PATH}"),
-                            format!("Run `systemctl enable {service_name}`"),
-                        ],
-                        confirm_label: "Persist Editor & Enable".into(),
-                        is_destructive: false,
-                        target: PersistConfirmTarget::EditorToml { enable: true },
-                    });
-                }
+                app.persist_confirm = Some(PersistConfirmModal {
+                    title: "Persist Editor TOML & Enable Boot Service".into(),
+                    summary: "This will install the validated TOML from the editor below as the active boot profile.".into(),
+                    changes: vec![
+                        format!("Install validated editor TOML to {active_path}"),
+                        format!("Ensure `ryzen_smu` is configured in {DEFAULT_MODULES_LOAD_PATH}"),
+                        format!("Run `systemctl enable {service_name}`"),
+                    ],
+                    confirm_label: "Persist Editor & Enable".into(),
+                    is_destructive: false,
+                    target: PersistConfirmTarget::EditorToml { enable: true },
+                });
             }
 
             if status.service_enabled {
@@ -2990,8 +2935,8 @@ fn render_persistence_card(
                 }
             }
 
-            if status.active_profile_exists {
-                if ui
+            if status.active_profile_exists
+                && ui
                     .add_enabled(
                         !busy,
                         egui::Button::new(
@@ -3002,23 +2947,22 @@ fn render_persistence_card(
                         "Disable zensmu-apply.service and delete /etc/zensmu/active.toml",
                     )
                     .clicked()
-                {
-                    app.persist_confirm = Some(PersistConfirmModal {
-                        title: "Disable & Remove Active Profile".into(),
-                        summary: "This will disable boot persistence and delete the active boot profile file.".into(),
-                        changes: vec![
-                            format!("Run `systemctl disable {service_name}`"),
-                            format!("Delete {active_path}"),
-                        ],
-                        confirm_label: "Disable & Remove".into(),
-                        is_destructive: true,
-                        target: PersistConfirmTarget::Cli(CliAction::PersistSetService {
-                            enable: false,
-                            remove_profile: true,
-                            allow_extreme: false,
-                        }),
-                    });
-                }
+            {
+                app.persist_confirm = Some(PersistConfirmModal {
+                    title: "Disable & Remove Active Profile".into(),
+                    summary: "This will disable boot persistence and delete the active boot profile file.".into(),
+                    changes: vec![
+                        format!("Run `systemctl disable {service_name}`"),
+                        format!("Delete {active_path}"),
+                    ],
+                    confirm_label: "Disable & Remove".into(),
+                    is_destructive: true,
+                    target: PersistConfirmTarget::Cli(CliAction::PersistSetService {
+                        enable: false,
+                        remove_profile: true,
+                        allow_extreme: false,
+                    }),
+                });
             }
         });
     });
@@ -3241,11 +3185,11 @@ pub fn render_dry_run_modal(app: &mut ZensmuApp, ctx: &egui::Context) {
             });
         });
 
-    if close_modal {
-        app.pending_modal = None;
-    }
     if let Some(action) = confirm_action {
+        app.pending_modal = None;
         app.dispatch_cli(action, ctx);
+    } else if close_modal {
+        app.dismiss_dry_run_modal();
     }
 }
 

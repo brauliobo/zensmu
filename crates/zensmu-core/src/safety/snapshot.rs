@@ -1,13 +1,12 @@
 //! Pre-change SMU state snapshots and atomic persistence for rollback.
 
 use crate::error::{Error, Result};
+use crate::safety::{map_io_err, now_unix_secs, write_atomic, write_atomic_create_new};
 use crate::types::{Codename, CurveShaperState};
 use serde::{Deserialize, Serialize};
-use std::fs::{self, File};
-use std::io::{ErrorKind, Write};
+use std::fs;
+use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{SystemTime, UNIX_EPOCH};
 
 /// Default runtime directory for ephemeral boot-scoped snapshots.
 pub const DEFAULT_STATE_DIR: &str = "/run/zensmu";
@@ -20,8 +19,6 @@ pub const LAST_STATE_FILE: &str = "last-state.json";
 
 /// Current on-disk snapshot schema version.
 pub const SNAPSHOT_SCHEMA_VERSION: u32 = 1;
-
-static TMP_SEQ: AtomicU64 = AtomicU64::new(0);
 
 /// Captured hardware SMU state used for rollback and profile diffing.
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
@@ -117,54 +114,14 @@ impl SnapshotStore {
     /// Returns `Ok(true)` if the boot baseline was created, or `Ok(false)` if one was already
     /// captured earlier in this boot.
     pub fn ensure_boot_baseline(&self, snap: &SmuStateSnapshot) -> Result<bool> {
-        let target = self.boot_baseline_path();
-        if target.exists() {
-            return Ok(false);
-        }
-
-        self.ensure_dir()?;
         let json = serialize_snapshot(snap)?;
-        let tmp_path = self.write_temp_file(BOOT_BASELINE_FILE, json.as_bytes())?;
-
-        // Use POSIX hard_link for atomic create-if-not-exists, falling back to rename if unsupported.
-        match fs::hard_link(&tmp_path, &target) {
-            Ok(()) => {
-                let _ = fs::remove_file(&tmp_path);
-                sync_dir_best_effort(&self.dir);
-                Ok(true)
-            }
-            Err(e) if e.kind() == ErrorKind::AlreadyExists => {
-                let _ = fs::remove_file(&tmp_path);
-                Ok(false)
-            }
-            Err(_) => {
-                if target.exists() {
-                    let _ = fs::remove_file(&tmp_path);
-                    return Ok(false);
-                }
-                fs::rename(&tmp_path, &target).map_err(|e| {
-                    let _ = fs::remove_file(&tmp_path);
-                    map_io_err(&target, e)
-                })?;
-                sync_dir_best_effort(&self.dir);
-                Ok(true)
-            }
-        }
+        write_atomic_create_new(&self.boot_baseline_path(), json.as_bytes())
     }
 
     /// Atomically save `last-state.json` (write to temp file + fsync + rename).
     pub fn save_last_state(&self, snap: &SmuStateSnapshot) -> Result<()> {
-        self.ensure_dir()?;
-        let target = self.last_state_path();
         let json = serialize_snapshot(snap)?;
-        let tmp_path = self.write_temp_file(LAST_STATE_FILE, json.as_bytes())?;
-
-        fs::rename(&tmp_path, &target).map_err(|e| {
-            let _ = fs::remove_file(&tmp_path);
-            map_io_err(&target, e)
-        })?;
-        sync_dir_best_effort(&self.dir);
-        Ok(())
+        write_atomic(&self.last_state_path(), json.as_bytes())
     }
 
     /// Load `boot-baseline.json` if it exists, or `Ok(None)` if not yet captured.
@@ -175,24 +132,6 @@ impl SnapshotStore {
     /// Load `last-state.json` if it exists, or `Ok(None)` if not yet captured.
     pub fn load_last_state(&self) -> Result<Option<SmuStateSnapshot>> {
         load_snapshot_file(&self.last_state_path())
-    }
-
-    fn ensure_dir(&self) -> Result<()> {
-        fs::create_dir_all(&self.dir).map_err(|e| map_io_err(&self.dir, e))
-    }
-
-    fn write_temp_file(&self, prefix: &str, bytes: &[u8]) -> Result<PathBuf> {
-        let seq = TMP_SEQ.fetch_add(1, Ordering::Relaxed);
-        let pid = std::process::id();
-        let tmp_path = self.dir.join(format!(".{prefix}.{pid}.{seq}.tmp"));
-
-        let mut file = File::create(&tmp_path).map_err(|e| map_io_err(&tmp_path, e))?;
-        if let Err(e) = file.write_all(bytes).and_then(|()| file.sync_all()) {
-            let _ = fs::remove_file(&tmp_path);
-            return Err(map_io_err(&tmp_path, e));
-        }
-
-        Ok(tmp_path)
     }
 }
 
@@ -224,32 +163,6 @@ fn load_snapshot_file(path: &Path) -> Result<Option<SmuStateSnapshot>> {
         )));
     }
     Ok(Some(snap))
-}
-
-fn now_unix_secs() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0)
-}
-
-fn sync_dir_best_effort(dir: &Path) {
-    if let Ok(d) = File::open(dir) {
-        let _ = d.sync_all();
-    }
-}
-
-fn map_io_err(path: &Path, source: std::io::Error) -> Error {
-    if source.kind() == ErrorKind::PermissionDenied {
-        Error::PermissionDenied {
-            path: path.display().to_string(),
-        }
-    } else {
-        Error::Io {
-            path: path.display().to_string(),
-            source,
-        }
-    }
 }
 
 #[cfg(test)]

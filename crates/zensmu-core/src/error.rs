@@ -61,7 +61,9 @@ pub enum Error {
     #[error("ryzen_smu sysfs not found at {path} (is the ryzen_smu kernel module loaded? try: sudo modprobe ryzen_smu)")]
     DriverNotLoaded { path: String },
 
-    #[error("permission denied accessing {path} (mailbox operations require root / sudo or pkexec)")]
+    #[error(
+        "permission denied accessing {path} (mailbox operations require root / sudo or pkexec)"
+    )]
     PermissionDenied { path: String },
 
     #[error("failed to acquire exclusive SMU transaction lock {path}: {reason}")]
@@ -90,7 +92,9 @@ pub enum Error {
         status: String,
     },
 
-    #[error("SMU mailbox health check failed on {mailbox}: expected {expected:#X}, got {actual:#X}")]
+    #[error(
+        "SMU mailbox health check failed on {mailbox}: expected {expected:#X}, got {actual:#X}"
+    )]
     MailboxUnhealthy {
         mailbox: &'static str,
         expected: u32,

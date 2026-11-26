@@ -4,6 +4,7 @@
 use crate::config::profile::Profile;
 use crate::error::{Error, Result};
 use crate::safety::guard::{BootLoopGuard, DEFAULT_GUARD_PATH};
+use crate::safety::{remove_file_if_exists, write_atomic};
 use crate::types::Codename;
 use serde::{Deserialize, Serialize};
 use std::fs;
@@ -110,7 +111,11 @@ pub fn read_persist_status(
         active_profile_codename,
         modules_load_configured,
         service_name: paths.service_name.clone(),
-        service_installed: service_installed || service_state != "not-found",
+        service_installed: service_installed
+            || !matches!(
+                service_state.as_str(),
+                "not-found" | "systemctl-unavailable"
+            ),
         service_enabled,
         service_state,
         resume_hook_installed,
@@ -142,18 +147,17 @@ fn query_systemd_enabled(service: &str) -> (bool, String) {
     }
 }
 
-/// Ensure `/etc/modules-load.d/ryzen_smu.conf` contains `ryzen_smu` (idempotent).
+/// Ensure `/etc/modules-load.d/ryzen_smu.conf` contains `ryzen_smu` (idempotent, atomic).
 pub fn ensure_modules_load_conf(path: &Path) -> Result<bool> {
     if let Ok(existing) = fs::read_to_string(path) {
         if existing.lines().any(|l| l.trim() == "ryzen_smu") {
             return Ok(false);
         }
     }
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent).map_err(|source| map_io_err(parent, source))?;
-    }
-    fs::write(path, "# Autoload AMD Ryzen SMU driver for zensmu\nryzen_smu\n")
-        .map_err(|source| map_io_err(path, source))?;
+    write_atomic(
+        path,
+        b"# Autoload AMD Ryzen SMU driver for zensmu\nryzen_smu\n",
+    )?;
     Ok(true)
 }
 
@@ -208,9 +212,10 @@ pub fn set_service_enabled(
         let stderr = String::from_utf8_lossy(&out.stderr).trim().to_string();
         let stdout = String::from_utf8_lossy(&out.stdout).trim().to_string();
         let msg = if !stderr.is_empty() { stderr } else { stdout };
-        if msg.to_ascii_lowercase().contains("permission denied")
-            || msg.to_ascii_lowercase().contains("access denied")
-            || msg.to_ascii_lowercase().contains("authentication")
+        let lower = msg.to_ascii_lowercase();
+        if lower.contains("permission denied")
+            || lower.contains("access denied")
+            || lower.contains("authentication")
         {
             return Err(Error::PermissionDenied {
                 path: format!("systemctl {verb} {}", paths.service_name),
@@ -231,25 +236,7 @@ pub fn set_service_enabled(
 
 /// Remove the active boot profile (`/etc/zensmu/active.toml`) if present.
 pub fn remove_active_profile(paths: &PersistPaths) -> Result<bool> {
-    if !paths.active_profile.exists() {
-        return Ok(false);
-    }
-    fs::remove_file(&paths.active_profile)
-        .map_err(|source| map_io_err(&paths.active_profile, source))?;
-    Ok(true)
-}
-
-fn map_io_err(path: &Path, source: std::io::Error) -> Error {
-    if source.kind() == std::io::ErrorKind::PermissionDenied {
-        Error::PermissionDenied {
-            path: path.display().to_string(),
-        }
-    } else {
-        Error::Io {
-            path: path.display().to_string(),
-            source,
-        }
-    }
+    remove_file_if_exists(&paths.active_profile)
 }
 
 #[cfg(test)]
@@ -265,7 +252,9 @@ mod tests {
             active_profile: dir.path().join("etc/zensmu/active.toml"),
             modules_load: dir.path().join("etc/modules-load.d/ryzen_smu.conf"),
             guard_path: dir.path().join("var/lib/zensmu/applying.lock"),
-            resume_hook: dir.path().join("usr/lib/systemd/system-sleep/zensmu-resume"),
+            resume_hook: dir
+                .path()
+                .join("usr/lib/systemd/system-sleep/zensmu-resume"),
             service_name: DEFAULT_SERVICE_NAME.to_string(),
         };
 

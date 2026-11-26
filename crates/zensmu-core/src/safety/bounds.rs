@@ -4,43 +4,65 @@ use crate::error::{Error, Result};
 use crate::hw::profiles::{capabilities_for, CoBounds};
 use crate::types::{Codename, TempBand};
 
+// --- iGPU Curve Optimizer bounds ---
+pub const IGPU_CO_MIN: i32 = -30;
+pub const IGPU_CO_MAX: i32 = 30;
+pub const IGPU_CO_SOFT_MIN: i32 = -25;
+
 // --- Curve Shaper bounds (Zen 5) ---
 pub const SHAPER_MIN: i32 = -50;
-pub const SHAPER_MAX: i32 = 50;
+pub const SHAPER_MAX: i32 = 30;
 pub const SHAPER_SOFT_MIN: i32 = -35;
 
 // --- PBO limit bounds ---
+// Hard ceilings accommodate BIOS "Motherboard/Unlimited" PBO profiles (e.g. PPT=1000W)
+// so snapshots and rollbacks never fail, while conservative soft ceilings still require `--allow-extreme`.
 pub const PPT_MIN_W: u32 = 10;
 pub const PPT_MAX_W: u32 = 1000;
-pub const PPT_SOFT_MAX_W: u32 = 400;
+pub const PPT_SOFT_MAX_W: u32 = 230;
 
 pub const TDC_MIN_A: u32 = 10;
-pub const TDC_MAX_A: u32 = 600;
-pub const TDC_SOFT_MAX_A: u32 = 300;
+pub const TDC_MAX_A: u32 = 500;
+pub const TDC_SOFT_MAX_A: u32 = 180;
 
 pub const EDC_MIN_A: u32 = 10;
-pub const EDC_MAX_A: u32 = 800;
-pub const EDC_SOFT_MAX_A: u32 = 400;
+pub const EDC_MAX_A: u32 = 500;
+pub const EDC_SOFT_MAX_A: u32 = 240;
 
+// Hard thermal ceiling of 95°C (never overridden by `--allow-extreme`).
 pub const TCTL_MIN_C: u32 = 40;
-pub const TCTL_MAX_C: u32 = 105;
+pub const TCTL_MAX_C: u32 = 95;
 pub const TCTL_SOFT_MAX_C: u32 = 95;
 
 pub const PBO_SCALAR_MIN: u32 = 1;
 pub const PBO_SCALAR_MAX: u32 = 10;
+pub const PBO_SCALAR_SOFT_MAX: u32 = 4;
 
-pub const FMAX_MIN_MHZ: u32 = 1000;
-pub const FMAX_MAX_MHZ: u32 = 7000;
+pub const FMAX_MIN_MHZ: u32 = 2000;
+pub const FMAX_MAX_MHZ: u32 = 6500;
 pub const FMAX_SOFT_MAX_MHZ: u32 = 6200;
+pub const FMAX_SOFT_DELTA_MHZ: u32 = 200;
 
 // --- APU DPTC limit bounds ---
 pub const APU_POWER_MIN_W: u32 = 5;
-pub const APU_POWER_MAX_W: u32 = 300;
-pub const APU_POWER_SOFT_MAX_W: u32 = 150;
+pub const APU_POWER_MAX_W: u32 = 150;
+pub const APU_POWER_SOFT_MAX_W: u32 = 100;
+pub const APU_FAST_POWER_SOFT_MAX_W: u32 = 120;
+
+pub const APU_TIME_MIN_S: u32 = 1;
+pub const APU_TIME_MAX_S: u32 = 600;
+
+pub const APU_SOC_TDC_MIN_A: u32 = 5;
+pub const APU_SOC_TDC_MAX_A: u32 = 100;
+pub const APU_SOC_TDC_SOFT_MAX_A: u32 = 60;
+
+pub const APU_SOC_EDC_MIN_A: u32 = 5;
+pub const APU_SOC_EDC_MAX_A: u32 = 150;
+pub const APU_SOC_EDC_SOFT_MAX_A: u32 = 90;
 
 pub const SKIN_TEMP_MIN_C: u32 = 30;
-pub const SKIN_TEMP_MAX_C: u32 = 100;
-pub const SKIN_TEMP_SOFT_MAX_C: u32 = 90;
+pub const SKIN_TEMP_MAX_C: u32 = 95;
+pub const SKIN_TEMP_SOFT_MAX_C: u32 = 80;
 
 /// Parse a positive unsigned integer with no leading sign or non-digit characters.
 fn parse_strict_u64(num_str: &str, original: &str, kind: &str) -> Result<u64> {
@@ -57,46 +79,55 @@ fn parse_strict_u64(num_str: &str, original: &str, kind: &str) -> Result<u64> {
     })
 }
 
+fn parse_milli_or_base_unit(
+    s: &str,
+    kind: &str,
+    milli_suffix: &str,
+    milli_label: &str,
+    base_suffix: char,
+    base_label: &str,
+) -> Result<u32> {
+    let trimmed = s.trim();
+    if trimmed.is_empty() {
+        return Err(Error::InvalidInput(format!("{kind} value cannot be empty")));
+    }
+
+    let lower = trimmed.to_ascii_lowercase();
+    let value_u64 = if let Some(num_part) = lower.strip_suffix(milli_suffix) {
+        let milli = parse_strict_u64(num_part, s, kind)?;
+        if milli < 1000 {
+            return Err(Error::InvalidInput(format!(
+                "invalid {kind} value '{s}': {milli_label} value must be at least 1000{base_label}"
+            )));
+        }
+        milli.checked_add(500).ok_or_else(|| {
+            Error::InvalidInput(format!("invalid {kind} value '{s}': numeric overflow"))
+        })? / 1000
+    } else if let Some(num_part) = lower.strip_suffix(base_suffix) {
+        parse_strict_u64(num_part, s, kind)?
+    } else {
+        parse_strict_u64(trimmed, s, kind)?
+    };
+
+    if value_u64 == 0 {
+        return Err(Error::InvalidInput(format!(
+            "invalid {kind} value '{s}': must be greater than zero"
+        )));
+    }
+
+    u32::try_from(value_u64).map_err(|_| {
+        Error::InvalidInput(format!(
+            "invalid {kind} value '{s}': exceeds maximum u32 range"
+        ))
+    })
+}
+
 /// Parse a positive wattage value.
 ///
 /// Accepts `"88"`, `"88W"`, `"88w"`, `"88000mW"`, `"88000mw"` (optional space before unit).
 /// Rejects zero, negative values, non-numeric inputs, overflow, and milliwatt values `< 1000mW`.
 pub fn parse_watts(s: &str) -> Result<u32> {
-    let trimmed = s.trim();
-    if trimmed.is_empty() {
-        return Err(Error::InvalidInput("wattage value cannot be empty".into()));
-    }
-
-    let lower = trimmed.to_ascii_lowercase();
-    let watts_u64 = if let Some(num_part) = lower.strip_suffix("mw") {
-        let mw = parse_strict_u64(num_part, s, "wattage")?;
-        if mw < 1000 {
-            return Err(Error::InvalidInput(format!(
-                "invalid wattage value '{s}': milliwatt value must be at least 1000mW (1W)"
-            )));
-        }
-        mw.checked_add(500)
-            .ok_or_else(|| {
-                Error::InvalidInput(format!("invalid wattage value '{s}': numeric overflow"))
-            })?
-            / 1000
-    } else if let Some(num_part) = lower.strip_suffix('w') {
-        parse_strict_u64(num_part, s, "wattage")?
-    } else {
-        parse_strict_u64(trimmed, s, "wattage")?
-    };
-
-    if watts_u64 == 0 {
-        return Err(Error::InvalidInput(format!(
-            "invalid wattage value '{s}': must be greater than zero"
-        )));
-    }
-
-    u32::try_from(watts_u64).map_err(|_| {
-        Error::InvalidInput(format!(
-            "invalid wattage value '{s}': exceeds maximum u32 range"
-        ))
-    })
+    parse_milli_or_base_unit(s, "wattage", "mw", "milliwatt", 'w', "mW (1W)")
 }
 
 /// Parse a positive current value in amperes.
@@ -104,41 +135,7 @@ pub fn parse_watts(s: &str) -> Result<u32> {
 /// Accepts `"75"`, `"75A"`, `"75a"`, `"75000mA"`, `"75000ma"` (optional space before unit).
 /// Rejects zero, negative values, non-numeric inputs, overflow, and milliamp values `< 1000mA`.
 pub fn parse_amps(s: &str) -> Result<u32> {
-    let trimmed = s.trim();
-    if trimmed.is_empty() {
-        return Err(Error::InvalidInput("current value cannot be empty".into()));
-    }
-
-    let lower = trimmed.to_ascii_lowercase();
-    let amps_u64 = if let Some(num_part) = lower.strip_suffix("ma") {
-        let ma = parse_strict_u64(num_part, s, "current")?;
-        if ma < 1000 {
-            return Err(Error::InvalidInput(format!(
-                "invalid current value '{s}': milliamp value must be at least 1000mA (1A)"
-            )));
-        }
-        ma.checked_add(500)
-            .ok_or_else(|| {
-                Error::InvalidInput(format!("invalid current value '{s}': numeric overflow"))
-            })?
-            / 1000
-    } else if let Some(num_part) = lower.strip_suffix('a') {
-        parse_strict_u64(num_part, s, "current")?
-    } else {
-        parse_strict_u64(trimmed, s, "current")?
-    };
-
-    if amps_u64 == 0 {
-        return Err(Error::InvalidInput(format!(
-            "invalid current value '{s}': must be greater than zero"
-        )));
-    }
-
-    u32::try_from(amps_u64).map_err(|_| {
-        Error::InvalidInput(format!(
-            "invalid current value '{s}': exceeds maximum u32 range"
-        ))
-    })
+    parse_milli_or_base_unit(s, "current", "ma", "milliamp", 'a', "mA (1A)")
 }
 
 /// Parse a positive temperature value in degrees Celsius.
@@ -192,9 +189,7 @@ pub fn parse_mhz(s: &str) -> Result<u32> {
         if num_str.is_empty()
             || num_str.starts_with('-')
             || num_str.starts_with('+')
-            || !num_str
-                .bytes()
-                .all(|b| b.is_ascii_digit() || b == b'.')
+            || !num_str.bytes().all(|b| b.is_ascii_digit() || b == b'.')
             || num_str.bytes().filter(|&b| b == b'.').count() > 1
         {
             return Err(Error::InvalidInput(format!(
@@ -202,9 +197,9 @@ pub fn parse_mhz(s: &str) -> Result<u32> {
             )));
         }
 
-        let ghz: f64 = num_str.parse().map_err(|_| {
-            Error::InvalidInput(format!("invalid frequency value '{s}'"))
-        })?;
+        let ghz: f64 = num_str
+            .parse()
+            .map_err(|_| Error::InvalidInput(format!("invalid frequency value '{s}'")))?;
         if !ghz.is_finite() || ghz <= 0.0 {
             return Err(Error::InvalidInput(format!(
                 "invalid frequency value '{s}': must be greater than zero"
@@ -370,9 +365,9 @@ fn parse_core_index(s: &str, max_cores: usize) -> Result<u32> {
             "invalid core index '{s}': expected non-negative integer"
         )));
     }
-    let idx: u32 = trimmed.parse().map_err(|_| {
-        Error::InvalidInput(format!("invalid core index '{s}': numeric overflow"))
-    })?;
+    let idx: u32 = trimmed
+        .parse()
+        .map_err(|_| Error::InvalidInput(format!("invalid core index '{s}': numeric overflow")))?;
     if (idx as usize) >= max_cores {
         return Err(Error::OutOfBounds {
             field: "core_index".into(),
@@ -536,7 +531,21 @@ pub fn validate_co_margin_for_codename(
     validate_co_margin(field, margin, bounds, allow_extreme)
 }
 
-/// Validate a Zen 5 Curve Shaper margin (`-50..=50`, conservative soft limit `>= -35`).
+/// Validate an iGPU Curve Optimizer margin (`-30..=30`, conservative soft limit `>= -25`).
+pub fn validate_igpu_co_margin(field: &str, margin: i32, allow_extreme: bool) -> Result<()> {
+    validate_co_margin(
+        field,
+        margin,
+        CoBounds {
+            min: IGPU_CO_MIN,
+            max: IGPU_CO_MAX,
+            soft_min: IGPU_CO_SOFT_MIN,
+        },
+        allow_extreme,
+    )
+}
+
+/// Validate a Zen 5 Curve Shaper margin (`-50..=30`, conservative soft limit `>= -35`).
 pub fn validate_shaper_margin(field: &str, margin: i32, allow_extreme: bool) -> Result<()> {
     if !(SHAPER_MIN..=SHAPER_MAX).contains(&margin) {
         return Err(Error::OutOfBounds {
@@ -595,31 +604,31 @@ pub fn validate_edc_amps(amps: u32, allow_extreme: bool) -> Result<()> {
 }
 
 /// Validate PBO thermal throttle limit (Tctl / TjMax) in degrees Celsius.
-pub fn validate_tctl_celsius(temp_c: u32, allow_extreme: bool) -> Result<()> {
+///
+/// Hard ceiling is `95°C` (`TCTL_MAX_C`) and is never overridden by `allow_extreme`.
+pub fn validate_tctl_celsius(temp_c: u32, _allow_extreme: bool) -> Result<()> {
+    validate_u32_hard_range("pbo.tctl_c", temp_c, TCTL_MIN_C, TCTL_MAX_C, "°C")
+}
+
+/// Validate PBO scalar hard range (`1..=10`).
+pub fn validate_pbo_scalar(scalar: u32) -> Result<()> {
+    validate_u32_hard_range("pbo.scalar", scalar, PBO_SCALAR_MIN, PBO_SCALAR_MAX, "x")
+}
+
+/// Validate PBO scalar against hard range (`1..=10`) and soft limit (`<= 4x`).
+pub fn validate_pbo_scalar_checked(scalar: u32, allow_extreme: bool) -> Result<()> {
     validate_u32_with_soft_max(
-        "pbo.tctl_c",
-        temp_c,
-        TCTL_MIN_C,
-        TCTL_MAX_C,
-        TCTL_SOFT_MAX_C,
-        "°C",
+        "pbo.scalar",
+        scalar,
+        PBO_SCALAR_MIN,
+        PBO_SCALAR_MAX,
+        PBO_SCALAR_SOFT_MAX,
+        "x",
         allow_extreme,
     )
 }
 
-/// Validate PBO scalar (`1..=10`).
-pub fn validate_pbo_scalar(scalar: u32) -> Result<()> {
-    if !(PBO_SCALAR_MIN..=PBO_SCALAR_MAX).contains(&scalar) {
-        return Err(Error::OutOfBounds {
-            field: "pbo.scalar".into(),
-            value: format!("{scalar}x"),
-            bounds: format!("{PBO_SCALAR_MIN}x..={PBO_SCALAR_MAX}x"),
-        });
-    }
-    Ok(())
-}
-
-/// Validate Fmax boost clock ceiling in MHz.
+/// Validate Fmax boost clock ceiling in MHz (hard range `2000..=6500` + offline soft ceiling `6200`).
 pub fn validate_fmax_mhz(mhz: u32, allow_extreme: bool) -> Result<()> {
     validate_u32_with_soft_max(
         "pbo.fmax_mhz",
@@ -632,7 +641,13 @@ pub fn validate_fmax_mhz(mhz: u32, allow_extreme: bool) -> Result<()> {
     )
 }
 
-/// Validate an APU power limit (STAPM, Fast, Slow, APU Slow) in watts.
+/// Validate Fmax boost clock ceiling hard range (`2000..=6500 MHz`), used when live
+/// relative soft-delta (`current + 200 MHz`) checking is performed separately.
+pub fn validate_fmax_hard_mhz(mhz: u32) -> Result<()> {
+    validate_u32_hard_range("pbo.fmax_mhz", mhz, FMAX_MIN_MHZ, FMAX_MAX_MHZ, "MHz")
+}
+
+/// Validate an APU sustained/slow power limit (STAPM, Slow, APU Slow) in watts.
 pub fn validate_apu_watts(field: &str, watts: u32, allow_extreme: bool) -> Result<()> {
     validate_u32_with_soft_max(
         field,
@@ -645,7 +660,51 @@ pub fn validate_apu_watts(field: &str, watts: u32, allow_extreme: bool) -> Resul
     )
 }
 
-/// Validate an APU or dGPU skin temperature limit in degrees Celsius.
+/// Validate an APU Fast PPT power limit in watts (soft ceiling `120W`, hard ceiling `150W`).
+pub fn validate_apu_fast_watts(field: &str, watts: u32, allow_extreme: bool) -> Result<()> {
+    validate_u32_with_soft_max(
+        field,
+        watts,
+        APU_POWER_MIN_W,
+        APU_POWER_MAX_W,
+        APU_FAST_POWER_SOFT_MAX_W,
+        "W",
+        allow_extreme,
+    )
+}
+
+/// Validate an APU STAPM/Slow time constant in seconds (`1..=600s`).
+pub fn validate_apu_time_secs(field: &str, secs: u32) -> Result<()> {
+    validate_u32_hard_range(field, secs, APU_TIME_MIN_S, APU_TIME_MAX_S, "s")
+}
+
+/// Validate an APU SoC TDC current limit in amps (`5..=100A`, soft `<= 60A`).
+pub fn validate_apu_soc_tdc_amps(field: &str, amps: u32, allow_extreme: bool) -> Result<()> {
+    validate_u32_with_soft_max(
+        field,
+        amps,
+        APU_SOC_TDC_MIN_A,
+        APU_SOC_TDC_MAX_A,
+        APU_SOC_TDC_SOFT_MAX_A,
+        "A",
+        allow_extreme,
+    )
+}
+
+/// Validate an APU SoC EDC current limit in amps (`5..=150A`, soft `<= 90A`).
+pub fn validate_apu_soc_edc_amps(field: &str, amps: u32, allow_extreme: bool) -> Result<()> {
+    validate_u32_with_soft_max(
+        field,
+        amps,
+        APU_SOC_EDC_MIN_A,
+        APU_SOC_EDC_MAX_A,
+        APU_SOC_EDC_SOFT_MAX_A,
+        "A",
+        allow_extreme,
+    )
+}
+
+/// Validate an APU or dGPU skin temperature limit in degrees Celsius (`30..=95°C`, soft `<= 80°C`).
 pub fn validate_skin_temp_celsius(field: &str, temp_c: u32, allow_extreme: bool) -> Result<()> {
     validate_u32_with_soft_max(
         field,
@@ -658,6 +717,17 @@ pub fn validate_skin_temp_celsius(field: &str, temp_c: u32, allow_extreme: bool)
     )
 }
 
+fn validate_u32_hard_range(field: &str, value: u32, min: u32, max: u32, unit: &str) -> Result<()> {
+    if value < min || value > max {
+        return Err(Error::OutOfBounds {
+            field: field.to_string(),
+            value: format!("{value}{unit}"),
+            bounds: format!("{min}{unit}..={max}{unit}"),
+        });
+    }
+    Ok(())
+}
+
 fn validate_u32_with_soft_max(
     field: &str,
     value: u32,
@@ -667,13 +737,7 @@ fn validate_u32_with_soft_max(
     unit: &str,
     allow_extreme: bool,
 ) -> Result<()> {
-    if value < min || value > max {
-        return Err(Error::OutOfBounds {
-            field: field.to_string(),
-            value: format!("{value}{unit}"),
-            bounds: format!("{min}{unit}..={max}{unit}"),
-        });
-    }
+    validate_u32_hard_range(field, value, min, max, unit)?;
     if !allow_extreme && value > soft_max {
         return Err(Error::ExtremeValueBlocked {
             field: field.to_string(),
@@ -875,14 +939,14 @@ mod tests {
             Err(Error::OutOfBounds { .. })
         ));
 
+        // Tctl hard ceiling is 95°C even with allow_extreme
         assert!(validate_tctl_celsius(95, false).is_ok());
         assert!(matches!(
-            validate_tctl_celsius(100, false),
-            Err(Error::ExtremeValueBlocked { .. })
+            validate_tctl_celsius(96, false),
+            Err(Error::OutOfBounds { .. })
         ));
-        assert!(validate_tctl_celsius(100, true).is_ok());
         assert!(matches!(
-            validate_tctl_celsius(110, true),
+            validate_tctl_celsius(96, true),
             Err(Error::OutOfBounds { .. })
         ));
 
@@ -894,6 +958,39 @@ mod tests {
         ));
         assert!(matches!(
             validate_pbo_scalar(11),
+            Err(Error::OutOfBounds { .. })
+        ));
+        assert!(validate_pbo_scalar_checked(4, false).is_ok());
+        assert!(matches!(
+            validate_pbo_scalar_checked(5, false),
+            Err(Error::ExtremeValueBlocked { .. })
+        ));
+        assert!(validate_pbo_scalar_checked(10, true).is_ok());
+
+        // Unified shaper, iGPU CO, and APU bounds match live ops
+        assert!(matches!(
+            validate_shaper_margin("shaper", 31, true),
+            Err(Error::OutOfBounds { .. })
+        ));
+        assert!(matches!(
+            validate_igpu_co_margin("igpu", -26, false),
+            Err(Error::ExtremeValueBlocked { .. })
+        ));
+        assert!(matches!(
+            validate_igpu_co_margin("igpu", -31, true),
+            Err(Error::OutOfBounds { .. })
+        ));
+        assert!(validate_apu_fast_watts("apu.fast_w", 115, false).is_ok());
+        assert!(matches!(
+            validate_apu_watts("apu.stapm_w", 115, false),
+            Err(Error::ExtremeValueBlocked { .. })
+        ));
+        assert!(matches!(
+            validate_skin_temp_celsius("apu.apu_skin_temp_c", 85, false),
+            Err(Error::ExtremeValueBlocked { .. })
+        ));
+        assert!(matches!(
+            validate_skin_temp_celsius("apu.apu_skin_temp_c", 96, true),
             Err(Error::OutOfBounds { .. })
         ));
     }

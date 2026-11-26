@@ -1,4 +1,5 @@
 use crate::error::{Error, Result, SmuStatus};
+use crate::safety::map_io_err;
 use crate::transport::{DriverSysfsInfo, MailboxResponse, SmuTransport};
 use crate::types::{Mailbox, SmuArgs};
 use std::fs::{self, File, OpenOptions};
@@ -51,34 +52,48 @@ impl SysfsTransport {
     }
 
     fn ensure_loaded(&self) -> Result<()> {
-        if !self.sysfs_dir.exists() {
-            return Err(Error::DriverNotLoaded {
-                path: self.sysfs_dir.display().to_string(),
-            });
+        if self.sysfs_dir.exists() {
+            return Ok(());
         }
-        Ok(())
+        // Automatically load `ryzen_smu` when targeting the default system sysfs path as root.
+        // Never invoke `modprobe` for custom/test paths or unprivileged callers.
+        if self.sysfs_dir == Path::new(DEFAULT_SYSFS_PATH) && unsafe { libc::geteuid() == 0 } {
+            let _ = std::process::Command::new("modprobe")
+                .arg("ryzen_smu")
+                .output();
+            if self.sysfs_dir.exists() {
+                return Ok(());
+            }
+        }
+        Err(Error::DriverNotLoaded {
+            path: self.sysfs_dir.display().to_string(),
+        })
     }
 
     fn acquire_lock(&self) -> Result<LockGuard> {
         let open_res = OpenOptions::new()
             .create(true)
+            .truncate(false)
             .read(true)
             .write(true)
             .open(&self.lock_path);
 
-        let file = match open_res {
-            Ok(f) => f,
+        let (file, active_lock_path): (File, PathBuf) = match open_res {
+            Ok(f) => (f, self.lock_path.clone()),
             Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
                 // Fallback to /tmp if non-root can't open /run/lock
-                OpenOptions::new()
+                let fallback = PathBuf::from(FALLBACK_LOCK_PATH);
+                let f = OpenOptions::new()
                     .create(true)
+                    .truncate(false)
                     .read(true)
                     .write(true)
-                    .open(FALLBACK_LOCK_PATH)
+                    .open(&fallback)
                     .map_err(|e2| Error::LockFailed {
                         path: FALLBACK_LOCK_PATH.into(),
                         reason: e2.to_string(),
-                    })?
+                    })?;
+                (f, fallback)
             }
             Err(e) => {
                 return Err(Error::LockFailed {
@@ -95,17 +110,19 @@ impl SysfsTransport {
                 return Ok(LockGuard { file });
             }
             let err = std::io::Error::last_os_error();
-            if err.raw_os_error() != Some(libc::EWOULDBLOCK)
-                && err.raw_os_error() != Some(libc::EAGAIN)
-            {
+            let raw = err.raw_os_error();
+            if raw == Some(libc::EINTR) {
+                continue;
+            }
+            if raw != Some(libc::EWOULDBLOCK) && raw != Some(libc::EAGAIN) {
                 return Err(Error::LockFailed {
-                    path: self.lock_path.display().to_string(),
+                    path: active_lock_path.display().to_string(),
                     reason: err.to_string(),
                 });
             }
             if Instant::now() >= deadline {
                 return Err(Error::LockFailed {
-                    path: self.lock_path.display().to_string(),
+                    path: active_lock_path.display().to_string(),
                     reason: format!("timed out after {:?}", self.lock_timeout),
                 });
             }
@@ -113,29 +130,16 @@ impl SysfsTransport {
         }
     }
 
-    fn map_io_err(path: &Path, source: std::io::Error) -> Error {
-        if source.kind() == std::io::ErrorKind::PermissionDenied {
-            Error::PermissionDenied {
-                path: path.display().to_string(),
-            }
-        } else {
-            Error::Io {
-                path: path.display().to_string(),
-                source,
-            }
-        }
-    }
-
     fn read_bytes(&self, rel: &str) -> Result<Vec<u8>> {
         let p = self.sysfs_dir.join(rel);
-        fs::read(&p).map_err(|e| Self::map_io_err(&p, e))
+        fs::read(&p).map_err(|e| map_io_err(&p, e))
     }
 
     fn read_string(&self, rel: &str) -> Result<String> {
         let p = self.sysfs_dir.join(rel);
         fs::read_to_string(&p)
             .map(|s| s.trim().to_string())
-            .map_err(|e| Self::map_io_err(&p, e))
+            .map_err(|e| map_io_err(&p, e))
     }
 
     fn write_exact(&self, rel: &str, data: &[u8]) -> Result<()> {
@@ -143,8 +147,8 @@ impl SysfsTransport {
         let mut f = OpenOptions::new()
             .write(true)
             .open(&p)
-            .map_err(|e| Self::map_io_err(&p, e))?;
-        f.write_all(data).map_err(|e| Self::map_io_err(&p, e))?;
+            .map_err(|e| map_io_err(&p, e))?;
+        f.write_all(data).map_err(|e| map_io_err(&p, e))?;
         Ok(())
     }
 
@@ -157,8 +161,8 @@ impl SysfsTransport {
 
         let p = self.sysfs_dir.join("smn");
         let mut buf = [0u8; 4];
-        let mut f = File::open(&p).map_err(|e| Self::map_io_err(&p, e))?;
-        f.read_exact(&mut buf).map_err(|e| Self::map_io_err(&p, e))?;
+        let mut f = File::open(&p).map_err(|e| map_io_err(&p, e))?;
+        f.read_exact(&mut buf).map_err(|e| map_io_err(&p, e))?;
         Ok(u32::from_le_bytes(buf))
     }
 }
@@ -182,13 +186,13 @@ impl SmuTransport for SysfsTransport {
         let drv_version = self.read_string("drv_version")?;
         let smu_version = self.read_string("version")?;
         let codename_str = self.read_string("codename")?;
-        let codename_id = codename_str.parse::<u32>().map_err(|e| {
-            Error::InvalidInput(format!("invalid codename '{codename_str}': {e}"))
-        })?;
+        let codename_id = codename_str
+            .parse::<u32>()
+            .map_err(|e| Error::InvalidInput(format!("invalid codename '{codename_str}': {e}")))?;
         let mp1_str = self.read_string("mp1_if_version")?;
-        let mp1_if_version = mp1_str.parse::<u32>().map_err(|e| {
-            Error::InvalidInput(format!("invalid mp1_if_version '{mp1_str}': {e}"))
-        })?;
+        let mp1_if_version = mp1_str
+            .parse::<u32>()
+            .map_err(|e| Error::InvalidInput(format!("invalid mp1_if_version '{mp1_str}': {e}")))?;
 
         let has_rsmu = self.sysfs_dir.join("rsmu_cmd").exists();
         let has_pm_table = self.sysfs_dir.join("pm_table").exists();
@@ -237,7 +241,11 @@ impl SmuTransport for SysfsTransport {
                 return Err(Error::PmTableTooLarge { size: sz });
             }
         }
-        self.read_bytes("pm_table")
+        let raw = self.read_bytes("pm_table")?;
+        if raw.len() > MAX_SAFE_PM_TABLE_SIZE {
+            return Err(Error::PmTableTooLarge { size: raw.len() });
+        }
+        Ok(raw)
     }
 
     fn send_command(
@@ -276,7 +284,8 @@ impl SmuTransport for SysfsTransport {
                 rsp_bytes.len()
             )));
         }
-        let raw_drv_rsp = u32::from_le_bytes([rsp_bytes[0], rsp_bytes[1], rsp_bytes[2], rsp_bytes[3]]);
+        let raw_drv_rsp =
+            u32::from_le_bytes([rsp_bytes[0], rsp_bytes[1], rsp_bytes[2], rsp_bytes[3]]);
         let driver_status = SmuStatus::from_raw(raw_drv_rsp).unwrap_or(SmuStatus::Failed);
 
         // Step 4: Read 24-byte LE output args from smu_args.
@@ -288,13 +297,9 @@ impl SmuTransport for SysfsTransport {
             )));
         }
         let mut out_args = [0u32; 6];
-        for i in 0..6 {
-            out_args[i] = u32::from_le_bytes([
-                out_bytes[i * 4],
-                out_bytes[i * 4 + 1],
-                out_bytes[i * 4 + 2],
-                out_bytes[i * 4 + 3],
-            ]);
+        let (chunks, _) = out_bytes.as_chunks::<4>();
+        for (slot, chunk) in out_args.iter_mut().zip(chunks) {
+            *slot = u32::from_le_bytes(*chunk);
         }
 
         // Step 5 (Safety Defense against ryzen_smu smu.c:213 false-OK bug):

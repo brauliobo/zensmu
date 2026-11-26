@@ -165,7 +165,10 @@ impl Codename {
     }
 
     pub fn is_zen5(self) -> bool {
-        matches!(self, Self::GraniteRidge | Self::StrixPoint | Self::StrixHalo)
+        matches!(
+            self,
+            Self::GraniteRidge | Self::StrixPoint | Self::StrixHalo
+        )
     }
 }
 

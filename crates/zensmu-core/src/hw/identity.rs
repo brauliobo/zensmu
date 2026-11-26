@@ -85,23 +85,21 @@ pub fn read_host_cpuid() -> Option<CpuidInfo> {
     }
 }
 
-/// Verify that `codename` is consistent with CPUID `family` (guards against spoofed/mismatched sysfs).
+/// Verify that `codename` is consistent with CPUID `family` (and verified `model`s
+/// for finalized silicon families), guarding against spoofed/mismatched sysfs.
 pub fn verify_codename_against_cpuid(codename: Codename, cpuid: &CpuidInfo) -> Result<()> {
-    let expected_family = match codename {
+    let expected: Option<(u32, &'static [u32])> = match codename {
+        Codename::SummitRidge | Codename::ThreadRipper => Some((0x17, &[0x01])),
+        Codename::PinnacleRidge | Codename::Colfax => Some((0x17, &[0x08])),
+        Codename::RavenRidge => Some((0x17, &[0x11])),
+        Codename::Picasso => Some((0x17, &[0x18])),
+        Codename::RavenRidge2 | Codename::Dali => Some((0x17, &[0x20])),
+        Codename::VanGogh => Some((0x17, &[0x90, 0x91])),
         Codename::Matisse
         | Codename::CastlePeak
         | Codename::Renoir
         | Codename::Lucienne
-        | Codename::Picasso
-        | Codename::RavenRidge
-        | Codename::RavenRidge2
-        | Codename::Dali
-        | Codename::SummitRidge
-        | Codename::PinnacleRidge
-        | Codename::Colfax
-        | Codename::ThreadRipper
-        | Codename::Naples
-        | Codename::VanGogh => Some(0x17),
+        | Codename::Naples => Some((0x17, &[])),
         Codename::Vermeer
         | Codename::Chagall
         | Codename::Milan
@@ -110,13 +108,14 @@ pub fn verify_codename_against_cpuid(codename: Codename, cpuid: &CpuidInfo) -> R
         | Codename::Raphael
         | Codename::Phoenix
         | Codename::HawkPoint
-        | Codename::StormPeak => Some(0x19),
-        Codename::GraniteRidge | Codename::StrixPoint | Codename::StrixHalo => Some(0x1A),
+        | Codename::StormPeak => Some((0x19, &[])),
+        Codename::GraniteRidge | Codename::StrixPoint | Codename::StrixHalo => Some((0x1A, &[])),
         Codename::Undefined => None,
     };
 
-    if let Some(fam) = expected_family {
-        if cpuid.family != fam {
+    if let Some((fam, models)) = expected {
+        let model_ok = models.is_empty() || models.contains(&cpuid.model);
+        if cpuid.family != fam || !model_ok {
             return Err(Error::IdentityMismatch {
                 driver_codename: codename.display_name().to_string(),
                 family: cpuid.family,
@@ -134,12 +133,11 @@ pub fn detect_hardware(
     verify_host_cpuid: bool,
 ) -> Result<HardwareContext> {
     let driver = transport.read_info()?;
-    let codename = Codename::from_driver_id(driver.codename_id).ok_or_else(|| {
-        Error::UnsupportedCpu {
+    let codename =
+        Codename::from_driver_id(driver.codename_id).ok_or_else(|| Error::UnsupportedCpu {
             codename: format!("id={}", driver.codename_id),
             detail: "codename ID not recognized by zensmu".into(),
-        }
-    })?;
+        })?;
 
     let cpuid = if verify_host_cpuid {
         let info = read_host_cpuid();
@@ -188,5 +186,30 @@ mod tests {
         };
         assert!(verify_codename_against_cpuid(Codename::GraniteRidge, &cpuid).is_ok());
         assert!(verify_codename_against_cpuid(Codename::Vermeer, &cpuid).is_err());
+    }
+
+    #[test]
+    fn cpuid_verification_checks_zen1_zenplus_and_apu0_models() {
+        let mk = |family, model| CpuidInfo {
+            vendor: "AuthenticAMD".into(),
+            brand: "AMD Test".into(),
+            family,
+            model,
+            stepping: 0,
+        };
+        assert!(verify_codename_against_cpuid(Codename::SummitRidge, &mk(0x17, 0x01)).is_ok());
+        assert!(verify_codename_against_cpuid(Codename::ThreadRipper, &mk(0x17, 0x01)).is_ok());
+        assert!(verify_codename_against_cpuid(Codename::PinnacleRidge, &mk(0x17, 0x08)).is_ok());
+        assert!(verify_codename_against_cpuid(Codename::Colfax, &mk(0x17, 0x08)).is_ok());
+        assert!(verify_codename_against_cpuid(Codename::RavenRidge, &mk(0x17, 0x11)).is_ok());
+        assert!(verify_codename_against_cpuid(Codename::Picasso, &mk(0x17, 0x18)).is_ok());
+        assert!(verify_codename_against_cpuid(Codename::RavenRidge2, &mk(0x17, 0x20)).is_ok());
+        assert!(verify_codename_against_cpuid(Codename::Dali, &mk(0x17, 0x20)).is_ok());
+        assert!(verify_codename_against_cpuid(Codename::VanGogh, &mk(0x17, 0x90)).is_ok());
+        assert!(verify_codename_against_cpuid(Codename::VanGogh, &mk(0x17, 0x91)).is_ok());
+
+        // Cross-model mismatch within family 0x17 is rejected
+        assert!(verify_codename_against_cpuid(Codename::Picasso, &mk(0x17, 0x08)).is_err());
+        assert!(verify_codename_against_cpuid(Codename::VanGogh, &mk(0x17, 0x11)).is_err());
     }
 }

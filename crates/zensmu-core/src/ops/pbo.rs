@@ -4,37 +4,36 @@
 use crate::error::{Error, Result};
 use crate::hw::identity::HardwareContext;
 use crate::hw::profiles::{DualOpcode, OpcodeSpec};
-use crate::ops::co::{check_mailbox_health, send_dual_verified, send_verified};
-use crate::ops::pm_table;
+use crate::ops::co::{check_mailbox_health, send_verified};
+use crate::ops::{execute_ops, pm_table, ExecOp};
+use crate::safety::bounds;
 use crate::transport::SmuTransport;
 use crate::types::{Mailbox, PlannedOp, SmuArgs};
 use serde::{Deserialize, Serialize};
 
-// Safe hard and soft limits for desktop PBO tuning.
-// Hard ceilings accommodate BIOS "Motherboard/Unlimited" PBO profiles (e.g. PPT=1000W)
-// so snapshots and rollbacks never fail, while conservative soft ceilings still require `--allow-extreme`.
-pub const PPT_MIN_W: u32 = 10;
-pub const PPT_MAX_W: u32 = 1000;
-pub const PPT_SOFT_MAX_W: u32 = 230;
+// Safe hard and soft limits for desktop PBO tuning (unified with `crate::safety::bounds`).
+pub const PPT_MIN_W: u32 = bounds::PPT_MIN_W;
+pub const PPT_MAX_W: u32 = bounds::PPT_MAX_W;
+pub const PPT_SOFT_MAX_W: u32 = bounds::PPT_SOFT_MAX_W;
 
-pub const TDC_MIN_A: u32 = 10;
-pub const TDC_MAX_A: u32 = 500;
-pub const TDC_SOFT_MAX_A: u32 = 180;
+pub const TDC_MIN_A: u32 = bounds::TDC_MIN_A;
+pub const TDC_MAX_A: u32 = bounds::TDC_MAX_A;
+pub const TDC_SOFT_MAX_A: u32 = bounds::TDC_SOFT_MAX_A;
 
-pub const EDC_MIN_A: u32 = 10;
-pub const EDC_MAX_A: u32 = 500;
-pub const EDC_SOFT_MAX_A: u32 = 240;
+pub const EDC_MIN_A: u32 = bounds::EDC_MIN_A;
+pub const EDC_MAX_A: u32 = bounds::EDC_MAX_A;
+pub const EDC_SOFT_MAX_A: u32 = bounds::EDC_SOFT_MAX_A;
 
-pub const TCTL_MIN_C: u32 = 40;
-pub const TCTL_MAX_C: u32 = 95;
+pub const TCTL_MIN_C: u32 = bounds::TCTL_MIN_C;
+pub const TCTL_MAX_C: u32 = bounds::TCTL_MAX_C;
 
-pub const SCALAR_MIN: u32 = 1;
-pub const SCALAR_MAX: u32 = 10;
-pub const SCALAR_SOFT_MAX: u32 = 4;
+pub const SCALAR_MIN: u32 = bounds::PBO_SCALAR_MIN;
+pub const SCALAR_MAX: u32 = bounds::PBO_SCALAR_MAX;
+pub const SCALAR_SOFT_MAX: u32 = bounds::PBO_SCALAR_SOFT_MAX;
 
-pub const FMAX_MIN_MHZ: u32 = 2000;
-pub const FMAX_MAX_MHZ: u32 = 6500;
-pub const FMAX_SOFT_DELTA_MHZ: u32 = 200;
+pub const FMAX_MIN_MHZ: u32 = bounds::FMAX_MIN_MHZ;
+pub const FMAX_MAX_MHZ: u32 = bounds::FMAX_MAX_MHZ;
+pub const FMAX_SOFT_DELTA_MHZ: u32 = bounds::FMAX_SOFT_DELTA_MHZ;
 
 /// Read-only fused factory power/current limits reported by the SMU (normalized to W / A).
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -78,6 +77,18 @@ pub struct PboSetRequest {
     pub fmax_mhz: Option<u32>,
 }
 
+impl PboSetRequest {
+    /// Returns true if no PBO parameters are set in this request.
+    pub fn is_empty(&self) -> bool {
+        self.ppt_w.is_none()
+            && self.tdc_a.is_none()
+            && self.edc_a.is_none()
+            && self.tctl_c.is_none()
+            && self.scalar.is_none()
+            && self.fmax_mhz.is_none()
+    }
+}
+
 fn query_optional(
     transport: &dyn SmuTransport,
     hw: &HardwareContext,
@@ -109,7 +120,9 @@ pub fn get_pbo_status(transport: &dyn SmuTransport, hw: &HardwareContext) -> Res
         .map(|o| f32::from_bits(o[0]))
         .filter(|v| v.is_finite() && (0.0..=100.0).contains(v));
 
-    let fmax_mhz = query_optional(transport, hw, caps.get_fmax, [0; 6])?.map(|o| o[0]);
+    let fmax_mhz = query_optional(transport, hw, caps.get_fmax, [0; 6])?
+        .map(|o| o[0])
+        .filter(|&mhz| mhz > 0);
 
     let norm_milli = |raw: u32| -> u32 {
         if raw >= 1000 {
@@ -120,8 +133,7 @@ pub fn get_pbo_status(transport: &dyn SmuTransport, hw: &HardwareContext) -> Res
     };
 
     let fused = FusedLimits {
-        ppt_w: query_optional(transport, hw, caps.get_fused_ppt, [0; 6])?
-            .map(|o| norm_milli(o[0])),
+        ppt_w: query_optional(transport, hw, caps.get_fused_ppt, [0; 6])?.map(|o| norm_milli(o[0])),
         slow_w: query_optional(transport, hw, caps.get_fused_slow, [0; 6])?
             .map(|o| norm_milli(o[0])),
         fast_w: query_optional(transport, hw, caps.get_fused_fast, [0; 6])?
@@ -130,8 +142,7 @@ pub fn get_pbo_status(transport: &dyn SmuTransport, hw: &HardwareContext) -> Res
             .map(|o| norm_milli(o[0])),
         vdd_tdc_a: query_optional(transport, hw, caps.get_fused_vdd_tdc, [0; 6])?
             .map(|o| norm_milli(o[0])),
-        edc_a: query_optional(transport, hw, caps.get_fused_edc, [0; 6])?
-            .map(|o| norm_milli(o[0])),
+        edc_a: query_optional(transport, hw, caps.get_fused_edc, [0; 6])?.map(|o| norm_milli(o[0])),
         soc_tdc_a: query_optional(transport, hw, caps.get_fused_soc_tdc, [0; 6])?
             .map(|o| norm_milli(o[0])),
     };
@@ -147,9 +158,12 @@ pub fn get_pbo_status(transport: &dyn SmuTransport, hw: &HardwareContext) -> Res
     let mut core_perf_scores = Vec::new();
     if caps.get_perf_data.is_some() {
         for core in &hw.topology.cores {
-            if let Some(out) =
-                query_optional(transport, hw, caps.get_perf_data, [core.index, 0, 0, 0, 0, 0])?
-            {
+            if let Some(out) = query_optional(
+                transport,
+                hw,
+                caps.get_perf_data,
+                [core.index, 0, 0, 0, 0, 0],
+            )? {
                 core_perf_scores.push((core.index, out[0]));
             }
         }
@@ -164,45 +178,23 @@ pub fn get_pbo_status(transport: &dyn SmuTransport, hw: &HardwareContext) -> Res
     })
 }
 
-fn validate_u32_range(
-    field: &str,
-    value: u32,
-    min: u32,
-    max: u32,
-    soft_max: Option<u32>,
-    allow_extreme: bool,
-) -> Result<()> {
-    if value < min || value > max {
-        return Err(Error::OutOfBounds {
-            field: field.into(),
-            value: value.to_string(),
-            bounds: format!("{min}..={max}"),
-        });
-    }
-    if let Some(soft) = soft_max {
-        if value > soft && !allow_extreme {
-            return Err(Error::ExtremeValueBlocked {
-                field: field.into(),
-                value: value.to_string(),
-                threshold: format!("<= {soft}"),
-            });
-        }
-    }
-    Ok(())
-}
-
-enum PboExecOp {
-    Single(OpcodeSpec, SmuArgs),
-    Dual(DualOpcode, SmuArgs),
-}
-
-impl PboExecOp {
-    fn primary_mailbox(&self) -> Mailbox {
-        match self {
-            Self::Single(s, _) => s.mailbox,
-            Self::Dual(d, _) => d.primary.mailbox,
-        }
-    }
+fn push_dual_op(
+    planned: &mut Vec<PlannedOp>,
+    exec_ops: &mut Vec<ExecOp>,
+    op: DualOpcode,
+    args: SmuArgs,
+    description: String,
+    target: String,
+) {
+    planned.push(PlannedOp {
+        description,
+        mailbox: op.primary.mailbox,
+        opcode: op.primary.opcode,
+        args,
+        current: None,
+        target,
+    });
+    exec_ops.push(ExecOp::Dual(op, args));
 }
 
 /// Apply requested PBO limits, scalar, and/or Fmax boost limit.
@@ -229,24 +221,15 @@ pub fn set_pbo(
             capability: "set_ppt",
             codename: codename.clone(),
         })?;
-        validate_u32_range(
-            "ppt_w",
-            ppt_w,
-            PPT_MIN_W,
-            PPT_MAX_W,
-            Some(PPT_SOFT_MAX_W),
-            allow_extreme,
-        )?;
-        let args = [ppt_w.saturating_mul(1000), 0, 0, 0, 0, 0];
-        planned.push(PlannedOp {
-            description: format!("Set PPT limit to {ppt_w} W"),
-            mailbox: op.primary.mailbox,
-            opcode: op.primary.opcode,
-            args,
-            current: None,
-            target: format!("{ppt_w} W"),
-        });
-        exec_ops.push(PboExecOp::Dual(op, args));
+        bounds::validate_ppt_watts(ppt_w, allow_extreme)?;
+        push_dual_op(
+            &mut planned,
+            &mut exec_ops,
+            op,
+            [ppt_w.saturating_mul(1000), 0, 0, 0, 0, 0],
+            format!("Set PPT limit to {ppt_w} W"),
+            format!("{ppt_w} W"),
+        );
     }
 
     if let Some(tdc_a) = req.tdc_a {
@@ -254,24 +237,15 @@ pub fn set_pbo(
             capability: "set_tdc",
             codename: codename.clone(),
         })?;
-        validate_u32_range(
-            "tdc_a",
-            tdc_a,
-            TDC_MIN_A,
-            TDC_MAX_A,
-            Some(TDC_SOFT_MAX_A),
-            allow_extreme,
-        )?;
-        let args = [tdc_a.saturating_mul(1000), 0, 0, 0, 0, 0];
-        planned.push(PlannedOp {
-            description: format!("Set TDC limit to {tdc_a} A"),
-            mailbox: op.primary.mailbox,
-            opcode: op.primary.opcode,
-            args,
-            current: None,
-            target: format!("{tdc_a} A"),
-        });
-        exec_ops.push(PboExecOp::Dual(op, args));
+        bounds::validate_tdc_amps(tdc_a, allow_extreme)?;
+        push_dual_op(
+            &mut planned,
+            &mut exec_ops,
+            op,
+            [tdc_a.saturating_mul(1000), 0, 0, 0, 0, 0],
+            format!("Set TDC limit to {tdc_a} A"),
+            format!("{tdc_a} A"),
+        );
     }
 
     if let Some(edc_a) = req.edc_a {
@@ -279,24 +253,15 @@ pub fn set_pbo(
             capability: "set_edc",
             codename: codename.clone(),
         })?;
-        validate_u32_range(
-            "edc_a",
-            edc_a,
-            EDC_MIN_A,
-            EDC_MAX_A,
-            Some(EDC_SOFT_MAX_A),
-            allow_extreme,
-        )?;
-        let args = [edc_a.saturating_mul(1000), 0, 0, 0, 0, 0];
-        planned.push(PlannedOp {
-            description: format!("Set EDC limit to {edc_a} A"),
-            mailbox: op.primary.mailbox,
-            opcode: op.primary.opcode,
-            args,
-            current: None,
-            target: format!("{edc_a} A"),
-        });
-        exec_ops.push(PboExecOp::Dual(op, args));
+        bounds::validate_edc_amps(edc_a, allow_extreme)?;
+        push_dual_op(
+            &mut planned,
+            &mut exec_ops,
+            op,
+            [edc_a.saturating_mul(1000), 0, 0, 0, 0, 0],
+            format!("Set EDC limit to {edc_a} A"),
+            format!("{edc_a} A"),
+        );
     }
 
     if let Some(tctl_c) = req.tctl_c {
@@ -305,17 +270,15 @@ pub fn set_pbo(
             codename: codename.clone(),
         })?;
         // Hard ceiling of 95 C (never overridden by allow_extreme).
-        validate_u32_range("tctl_c", tctl_c, TCTL_MIN_C, TCTL_MAX_C, None, false)?;
-        let args = [tctl_c, 0, 0, 0, 0, 0];
-        planned.push(PlannedOp {
-            description: format!("Set Tctl thermal limit to {tctl_c} C"),
-            mailbox: op.primary.mailbox,
-            opcode: op.primary.opcode,
-            args,
-            current: None,
-            target: format!("{tctl_c} C"),
-        });
-        exec_ops.push(PboExecOp::Dual(op, args));
+        bounds::validate_tctl_celsius(tctl_c, false)?;
+        push_dual_op(
+            &mut planned,
+            &mut exec_ops,
+            op,
+            [tctl_c, 0, 0, 0, 0, 0],
+            format!("Set Tctl thermal limit to {tctl_c} C"),
+            format!("{tctl_c} C"),
+        );
     }
 
     if let Some(scalar) = req.scalar {
@@ -325,14 +288,7 @@ pub fn set_pbo(
                 capability: "set_pbo_scalar",
                 codename: codename.clone(),
             })?;
-        validate_u32_range(
-            "scalar",
-            scalar,
-            SCALAR_MIN,
-            SCALAR_MAX,
-            Some(SCALAR_SOFT_MAX),
-            allow_extreme,
-        )?;
+        bounds::validate_pbo_scalar_checked(scalar, allow_extreme)?;
 
         if let Some(en_op) = caps.set_pbo_en {
             let en_args = [1, 0, 0, 0, 0, 0];
@@ -344,19 +300,17 @@ pub fn set_pbo(
                 current: None,
                 target: "enabled".into(),
             });
-            exec_ops.push(PboExecOp::Single(en_op, en_args));
+            exec_ops.push(ExecOp::Single(en_op, en_args));
         }
 
-        let args = [scalar.saturating_mul(100), 0, 0, 0, 0, 0];
-        planned.push(PlannedOp {
-            description: format!("Set PBO scalar to {scalar}x"),
-            mailbox: op.primary.mailbox,
-            opcode: op.primary.opcode,
-            args,
-            current: None,
-            target: format!("{scalar}x"),
-        });
-        exec_ops.push(PboExecOp::Dual(op, args));
+        push_dual_op(
+            &mut planned,
+            &mut exec_ops,
+            op,
+            [scalar.saturating_mul(100), 0, 0, 0, 0, 0],
+            format!("Set PBO scalar to {scalar}x"),
+            format!("{scalar}x"),
+        );
     }
 
     if let Some(fmax_mhz) = req.fmax_mhz {
@@ -364,30 +318,25 @@ pub fn set_pbo(
             capability: "set_fmax",
             codename: codename.clone(),
         })?;
-        validate_u32_range(
-            "fmax_mhz",
-            fmax_mhz,
-            FMAX_MIN_MHZ,
-            FMAX_MAX_MHZ,
-            None,
-            allow_extreme,
-        )?;
+        bounds::validate_fmax_hard_mhz(fmax_mhz)?;
 
         let mut current_fmax = None;
         if !dry_run {
             if let Some(get_fmax_op) = caps.get_fmax {
                 if let Ok(out) = send_verified(transport, hw, get_fmax_op, [0; 6]) {
                     let cur = out[0];
-                    current_fmax = Some(cur);
-                    if !allow_extreme && fmax_mhz > cur.saturating_add(FMAX_SOFT_DELTA_MHZ) {
-                        return Err(Error::ExtremeValueBlocked {
-                            field: "fmax_mhz".into(),
-                            value: format!("{fmax_mhz} MHz"),
-                            threshold: format!(
-                                "<= {} MHz (current {cur} + {FMAX_SOFT_DELTA_MHZ})",
-                                cur.saturating_add(FMAX_SOFT_DELTA_MHZ)
-                            ),
-                        });
+                    if cur > 0 {
+                        current_fmax = Some(cur);
+                        if !allow_extreme && fmax_mhz > cur.saturating_add(FMAX_SOFT_DELTA_MHZ) {
+                            return Err(Error::ExtremeValueBlocked {
+                                field: "pbo.fmax_mhz".into(),
+                                value: format!("{fmax_mhz} MHz"),
+                                threshold: format!(
+                                    "<= {} MHz (current {cur} + {FMAX_SOFT_DELTA_MHZ})",
+                                    cur.saturating_add(FMAX_SOFT_DELTA_MHZ)
+                                ),
+                            });
+                        }
                     }
                 }
             }
@@ -402,40 +351,14 @@ pub fn set_pbo(
             current: current_fmax.map(|c| format!("{c} MHz")),
             target: format!("{fmax_mhz} MHz"),
         });
-        exec_ops.push(PboExecOp::Single(op, args));
+        exec_ops.push(ExecOp::Single(op, args));
     }
 
     if dry_run || exec_ops.is_empty() {
         return Ok(planned);
     }
 
-    // Health-check each distinct mailbox we are about to write to.
-    let mut checked_rsmu = false;
-    let mut checked_mp1 = false;
-    for op in &exec_ops {
-        match op.primary_mailbox() {
-            Mailbox::Rsmu if !checked_rsmu => {
-                check_mailbox_health(transport, hw, Mailbox::Rsmu)?;
-                checked_rsmu = true;
-            }
-            Mailbox::Mp1 if !checked_mp1 => {
-                check_mailbox_health(transport, hw, Mailbox::Mp1)?;
-                checked_mp1 = true;
-            }
-            _ => {}
-        }
-    }
-
-    for op in exec_ops {
-        match op {
-            PboExecOp::Single(spec, args) => {
-                send_verified(transport, hw, spec, args)?;
-            }
-            PboExecOp::Dual(dual, args) => {
-                send_dual_verified(transport, hw, dual, args)?;
-            }
-        }
-    }
+    execute_ops(transport, hw, exec_ops)?;
 
     // Read-after-write verification: scalar
     if let (Some(expected), Some(get_op)) = (req.scalar, caps.get_pbo_scalar) {
@@ -464,10 +387,8 @@ pub fn set_pbo(
     }
 
     // Read-after-write verification: PPT/TDC/EDC/Tctl via PM table when supported & readable
-    let need_pm_verify = req.ppt_w.is_some()
-        || req.tdc_a.is_some()
-        || req.edc_a.is_some()
-        || req.tctl_c.is_some();
+    let need_pm_verify =
+        req.ppt_w.is_some() || req.tdc_a.is_some() || req.edc_a.is_some() || req.tctl_c.is_some();
     if need_pm_verify && hw.driver.has_pm_table {
         if let Ok(telem) = pm_table::read_telemetry(transport, hw) {
             verify_pm_limit("pbo.ppt_w", req.ppt_w, telem.ppt_limit_w, "W")?;
@@ -487,7 +408,7 @@ fn verify_pm_limit(
     unit: &str,
 ) -> Result<()> {
     if let (Some(exp), Some(act)) = (requested, observed) {
-        if (act - exp as f32).abs() > 1.0 {
+        if !act.is_finite() || (act - exp as f32).abs() > 1.0 {
             return Err(Error::VerificationFailed {
                 field: field.into(),
                 expected: format!("{exp} {unit}"),

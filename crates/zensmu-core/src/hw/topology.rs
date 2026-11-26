@@ -92,8 +92,9 @@ impl CpuTopology {
         for (idx, ((ccd, _core_id), mut cpus)) in grouped.into_iter().enumerate() {
             cpus.sort_unstable();
             ccd_max = ccd_max.max(ccd);
-            let local_core = *per_ccd_counter.entry(ccd).or_insert(0);
-            *per_ccd_counter.get_mut(&ccd).unwrap() += 1;
+            let counter = per_ccd_counter.entry(ccd).or_insert(0);
+            let local_core = *counter;
+            *counter += 1;
 
             cores.push(CoreInfo {
                 index: idx as u32,

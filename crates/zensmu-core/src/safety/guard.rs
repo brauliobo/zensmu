@@ -8,17 +8,14 @@
 //! preventing an infinite boot-crash loop.
 
 use crate::error::{Error, Result};
+use crate::safety::{map_io_err, now_unix_secs, remove_file_if_exists, write_atomic_create_new};
 use serde::{Deserialize, Serialize};
-use std::fs::{self, File};
-use std::io::{ErrorKind, Write};
+use std::fs;
+use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{SystemTime, UNIX_EPOCH};
 
 /// Default persistent path for the boot-loop crash guard sentinel.
 pub const DEFAULT_GUARD_PATH: &str = "/var/lib/zensmu/applying.lock";
-
-static GUARD_TMP_SEQ: AtomicU64 = AtomicU64::new(0);
 
 /// Metadata recorded inside the boot-loop guard sentinel file.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -73,71 +70,19 @@ impl BootLoopGuard {
     ///   and profile name, calls `sync_all()` so it hits disk before returning, and returns an
     ///   [`ArmedBootGuard`] handle.
     pub fn check_and_arm(&self, profile_name: &str) -> Result<ArmedBootGuard> {
-        if self.is_tripped() {
-            return Err(Error::BootGuardTripped {
-                sentinel: self.sentinel_path.display().to_string(),
-            });
-        }
-
-        let parent = self
-            .sentinel_path
-            .parent()
-            .filter(|p| !p.as_os_str().is_empty())
-            .unwrap_or_else(|| Path::new("."));
-        fs::create_dir_all(parent).map_err(|e| map_io_err(parent, e))?;
-
         let info = SentinelInfo {
             profile: profile_name.to_string(),
             armed_unix_secs: now_unix_secs(),
             pid: std::process::id(),
         };
-        let payload = serde_json::to_string_pretty(&info).map_err(|e| Error::Serde(e.to_string()))?;
+        let payload =
+            serde_json::to_string_pretty(&info).map_err(|e| Error::Serde(e.to_string()))?;
 
-        let seq = GUARD_TMP_SEQ.fetch_add(1, Ordering::Relaxed);
-        let file_name = self
-            .sentinel_path
-            .file_name()
-            .and_then(|n| n.to_str())
-            .unwrap_or("applying.lock");
-        let tmp_path = parent.join(format!(".{file_name}.{}.{}.tmp", info.pid, seq));
-
-        let mut file = File::create(&tmp_path).map_err(|e| map_io_err(&tmp_path, e))?;
-        if let Err(e) = file
-            .write_all(payload.as_bytes())
-            .and_then(|()| file.sync_all())
-        {
-            let _ = fs::remove_file(&tmp_path);
-            return Err(map_io_err(&tmp_path, e));
+        if !write_atomic_create_new(&self.sentinel_path, payload.as_bytes())? {
+            return Err(Error::BootGuardTripped {
+                sentinel: self.sentinel_path.display().to_string(),
+            });
         }
-        drop(file);
-
-        // Atomically link sentinel only if absent, preventing concurrent race overwrites.
-        match fs::hard_link(&tmp_path, &self.sentinel_path) {
-            Ok(()) => {
-                let _ = fs::remove_file(&tmp_path);
-            }
-            Err(e) if e.kind() == ErrorKind::AlreadyExists => {
-                let _ = fs::remove_file(&tmp_path);
-                return Err(Error::BootGuardTripped {
-                    sentinel: self.sentinel_path.display().to_string(),
-                });
-            }
-            Err(_) => {
-                if self.sentinel_path.exists() {
-                    let _ = fs::remove_file(&tmp_path);
-                    return Err(Error::BootGuardTripped {
-                        sentinel: self.sentinel_path.display().to_string(),
-                    });
-                }
-                fs::rename(&tmp_path, &self.sentinel_path).map_err(|e| {
-                    let _ = fs::remove_file(&tmp_path);
-                    map_io_err(&self.sentinel_path, e)
-                })?;
-            }
-        }
-
-        // Flush directory entry to persistent storage before any SMU writes occur.
-        sync_dir_best_effort(parent);
 
         Ok(ArmedBootGuard {
             sentinel_path: self.sentinel_path.clone(),
@@ -149,7 +94,8 @@ impl BootLoopGuard {
     ///
     /// Succeeds idempotently if the sentinel does not exist.
     pub fn clear(&self) -> Result<()> {
-        remove_if_exists(&self.sentinel_path)
+        let _ = remove_file_if_exists(&self.sentinel_path)?;
+        Ok(())
     }
 }
 
@@ -171,7 +117,7 @@ impl ArmedBootGuard {
 
     /// Remove the sentinel cleanly after profile application and stability verification succeed.
     pub fn disarm(mut self) -> Result<()> {
-        remove_if_exists(&self.sentinel_path)?;
+        let _ = remove_file_if_exists(&self.sentinel_path)?;
         self.disarmed = true;
         Ok(())
     }
@@ -182,45 +128,6 @@ impl Drop for ArmedBootGuard {
         // Intentionally do NOT delete `self.sentinel_path` when `!self.disarmed`:
         // crashes, panics, or aborted applies MUST leave the sentinel on disk.
         let _ = self.disarmed;
-    }
-}
-
-fn remove_if_exists(path: &Path) -> Result<()> {
-    match fs::remove_file(path) {
-        Ok(()) => {
-            if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
-                sync_dir_best_effort(parent);
-            }
-            Ok(())
-        }
-        Err(e) if e.kind() == ErrorKind::NotFound => Ok(()),
-        Err(e) => Err(map_io_err(path, e)),
-    }
-}
-
-fn now_unix_secs() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0)
-}
-
-fn sync_dir_best_effort(dir: &Path) {
-    if let Ok(d) = File::open(dir) {
-        let _ = d.sync_all();
-    }
-}
-
-fn map_io_err(path: &Path, source: std::io::Error) -> Error {
-    if source.kind() == ErrorKind::PermissionDenied {
-        Error::PermissionDenied {
-            path: path.display().to_string(),
-        }
-    } else {
-        Error::Io {
-            path: path.display().to_string(),
-            source,
-        }
     }
 }
 
