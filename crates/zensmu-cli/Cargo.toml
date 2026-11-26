@@ -1,0 +1,26 @@
+[package]
+name = "zensmu-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Safety-first CLI and live TUI for AMD Ryzen SMU control and telemetry"
+
+[[bin]]
+name = "zensmu"
+path = "src/main.rs"
+
+[dependencies]
+zensmu-core.workspace = true
+clap.workspace = true
+clap_complete.workspace = true
+ratatui.workspace = true
+crossterm.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+toml.workspace = true
+thiserror.workspace = true
+libc.workspace = true
+
+[dev-dependencies]
+tempfile = "3"
