@@ -1,6 +1,9 @@
 //! Dark cockpit UI panels, plots, tuning controls, and dry-run confirmation modal.
 
-use crate::app::{Tab, ToastLevel, ZensmuApp, POLL_INTERVAL_OPTIONS_MS, TELEMETRY_RING_CAPACITY};
+use crate::app::{
+    Tab, ToastLevel, ZensmuApp, POLL_INTERVAL_OPTIONS_MS, TELEMETRY_RING_CAPACITY,
+    UI_ZOOM_DEFAULT, UI_ZOOM_MAX, UI_ZOOM_MIN, UI_ZOOM_STEP,
+};
 use crate::elevate::CliAction;
 use eframe::egui::{self, Color32, RichText, Stroke, Ui};
 use egui_plot::{HLine, Line, Plot, PlotPoints};
@@ -61,7 +64,7 @@ pub fn render_top_bar(app: &mut ZensmuApp, ctx: &egui::Context) {
                 ui.label(
                     RichText::new("zensmu")
                         .strong()
-                        .size(18.0)
+                        .size(22.0)
                         .color(ACCENT_CRIMSON),
                 );
                 ui.separator();
@@ -113,6 +116,40 @@ pub fn render_top_bar(app: &mut ZensmuApp, ctx: &egui::Context) {
                     let busy = app.runner.is_busy();
                     let has_hw = app.hw.is_some();
 
+                    // Compact UI Zoom controls (rendered left-to-right as: A- | 100% | A+)
+                    if ui
+                        .add_enabled(
+                            app.ui_zoom < UI_ZOOM_MAX - 0.001,
+                            egui::Button::new("A+").small(),
+                        )
+                        .on_hover_text("Increase UI scale (Ctrl +)")
+                        .clicked()
+                    {
+                        app.adjust_ui_zoom(UI_ZOOM_STEP, ctx);
+                    }
+
+                    let zoom_pct = format!("{:.0}%", app.ui_zoom * 100.0);
+                    if ui
+                        .add(egui::Button::new(RichText::new(zoom_pct).monospace()).small())
+                        .on_hover_text("Reset UI scale to 100% (Ctrl 0)")
+                        .clicked()
+                    {
+                        app.set_ui_zoom(UI_ZOOM_DEFAULT, ctx);
+                    }
+
+                    if ui
+                        .add_enabled(
+                            app.ui_zoom > UI_ZOOM_MIN + 0.001,
+                            egui::Button::new("A-").small(),
+                        )
+                        .on_hover_text("Decrease UI scale (Ctrl -)")
+                        .clicked()
+                    {
+                        app.adjust_ui_zoom(-UI_ZOOM_STEP, ctx);
+                    }
+
+                    ui.separator();
+
                     if ui
                         .add_enabled(has_hw && !busy, egui::Button::new("Reset"))
                         .on_hover_text("Preview reset to boot baseline (dry-run first)")
@@ -153,7 +190,7 @@ pub fn render_top_bar(app: &mut ZensmuApp, ctx: &egui::Context) {
 
                     let mut selected_ms = app.poll_interval_ms;
                     egui::ComboBox::from_id_salt("poll_rate_combo")
-                        .width(74.0)
+                        .width(92.0)
                         .selected_text(format_interval_label(selected_ms))
                         .show_ui(ui, |ui| {
                             for ms in POLL_INTERVAL_OPTIONS_MS {
@@ -245,7 +282,7 @@ pub fn render_bottom_bar(app: &mut ZensmuApp, ctx: &egui::Context) {
 pub fn render_sidebar(app: &mut ZensmuApp, ctx: &egui::Context) {
     egui::SidePanel::left("sidebar")
         .resizable(false)
-        .exact_width(210.0)
+        .exact_width(245.0)
         .frame(
             egui::Frame::NONE
                 .fill(BG_PANEL)
@@ -620,7 +657,7 @@ pub fn render_dashboard(app: &mut ZensmuApp, ui: &mut Ui) {
             egui::Grid::new("clocks_grid")
                 .num_columns(2)
                 .striped(true)
-                .min_col_width(140.0)
+                .min_col_width(180.0)
                 .show(ui, |ui| {
                     metric_row(ui, "FCLK (Infinity Fabric)", snap.and_then(|s| s.fclk_mhz), "MHz", 0);
                     metric_row(ui, "UCLK (Memory Controller)", snap.and_then(|s| s.uclk_mhz), "MHz", 0);
@@ -635,7 +672,7 @@ pub fn render_dashboard(app: &mut ZensmuApp, ui: &mut Ui) {
             egui::Grid::new("voltages_grid")
                 .num_columns(2)
                 .striped(true)
-                .min_col_width(140.0)
+                .min_col_width(180.0)
                 .show(ui, |ui| {
                     metric_row(ui, "VDDCR_SOC", snap.and_then(|s| s.vddcr_soc_v), "V", 3);
                     metric_row(ui, "VDDCR_MISC", snap.and_then(|s| s.vddcr_misc_v), "V", 3);
@@ -671,7 +708,7 @@ fn render_gauge_card(
                 };
                 ui.label(
                     RichText::new(format!("{val:.1} {unit}"))
-                        .size(20.0)
+                        .size(24.0)
                         .strong()
                         .monospace(),
                 );
@@ -685,7 +722,7 @@ fn render_gauge_card(
             (Some(val), _) => {
                 ui.label(
                     RichText::new(format!("{val:.1} {unit}"))
-                        .size(20.0)
+                        .size(24.0)
                         .strong()
                         .monospace(),
                 );
@@ -695,7 +732,7 @@ fn render_gauge_card(
             _ => {
                 ui.label(
                     RichText::new("—")
-                        .size(20.0)
+                        .size(24.0)
                         .strong()
                         .monospace()
                         .color(TEXT_MUTED),
@@ -1532,11 +1569,11 @@ pub fn render_profiles_and_safety(app: &mut ZensmuApp, ui: &mut Ui, ctx: &egui::
         ui.label(RichText::new("Declarative TOML Profile").strong());
         ui.add_space(6.0);
 
-        ui.horizontal(|ui| {
+        ui.horizontal_wrapped(|ui| {
             ui.label("Path:");
             ui.add(
                 egui::TextEdit::singleline(&mut app.profile_editor.path)
-                    .desired_width(340.0)
+                    .desired_width(400.0)
                     .hint_text("/etc/zensmu/active.toml"),
             );
             if ui.button("Load TOML").clicked() {
@@ -1584,7 +1621,7 @@ pub fn render_profiles_and_safety(app: &mut ZensmuApp, ui: &mut Ui, ctx: &egui::
         ui.add_space(6.0);
         egui::ScrollArea::vertical()
             .id_salt("toml_editor_scroll")
-            .max_height(240.0)
+            .max_height(260.0)
             .show(ui, |ui| {
                 ui.add(
                     egui::TextEdit::multiline(&mut app.profile_editor.toml_text)
@@ -1818,7 +1855,7 @@ pub fn render_dry_run_modal(app: &mut ZensmuApp, ctx: &egui::Context) {
     egui::Window::new(format!("Dry-Run Confirmation — {}", modal.title))
         .collapsible(false)
         .resizable(true)
-        .default_width(760.0)
+        .default_width(860.0)
         .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
         .show(ctx, |ui| {
             ui.label(

@@ -8,8 +8,8 @@ fn main() -> eframe::Result<()> {
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_title("zensmu — AMD Ryzen SMU Control & Telemetry")
-            .with_inner_size([1220.0, 780.0])
-            .with_min_inner_size([920.0, 620.0]),
+            .with_inner_size([1380.0, 860.0])
+            .with_min_inner_size([1000.0, 660.0]),
         ..Default::default()
     };
 

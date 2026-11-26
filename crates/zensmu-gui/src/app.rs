@@ -27,6 +27,12 @@ pub const TELEMETRY_RING_CAPACITY: usize = 180;
 /// Available telemetry polling intervals in milliseconds.
 pub const POLL_INTERVAL_OPTIONS_MS: [u64; 4] = [250, 500, 1000, 2000];
 
+/// Interactive UI zoom / font scale bounds and step.
+pub const UI_ZOOM_DEFAULT: f32 = 1.0;
+pub const UI_ZOOM_MIN: f32 = 0.85;
+pub const UI_ZOOM_MAX: f32 = 1.60;
+pub const UI_ZOOM_STEP: f32 = 0.10;
+
 /// Main navigation tabs in the left sidebar.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Tab {
@@ -199,6 +205,7 @@ pub struct ZensmuApp {
     pub hw: Option<HardwareContext>,
     pub hw_error: Option<String>,
     pub active_tab: Tab,
+    pub ui_zoom: f32,
 
     // Live unprivileged telemetry
     pub samples: VecDeque<TelemetrySample>,
@@ -241,6 +248,7 @@ impl ZensmuApp {
             hw: None,
             hw_error: None,
             active_tab: Tab::Dashboard,
+            ui_zoom: UI_ZOOM_DEFAULT,
             samples: VecDeque::with_capacity(TELEMETRY_RING_CAPACITY),
             latest_telemetry: None,
             telemetry_error: None,
@@ -263,9 +271,53 @@ impl ZensmuApp {
             toast: None,
         };
 
+        app.set_ui_zoom(app.ui_zoom, &cc.egui_ctx);
         app.probe_hardware(&cc.egui_ctx);
         app.refresh_safety_files();
         app
+    }
+
+    /// Set the interactive UI zoom factor (clamped to `0.85..=1.60`) and apply it to `egui`.
+    pub fn set_ui_zoom(&mut self, zoom: f32, ctx: &egui::Context) {
+        let clamped = clamp_ui_zoom(zoom);
+        self.ui_zoom = clamped;
+        ctx.set_zoom_factor(clamped);
+    }
+
+    /// Adjust the interactive UI zoom factor by `delta` (e.g. `±UI_ZOOM_STEP`).
+    pub fn adjust_ui_zoom(&mut self, delta: f32, ctx: &egui::Context) {
+        self.set_ui_zoom(self.ui_zoom + delta, ctx);
+    }
+
+    /// Handle global keyboard zoom shortcuts (`Ctrl +`/`=`, `Ctrl -`, `Ctrl 0`).
+    fn handle_zoom_shortcuts(&mut self, ctx: &egui::Context) {
+        let mut delta = 0.0_f32;
+        let mut reset = false;
+
+        ctx.input_mut(|i| {
+            let cmd = egui::Modifiers::COMMAND;
+            let cmd_shift = egui::Modifiers::COMMAND | egui::Modifiers::SHIFT;
+
+            if i.consume_key(cmd, egui::Key::Plus)
+                || i.consume_key(cmd_shift, egui::Key::Plus)
+                || i.consume_key(cmd, egui::Key::Equals)
+                || i.consume_key(cmd_shift, egui::Key::Equals)
+            {
+                delta += UI_ZOOM_STEP;
+            }
+            if i.consume_key(cmd, egui::Key::Minus) {
+                delta -= UI_ZOOM_STEP;
+            }
+            if i.consume_key(cmd, egui::Key::Num0) {
+                reset = true;
+            }
+        });
+
+        if reset {
+            self.set_ui_zoom(UI_ZOOM_DEFAULT, ctx);
+        } else if delta != 0.0 {
+            self.adjust_ui_zoom(delta, ctx);
+        }
     }
 
     /// Probe `/sys/kernel/ryzen_smu_drv/` read-only attributes without root.
@@ -707,6 +759,7 @@ impl Drop for ZensmuApp {
 
 impl eframe::App for ZensmuApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        self.handle_zoom_shortcuts(ctx);
         self.drain_telemetry();
         self.drain_cli_results(ctx);
 
@@ -738,8 +791,16 @@ impl eframe::App for ZensmuApp {
     }
 }
 
-/// Apply the dark cockpit visual theme to `egui`.
+/// Clamp and round a UI zoom value to two decimal places within `UI_ZOOM_MIN..=UI_ZOOM_MAX`.
+pub fn clamp_ui_zoom(zoom: f32) -> f32 {
+    (zoom.clamp(UI_ZOOM_MIN, UI_ZOOM_MAX) * 100.0).round() / 100.0
+}
+
+/// Apply the dark cockpit visual theme and legible desktop typography to `egui`.
 pub fn configure_dark_cockpit_theme(ctx: &egui::Context) {
+    // Manage Ctrl+/Ctrl-/Ctrl+0 ourselves so `ZensmuApp::ui_zoom` stays in sync and clamped.
+    ctx.options_mut(|o| o.zoom_with_keyboard = false);
+
     let mut visuals = egui::Visuals::dark();
     visuals.panel_fill = views::BG_PANEL;
     visuals.window_fill = views::BG_CARD;
@@ -756,8 +817,33 @@ pub fn configure_dark_cockpit_theme(ctx: &egui::Context) {
     ctx.set_visuals(visuals);
 
     let mut style = (*ctx.style()).clone();
-    style.spacing.item_spacing = egui::vec2(8.0, 7.0);
-    style.spacing.button_padding = egui::vec2(10.0, 5.0);
+    style.text_styles = [
+        (
+            egui::TextStyle::Heading,
+            egui::FontId::new(24.0, egui::FontFamily::Proportional),
+        ),
+        (
+            egui::TextStyle::Body,
+            egui::FontId::new(16.0, egui::FontFamily::Proportional),
+        ),
+        (
+            egui::TextStyle::Button,
+            egui::FontId::new(15.5, egui::FontFamily::Proportional),
+        ),
+        (
+            egui::TextStyle::Monospace,
+            egui::FontId::new(15.0, egui::FontFamily::Monospace),
+        ),
+        (
+            egui::TextStyle::Small,
+            egui::FontId::new(13.5, egui::FontFamily::Proportional),
+        ),
+    ]
+    .into();
+    style.spacing.item_spacing = egui::vec2(10.0, 8.0);
+    style.spacing.button_padding = egui::vec2(12.0, 6.0);
+    style.spacing.interact_size.y = 26.0;
+    style.spacing.slider_width = 150.0;
     ctx.set_style(style);
 }
 
@@ -786,4 +872,49 @@ fn default_profile_template(hw: &HardwareContext) -> String {
     }
 
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn ui_zoom_clamps_and_rounds_cleanly() {
+        assert_eq!(clamp_ui_zoom(0.50), UI_ZOOM_MIN);
+        assert_eq!(clamp_ui_zoom(UI_ZOOM_MIN), 0.85);
+        assert_eq!(clamp_ui_zoom(1.0 + 0.1 + 0.1), 1.2);
+        assert_eq!(clamp_ui_zoom(2.25), UI_ZOOM_MAX);
+    }
+
+    #[test]
+    fn dark_cockpit_theme_sets_legible_typography_and_spacing() {
+        let ctx = egui::Context::default();
+        configure_dark_cockpit_theme(&ctx);
+
+        let style = ctx.style();
+        assert_eq!(
+            style.text_styles.get(&egui::TextStyle::Heading),
+            Some(&egui::FontId::new(24.0, egui::FontFamily::Proportional))
+        );
+        assert_eq!(
+            style.text_styles.get(&egui::TextStyle::Body),
+            Some(&egui::FontId::new(16.0, egui::FontFamily::Proportional))
+        );
+        assert_eq!(
+            style.text_styles.get(&egui::TextStyle::Button),
+            Some(&egui::FontId::new(15.5, egui::FontFamily::Proportional))
+        );
+        assert_eq!(
+            style.text_styles.get(&egui::TextStyle::Monospace),
+            Some(&egui::FontId::new(15.0, egui::FontFamily::Monospace))
+        );
+        assert_eq!(
+            style.text_styles.get(&egui::TextStyle::Small),
+            Some(&egui::FontId::new(13.5, egui::FontFamily::Proportional))
+        );
+        assert_eq!(style.spacing.item_spacing, egui::vec2(10.0, 8.0));
+        assert_eq!(style.spacing.button_padding, egui::vec2(12.0, 6.0));
+        assert_eq!(style.spacing.interact_size.y, 26.0);
+        assert!(!ctx.options(|o| o.zoom_with_keyboard));
+    }
 }
