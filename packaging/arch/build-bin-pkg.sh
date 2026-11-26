@@ -58,5 +58,11 @@ if [[ "${1:-}" == "--publish" ]]; then
     echo "==> Publishing $(basename "${FINAL_PKG}") to ${REPO_DIR} (${DB_NAME})"
     sudo install -Dm644 -o root -g http "${FINAL_PKG}" "${REPO_DIR}/$(basename "${FINAL_PKG}")"
     sudo repo-add "${REPO_DIR}/${DB_NAME}" "${REPO_DIR}/$(basename "${FINAL_PKG}")"
+    # Dereference .db / .files symlinks created by repo-add into regular files
+    # (HTTP servers such as oxiroute reject symlinks with 403 Forbidden).
+    DB_BASE="${DB_NAME%.db.tar.gz}"
+    sudo cp -L --remove-destination "${REPO_DIR}/${DB_BASE}.db.tar.gz" "${REPO_DIR}/${DB_BASE}.db"
+    sudo cp -L --remove-destination "${REPO_DIR}/${DB_BASE}.files.tar.gz" "${REPO_DIR}/${DB_BASE}.files"
+    sudo chmod 644 "${REPO_DIR}/${DB_BASE}.db" "${REPO_DIR}/${DB_BASE}.files"
     echo "==> Published successfully to ${REPO_DIR}"
 fi
