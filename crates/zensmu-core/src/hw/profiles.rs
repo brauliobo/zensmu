@@ -126,6 +126,7 @@ pub struct CpuCapabilities {
     pub get_fused_fast: Option<OpcodeSpec>,
     pub get_fused_apu_slow: Option<OpcodeSpec>,
     pub get_fused_vdd_tdc: Option<OpcodeSpec>,
+    pub get_fused_edc: Option<OpcodeSpec>,
     pub get_fused_soc_tdc: Option<OpcodeSpec>,
 
     // APU-specific DPTC controls
@@ -237,12 +238,15 @@ fn zen4_desktop(codename: Codename) -> CpuCapabilities {
         get_expo_active: Some(OpcodeSpec::rsmu(0x35)),
         get_ln2_mode: Some(OpcodeSpec::rsmu(0xDD)),
         get_perf_data: Some(OpcodeSpec::rsmu(0x5C)),
-        get_fused_ppt: Some(OpcodeSpec::rsmu(0xDC)),
+        // Verified live on Ryzen 7 9700X (Granite Ridge):
+        // 0xD9 = 88000 mW (PPT), 0xDB = 75000 mA (TDC), 0xDC = 150000 mA (EDC)
+        get_fused_ppt: Some(OpcodeSpec::rsmu(0xD9)),
         get_fused_slow: None,
         get_fused_fast: None,
         get_fused_apu_slow: Some(OpcodeSpec::rsmu(0xDA)),
         get_fused_vdd_tdc: Some(OpcodeSpec::rsmu(0xDB)),
-        get_fused_soc_tdc: Some(OpcodeSpec::rsmu(0xD9)),
+        get_fused_edc: Some(OpcodeSpec::rsmu(0xDC)),
+        get_fused_soc_tdc: None,
 
         set_stapm_limit: None,
         set_stapm_time: None,
@@ -311,6 +315,7 @@ fn zen3_desktop(codename: Codename) -> CpuCapabilities {
         get_fused_fast: None,
         get_fused_apu_slow: None,
         get_fused_vdd_tdc: None,
+        get_fused_edc: None,
         get_fused_soc_tdc: None,
 
         set_stapm_limit: None,
@@ -366,6 +371,7 @@ fn zen2_desktop(codename: Codename) -> CpuCapabilities {
         get_fused_fast: None,
         get_fused_apu_slow: None,
         get_fused_vdd_tdc: None,
+        get_fused_edc: None,
         get_fused_soc_tdc: None,
 
         set_stapm_limit: None,
@@ -442,6 +448,7 @@ fn apu1_base(codename: Codename) -> CpuCapabilities {
         get_fused_fast: Some(OpcodeSpec::rsmu(0x13)),
         get_fused_apu_slow: Some(OpcodeSpec::rsmu(0x14)),
         get_fused_vdd_tdc: Some(OpcodeSpec::rsmu(0x15)),
+        get_fused_edc: None,
         get_fused_soc_tdc: Some(OpcodeSpec::rsmu(0x16)),
 
         set_stapm_limit: Some(DualOpcode::mp1_then_rsmu(0x14, 0x31)),

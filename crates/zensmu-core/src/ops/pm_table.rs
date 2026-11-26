@@ -70,14 +70,17 @@ fn layout_for(codename: Codename, version: u32) -> Option<PmTableLayout> {
             };
             Some(PmTableLayout {
                 min_size,
-                ppt_limit_w: Some(0x000),
-                ppt_value_w: Some(0x004),
-                tdc_limit_a: Some(0x008),
-                tdc_value_a: Some(0x00C),
-                tctl_limit_c: Some(0x010),
-                tctl_value_c: Some(0x014),
-                edc_limit_a: Some(0x020),
-                edc_value_a: Some(0x024),
+                // Verified live on Ryzen 7 9700X (Granite Ridge, PM table 0x620105, 0x724 bytes):
+                // 0x000..0x004 STAPM (0 on desktop), 0x008/0x00C PPT, 0x020/0x024 TDC VDD,
+                // 0x028/0x02C THM/Tctl, 0x0FC/0x100 EDC VDD.
+                ppt_limit_w: Some(0x008),
+                ppt_value_w: Some(0x00C),
+                tdc_limit_a: Some(0x020),
+                tdc_value_a: Some(0x024),
+                tctl_limit_c: Some(0x028),
+                tctl_value_c: Some(0x02C),
+                edc_limit_a: Some(0x0FC),
+                edc_value_a: Some(0x100),
                 vddcr_soc_v: Some(0x0D8),
                 vddcr_misc_v: Some(0x0EC),
                 fclk_mhz: Some(0x11C),
@@ -98,14 +101,14 @@ fn layout_for(codename: Codename, version: u32) -> Option<PmTableLayout> {
             }
             Some(PmTableLayout {
                 min_size: 0x434,
-                ppt_limit_w: Some(0x000),
-                ppt_value_w: Some(0x004),
-                tdc_limit_a: Some(0x008),
-                tdc_value_a: Some(0x00C),
-                tctl_limit_c: Some(0x010),
-                tctl_value_c: Some(0x014),
-                edc_limit_a: Some(0x020),
-                edc_value_a: Some(0x024),
+                ppt_limit_w: Some(0x008),
+                ppt_value_w: Some(0x00C),
+                tdc_limit_a: Some(0x020),
+                tdc_value_a: Some(0x024),
+                tctl_limit_c: Some(0x028),
+                tctl_value_c: Some(0x02C),
+                edc_limit_a: Some(0x0FC),
+                edc_value_a: Some(0x100),
                 vddcr_soc_v: Some(0x0D0),
                 vddcr_misc_v: Some(0x0E4),
                 fclk_mhz: Some(0x118),
@@ -399,8 +402,8 @@ mod tests {
     #[test]
     fn filters_nan_inf_and_absurd_values() {
         let mut raw = vec![0u8; 0x724];
-        write_f32(&mut raw, 0x000, f32::NAN);
-        write_f32(&mut raw, 0x004, f32::INFINITY);
+        write_f32(&mut raw, 0x008, f32::NAN);
+        write_f32(&mut raw, 0x00C, f32::INFINITY);
         write_f32(&mut raw, 0x0D8, 99.0); // absurd voltage
         write_f32(&mut raw, 0x11C, 2000.0); // valid FCLK
         write_f32(&mut raw, 0x12C, -50.0); // negative clock

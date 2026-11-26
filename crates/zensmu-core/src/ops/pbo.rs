@@ -34,7 +34,7 @@ pub const FMAX_MIN_MHZ: u32 = 2000;
 pub const FMAX_MAX_MHZ: u32 = 6500;
 pub const FMAX_SOFT_DELTA_MHZ: u32 = 200;
 
-/// Read-only fused factory power/current limits reported by the SMU.
+/// Read-only fused factory power/current limits reported by the SMU (normalized to W / A).
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FusedLimits {
     pub ppt_w: Option<u32>,
@@ -42,6 +42,8 @@ pub struct FusedLimits {
     pub fast_w: Option<u32>,
     pub apu_slow_w: Option<u32>,
     pub vdd_tdc_a: Option<u32>,
+    #[serde(default)]
+    pub edc_a: Option<u32>,
     pub soc_tdc_a: Option<u32>,
 }
 
@@ -107,13 +109,29 @@ pub fn get_pbo_status(transport: &dyn SmuTransport, hw: &HardwareContext) -> Res
 
     let fmax_mhz = query_optional(transport, hw, caps.get_fmax, [0; 6])?.map(|o| o[0]);
 
+    let norm_milli = |raw: u32| -> u32 {
+        if raw >= 1000 {
+            raw / 1000
+        } else {
+            raw
+        }
+    };
+
     let fused = FusedLimits {
-        ppt_w: query_optional(transport, hw, caps.get_fused_ppt, [0; 6])?.map(|o| o[0]),
-        slow_w: query_optional(transport, hw, caps.get_fused_slow, [0; 6])?.map(|o| o[0]),
-        fast_w: query_optional(transport, hw, caps.get_fused_fast, [0; 6])?.map(|o| o[0]),
-        apu_slow_w: query_optional(transport, hw, caps.get_fused_apu_slow, [0; 6])?.map(|o| o[0]),
-        vdd_tdc_a: query_optional(transport, hw, caps.get_fused_vdd_tdc, [0; 6])?.map(|o| o[0]),
-        soc_tdc_a: query_optional(transport, hw, caps.get_fused_soc_tdc, [0; 6])?.map(|o| o[0]),
+        ppt_w: query_optional(transport, hw, caps.get_fused_ppt, [0; 6])?
+            .map(|o| norm_milli(o[0])),
+        slow_w: query_optional(transport, hw, caps.get_fused_slow, [0; 6])?
+            .map(|o| norm_milli(o[0])),
+        fast_w: query_optional(transport, hw, caps.get_fused_fast, [0; 6])?
+            .map(|o| norm_milli(o[0])),
+        apu_slow_w: query_optional(transport, hw, caps.get_fused_apu_slow, [0; 6])?
+            .map(|o| norm_milli(o[0])),
+        vdd_tdc_a: query_optional(transport, hw, caps.get_fused_vdd_tdc, [0; 6])?
+            .map(|o| norm_milli(o[0])),
+        edc_a: query_optional(transport, hw, caps.get_fused_edc, [0; 6])?
+            .map(|o| norm_milli(o[0])),
+        soc_tdc_a: query_optional(transport, hw, caps.get_fused_soc_tdc, [0; 6])?
+            .map(|o| norm_milli(o[0])),
     };
 
     let flags = PlatformFlags {
@@ -508,7 +526,7 @@ mod tests {
         assert_eq!(status.fmax_mhz, Some(5550));
         assert_eq!(status.fused.ppt_w, Some(88));
         assert_eq!(status.fused.vdd_tdc_a, Some(75));
-        assert_eq!(status.fused.soc_tdc_a, Some(45));
+        assert_eq!(status.fused.edc_a, Some(150));
         assert_eq!(status.fused.apu_slow_w, Some(65));
         assert_eq!(status.flags.overclockable, Some(true));
         assert_eq!(status.flags.expo_active, Some(true));

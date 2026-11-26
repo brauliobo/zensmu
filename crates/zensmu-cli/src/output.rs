@@ -472,7 +472,10 @@ pub fn print_pbo_status(out: &PboGetOutput) {
     let f = &out.status.fused;
     println!("  Fused PPT      : {}", fmt_opt_u32(f.ppt_w, "W"));
     println!("  Fused VDD TDC  : {}", fmt_opt_u32(f.vdd_tdc_a, "A"));
-    println!("  Fused SoC TDC  : {}", fmt_opt_u32(f.soc_tdc_a, "A"));
+    println!("  Fused EDC      : {}", fmt_opt_u32(f.edc_a, "A"));
+    if f.soc_tdc_a.is_some() {
+        println!("  Fused SoC TDC  : {}", fmt_opt_u32(f.soc_tdc_a, "A"));
+    }
     if f.slow_w.is_some() || f.fast_w.is_some() || f.apu_slow_w.is_some() {
         println!("  Fused Slow     : {}", fmt_opt_u32(f.slow_w, "W"));
         println!("  Fused Fast     : {}", fmt_opt_u32(f.fast_w, "W"));

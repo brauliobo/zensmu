@@ -37,7 +37,7 @@ struct MockState {
     /// Fused limits
     fused_ppt_w: u32,
     fused_vdd_tdc_a: u32,
-    fused_soc_tdc_a: u32,
+    fused_edc_a: u32,
     fused_apu_slow_w: u32,
     /// Flags
     overclockable: bool,
@@ -62,19 +62,17 @@ impl MockTransport {
             co_margins.insert(c << 20, 0);
         }
         let mut pm_table = vec![0u8; 0x724];
-        // Populate realistic verified Granite Ridge 0x620105 floats:
-        // FCLK=2000, UCLK=3000, MCLK=3000, VDDCR_SOC=1.24V, CLDO_VDDP=1.05V,
-        // CLDO_VDDG_IOD=0.95V, CLDO_VDDG_CCD=0.95V, MISC=1.10V
-        write_f32(&mut pm_table, 0x000, 88.0); // PPT limit
-        write_f32(&mut pm_table, 0x004, 42.5); // PPT value
-        write_f32(&mut pm_table, 0x008, 75.0); // TDC limit
-        write_f32(&mut pm_table, 0x00C, 21.0); // TDC value
-        write_f32(&mut pm_table, 0x010, 95.0); // Tctl limit
-        write_f32(&mut pm_table, 0x014, 54.2); // Tctl value
-        write_f32(&mut pm_table, 0x020, 150.0); // EDC limit
-        write_f32(&mut pm_table, 0x024, 38.0); // EDC value
+        // Populate verified Granite Ridge 0x620105 floats (matching live Ryzen 7 9700X):
+        write_f32(&mut pm_table, 0x008, 88.0); // PPT limit
+        write_f32(&mut pm_table, 0x00C, 42.5); // PPT value
+        write_f32(&mut pm_table, 0x020, 75.0); // TDC limit
+        write_f32(&mut pm_table, 0x024, 21.0); // TDC value
+        write_f32(&mut pm_table, 0x028, 95.0); // Tctl limit
+        write_f32(&mut pm_table, 0x02C, 54.2); // Tctl value
         write_f32(&mut pm_table, 0x0D8, 1.24); // VDDCR_SOC
         write_f32(&mut pm_table, 0x0EC, 1.10); // VDDCR_MISC
+        write_f32(&mut pm_table, 0x0FC, 150.0); // EDC limit
+        write_f32(&mut pm_table, 0x100, 38.0); // EDC value
         write_f32(&mut pm_table, 0x11C, 2000.0); // FCLK
         write_f32(&mut pm_table, 0x12C, 3000.0); // UCLK
         write_f32(&mut pm_table, 0x13C, 3000.0); // MCLK
@@ -105,7 +103,7 @@ impl MockTransport {
                 tctl_c: 95,
                 fused_ppt_w: 88,
                 fused_vdd_tdc_a: 75,
-                fused_soc_tdc_a: 45,
+                fused_edc_a: 150,
                 fused_apu_slow_w: 65,
                 overclockable: true,
                 expo_active: true,
@@ -233,22 +231,22 @@ impl SmuTransport for MockTransport {
             (Mailbox::Rsmu, 0x56) | (Mailbox::Mp1, 0x3E) => {
                 st.ppt_mw = args[0];
                 let w = args[0] as f32 / 1000.0;
-                write_f32(&mut st.pm_table, 0x000, w);
+                write_f32(&mut st.pm_table, 0x008, w);
             }
             (Mailbox::Rsmu, 0x57) | (Mailbox::Mp1, 0x3C) => {
                 st.tdc_ma = args[0];
                 let a = args[0] as f32 / 1000.0;
-                write_f32(&mut st.pm_table, 0x008, a);
+                write_f32(&mut st.pm_table, 0x020, a);
             }
             (Mailbox::Rsmu, 0x58) | (Mailbox::Mp1, 0x3D) => {
                 st.edc_ma = args[0];
                 let a = args[0] as f32 / 1000.0;
-                write_f32(&mut st.pm_table, 0x020, a);
+                write_f32(&mut st.pm_table, 0x0FC, a);
             }
             (Mailbox::Rsmu, 0x59) | (Mailbox::Mp1, 0x3F) => {
                 st.tctl_c = args[0];
                 let c = args[0] as f32;
-                write_f32(&mut st.pm_table, 0x010, c);
+                write_f32(&mut st.pm_table, 0x028, c);
             }
             (Mailbox::Rsmu, 0x6D) => {
                 out[0] = st.pbo_scalar.to_bits();
@@ -272,16 +270,16 @@ impl SmuTransport for MockTransport {
                 out[0] = u32::from(st.ln2_mode);
             }
             (Mailbox::Rsmu, 0xDC) => {
-                out[0] = st.fused_ppt_w;
+                out[0] = st.fused_edc_a * 1000; // Fused EDC (mA) on AM5
             }
             (Mailbox::Rsmu, 0xDB) => {
-                out[0] = st.fused_vdd_tdc_a;
+                out[0] = st.fused_vdd_tdc_a * 1000;
             }
             (Mailbox::Rsmu, 0xD9) => {
-                out[0] = st.fused_soc_tdc_a;
+                out[0] = st.fused_ppt_w * 1000; // Fused PPT (mW) on AM5
             }
             (Mailbox::Rsmu, 0xDA) => {
-                out[0] = st.fused_apu_slow_w;
+                out[0] = st.fused_apu_slow_w * 1000;
             }
             (Mailbox::Rsmu, 0x5C) => {
                 // CPPC perf score mock: higher on core 0 & 3
