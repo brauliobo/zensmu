@@ -39,6 +39,7 @@ cp "${TARBALL}" "${BUILD_DIR}/"
 
 # Point local PKGBUILD build at the freshly built local tarball
 sed -i "s|^source=.*|source=(\"zensmu-bin-\${pkgver}-x86_64.tar.gz\")|" "${BUILD_DIR}/PKGBUILD"
+sed -i "s|^sha256sums=.*|sha256sums=('SKIP')|" "${BUILD_DIR}/PKGBUILD"
 sed -i "s|^pkgver=.*|pkgver=${PKGVER}|" "${BUILD_DIR}/PKGBUILD"
 sed -i "s|^pkgrel=.*|pkgrel=${PKGREL}|" "${BUILD_DIR}/PKGBUILD"
 
