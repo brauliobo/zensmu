@@ -99,13 +99,36 @@ pub fn apply_snapshot(
         }
     }
 
+    // Compare against live hardware so rollback/reset skips unchanged PBO limits
+    // (avoids redundant SMU writes and prevents failing on BIOS Motherboard-PBO limits).
+    let live_telem = pm_table::read_telemetry(transport, hw).ok();
+    let live_pbo = pbo::get_pbo_status(transport, hw).ok();
+    let changed_u32 = |desired: Option<u32>, current: Option<f32>| -> Option<u32> {
+        let d = desired?;
+        if let Some(c) = current {
+            if (c - d as f32).abs() <= 0.5 {
+                return None;
+            }
+        }
+        Some(d)
+    };
+    let desired_scalar = snap.pbo_scalar.map(|s| s.round().clamp(1.0, 10.0) as u32);
+    let scalar_req = match (desired_scalar, live_pbo.as_ref().and_then(|p| p.scalar)) {
+        (Some(d), Some(c)) if (c - d as f32).abs() <= 0.05 => None,
+        (d, _) => d,
+    };
+    let fmax_req = match (snap.fmax_mhz, live_pbo.as_ref().and_then(|p| p.fmax_mhz)) {
+        (Some(d), Some(c)) if d == c => None,
+        (d, _) => d,
+    };
+
     let pbo_req = pbo::PboSetRequest {
-        ppt_w: snap.ppt_w,
-        tdc_a: snap.tdc_a,
-        edc_a: snap.edc_a,
-        tctl_c: snap.tctl_c,
-        scalar: snap.pbo_scalar.map(|s| s.round().clamp(1.0, 10.0) as u32),
-        fmax_mhz: snap.fmax_mhz,
+        ppt_w: changed_u32(snap.ppt_w, live_telem.as_ref().and_then(|t| t.ppt_limit_w)),
+        tdc_a: changed_u32(snap.tdc_a, live_telem.as_ref().and_then(|t| t.tdc_limit_a)),
+        edc_a: changed_u32(snap.edc_a, live_telem.as_ref().and_then(|t| t.edc_limit_a)),
+        tctl_c: changed_u32(snap.tctl_c, live_telem.as_ref().and_then(|t| t.tctl_limit_c)),
+        scalar: scalar_req,
+        fmax_mhz: fmax_req,
     };
     if pbo_req.ppt_w.is_some()
         || pbo_req.tdc_a.is_some()
@@ -114,11 +137,12 @@ pub fn apply_snapshot(
         || pbo_req.scalar.is_some()
         || pbo_req.fmax_mhz.is_some()
     {
+        // Restoring a captured hardware snapshot permits BIOS-configured baseline limits.
         ops.extend(pbo::set_pbo(
             transport,
             hw,
             &pbo_req,
-            allow_extreme,
+            true,
             dry_run,
         )?);
     }

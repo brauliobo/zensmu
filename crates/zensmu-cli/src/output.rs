@@ -597,7 +597,14 @@ pub fn print_status(status: &StatusOutput) {
         print_shaper_matrix(cs, status.codename);
     } else if let Some(ref err) = status.curve_shaper_error {
         println!();
-        println!("Curve Shaper    : unavailable ({err})");
+        if err.contains("UNKNOWN_CMD (0xFE)") || err.contains("CMD_REJECTED_PREREQ (0xFD)") {
+            let code = if err.contains("0xFE") { "0xFE" } else { "0xFD" };
+            println!(
+                "Curve Shaper    : not exposed by BIOS / SMU firmware ({code})"
+            );
+        } else {
+            println!("Curve Shaper    : unavailable ({err})");
+        }
     }
 
     if let Some(ref pbo) = status.pbo {

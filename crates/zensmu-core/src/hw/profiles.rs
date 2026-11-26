@@ -286,10 +286,11 @@ fn zen3_desktop(codename: Codename) -> CpuCapabilities {
         test_message_rsmu: Some(OpcodeSpec::rsmu(0x01)),
         test_message_mp1: Some(OpcodeSpec::mp1(0x01)),
 
-        // Zen 3 (Vermeer/Chagall): MP1 CO set is well-verified; RSMU CO get (0x7C) is not reliable on all AGESA
-        get_co_per_core: None,
-        set_co_per_core: Some(DualOpcode::mp1_only(0x35)),
-        set_co_all_cores: Some(DualOpcode::mp1_only(0x36)),
+        // Zen 3 (Vermeer/Chagall): verified live on Ryzen 9 5900XT (SMU 56.76.0):
+        // RSMU 0x7C reads per-core CO across CCD0/CCD1; MP1 0x35/0x36 (with RSMU 0x0A/0x0B fallback) writes CO.
+        get_co_per_core: Some(OpcodeSpec::rsmu(0x7C)),
+        set_co_per_core: Some(DualOpcode::mp1_then_rsmu(0x35, 0x0A)),
+        set_co_all_cores: Some(DualOpcode::mp1_then_rsmu(0x36, 0x0B)),
         get_igpu_co: None,
         set_igpu_co: None,
 
@@ -409,7 +410,11 @@ fn apu1_base(codename: Codename) -> CpuCapabilities {
         test_message_rsmu: Some(OpcodeSpec::rsmu(0x01)),
         test_message_mp1: Some(OpcodeSpec::mp1(0x01)),
 
-        get_co_per_core: None,
+        get_co_per_core: if codename == Codename::Cezanne {
+            Some(OpcodeSpec::rsmu(0xC3))
+        } else {
+            None
+        },
         set_co_per_core: if codename == Codename::Cezanne {
             Some(DualOpcode::mp1_then_rsmu(0x54, 0x52))
         } else {

@@ -324,6 +324,7 @@ enum MailboxState<T> {
     Loaded(T),
     PermissionDenied,
     Unsupported,
+    FirmwareUnsupported(String),
     Error(String),
 }
 
@@ -333,6 +334,16 @@ impl<T> MailboxState<T> {
             Ok(v) => Self::Loaded(v),
             Err(Error::PermissionDenied { .. }) => Self::PermissionDenied,
             Err(Error::UnsupportedCapability { .. }) => Self::Unsupported,
+            Err(Error::SmuRejected { status, .. })
+                if status.contains("0xFE") || status.contains("0xFD") =>
+            {
+                let code = if status.contains("0xFE") {
+                    "0xFE"
+                } else {
+                    "0xFD"
+                };
+                Self::FirmwareUnsupported(code.to_string())
+            }
             Err(err) => Self::Error(err.to_string()),
         }
     }
@@ -1407,7 +1418,7 @@ fn draw_co_pbo_summary(frame: &mut Frame, area: Rect, app: &App, hw: &HardwareCo
         lines.push(Line::from(vec![
             Span::styled("PBO: ", Style::default().fg(palette::MUTED)),
             Span::styled(
-                mailbox_status_label(&app.pbo_state),
+                mailbox_status_label(&app.pbo_state, &hw.driver.smu_version),
                 Style::default().fg(palette::DIM),
             ),
         ]));
@@ -1416,31 +1427,91 @@ fn draw_co_pbo_summary(frame: &mut Frame, area: Rect, app: &App, hw: &HardwareCo
     // Per-core CO compact pills
     match &app.co_state {
         MailboxState::Loaded(co_snap) => {
-            let mut pill_spans: Vec<Span<'_>> = Vec::new();
-            pill_spans.push(Span::styled("CO: ", Style::default().fg(palette::MUTED)));
-            for core in &co_snap.cores {
-                let col = margin_color(core.margin);
-                pill_spans.push(Span::styled(
-                    format!("C{}:{}", core.core_index, format_signed_margin(core.margin)),
-                    Style::default().fg(col).add_modifier(Modifier::BOLD),
-                ));
-                pill_spans.push(Span::raw(" "));
+            if co_snap.cores.len() > 8 {
+                // On high-core-count dual-CCD CPUs (e.g. 16-core 5900XT/9950X),
+                // show a concise all-equal summary or CCD-grouped compact lines so nothing clips.
+                let first = co_snap.cores[0].margin;
+                if co_snap.cores.iter().all(|c| c.margin == first) {
+                    let mut spans = vec![
+                        Span::styled("CO: ", Style::default().fg(palette::MUTED)),
+                        Span::styled(
+                            format!(
+                                "all {} ({} cores across {} CCDs)",
+                                format_signed_margin(first),
+                                co_snap.cores.len(),
+                                hw.topology.ccd_count
+                            ),
+                            Style::default()
+                                .fg(margin_color(first))
+                                .add_modifier(Modifier::BOLD),
+                        ),
+                    ];
+                    if let Some(igpu) = co_snap.igpu {
+                        spans.push(Span::raw("  "));
+                        spans.push(Span::styled(
+                            format!("iGPU:{}", format_signed_margin(igpu)),
+                            Style::default()
+                                .fg(margin_color(igpu))
+                                .add_modifier(Modifier::BOLD),
+                        ));
+                    }
+                    lines.push(Line::from(spans));
+                } else {
+                    for chunk in co_snap.cores.chunks(8) {
+                        let mut pill_spans: Vec<Span<'_>> = Vec::new();
+                        let label = if chunk[0].core_index == 0 {
+                            "CO: "
+                        } else {
+                            "    "
+                        };
+                        pill_spans.push(Span::styled(label, Style::default().fg(palette::MUTED)));
+                        for core in chunk {
+                            let col = margin_color(core.margin);
+                            pill_spans.push(Span::styled(
+                                format!("C{}:{}", core.core_index, format_signed_margin(core.margin)),
+                                Style::default().fg(col).add_modifier(Modifier::BOLD),
+                            ));
+                            pill_spans.push(Span::raw(" "));
+                        }
+                        lines.push(Line::from(pill_spans));
+                    }
+                }
+            } else {
+                let mut pill_spans: Vec<Span<'_>> = Vec::new();
+                pill_spans.push(Span::styled("CO: ", Style::default().fg(palette::MUTED)));
+                for core in &co_snap.cores {
+                    let col = margin_color(core.margin);
+                    pill_spans.push(Span::styled(
+                        format!("C{}:{}", core.core_index, format_signed_margin(core.margin)),
+                        Style::default().fg(col).add_modifier(Modifier::BOLD),
+                    ));
+                    pill_spans.push(Span::raw(" "));
+                }
+                if let Some(igpu) = co_snap.igpu {
+                    pill_spans.push(Span::styled(
+                        format!("iGPU:{}", format_signed_margin(igpu)),
+                        Style::default()
+                            .fg(margin_color(igpu))
+                            .add_modifier(Modifier::BOLD),
+                    ));
+                }
+                lines.push(Line::from(pill_spans));
             }
-            if let Some(igpu) = co_snap.igpu {
-                pill_spans.push(Span::styled(
-                    format!("iGPU:{}", format_signed_margin(igpu)),
-                    Style::default()
-                        .fg(margin_color(igpu))
-                        .add_modifier(Modifier::BOLD),
-                ));
-            }
-            lines.push(Line::from(pill_spans));
+        }
+        MailboxState::Unsupported if hw.capabilities.set_co_per_core.is_some() => {
+            lines.push(Line::from(vec![
+                Span::styled("CO: ", Style::default().fg(palette::MUTED)),
+                Span::styled(
+                    "write-only on this CPU (no read opcode)",
+                    Style::default().fg(palette::DIM),
+                ),
+            ]));
         }
         other => {
             lines.push(Line::from(vec![
                 Span::styled("CO: ", Style::default().fg(palette::MUTED)),
                 Span::styled(
-                    mailbox_status_label(other),
+                    mailbox_status_label(other, &hw.driver.smu_version),
                     Style::default().fg(palette::DIM),
                 ),
             ]));
@@ -1483,7 +1554,7 @@ fn draw_co_pbo_summary(frame: &mut Frame, area: Rect, app: &App, hw: &HardwareCo
             lines.push(Line::from(vec![
                 Span::styled("Shaper: ", Style::default().fg(palette::MUTED)),
                 Span::styled(
-                    mailbox_status_label(other),
+                    mailbox_status_label(other, &hw.driver.smu_version),
                     Style::default().fg(palette::DIM),
                 ),
             ]));
@@ -1506,11 +1577,14 @@ fn flag_pill(name: &str, state: Option<bool>) -> Span<'static> {
     }
 }
 
-fn mailbox_status_label<T>(state: &MailboxState<T>) -> String {
+fn mailbox_status_label<T>(state: &MailboxState<T>, smu_ver: &str) -> String {
     match state {
         MailboxState::Loaded(_) => "loaded".to_string(),
         MailboxState::PermissionDenied => "requires sudo".to_string(),
         MailboxState::Unsupported => "unsupported on this CPU".to_string(),
+        MailboxState::FirmwareUnsupported(code) => {
+            format!("not exposed by SMU {smu_ver} ({code})")
+        }
         MailboxState::Error(e) => format!("error: {e}"),
     }
 }
@@ -1777,7 +1851,7 @@ fn draw_co_shaper_tab(frame: &mut Frame, area: Rect, app: &App, hw: &HardwareCon
         .split(cols[1]);
 
     draw_shaper_matrix(frame, right[0], app, hw);
-    draw_fused_pbo_table(frame, right[1], app);
+    draw_fused_pbo_table(frame, right[1], app, hw);
 }
 
 fn draw_unprivileged_tab3(frame: &mut Frame, area: Rect, note: &str, hw: &HardwareContext) {
@@ -1963,7 +2037,7 @@ fn draw_co_table(frame: &mut Frame, area: Rect, app: &App, hw: &HardwareContext)
             frame.render_widget(block, area);
             frame.render_widget(
                 Paragraph::new(Line::from(Span::styled(
-                    format!(" {}", mailbox_status_label(other)),
+                    format!(" {}", mailbox_status_label(other, &hw.driver.smu_version)),
                     Style::default().fg(palette::MUTED),
                 ))),
                 inner,
@@ -2038,7 +2112,7 @@ fn draw_shaper_matrix(frame: &mut Frame, area: Rect, app: &App, hw: &HardwareCon
             frame.render_widget(block, area);
             frame.render_widget(
                 Paragraph::new(Line::from(Span::styled(
-                    format!(" {}", mailbox_status_label(other)),
+                    format!(" {}", mailbox_status_label(other, &hw.driver.smu_version)),
                     Style::default().fg(palette::MUTED),
                 ))),
                 inner,
@@ -2047,7 +2121,7 @@ fn draw_shaper_matrix(frame: &mut Frame, area: Rect, app: &App, hw: &HardwareCon
     }
 }
 
-fn draw_fused_pbo_table(frame: &mut Frame, area: Rect, app: &App) {
+fn draw_fused_pbo_table(frame: &mut Frame, area: Rect, app: &App, hw: &HardwareContext) {
     let block = styled_block(" Fused Factory PBO Limits & Status ", palette::PURPLE);
 
     match &app.pbo_state {
@@ -2058,13 +2132,31 @@ fn draw_fused_pbo_table(frame: &mut Frame, area: Rect, app: &App) {
                 fmt_bool_opt(pbo.flags.expo_active),
                 fmt_bool_opt(pbo.flags.ln2_mode),
             );
-            let rows = vec![
+            let mut rows = vec![
                 kv_row(
                     "Fused PPT",
                     format_opt_u32(pbo.fused.ppt_w, "W"),
                     palette::CYAN,
                 ),
                 kv_row(
+                    "Fused VDD TDC / EDC",
+                    format!(
+                        "{} / {}",
+                        format_opt_u32(pbo.fused.vdd_tdc_a, "A"),
+                        format_opt_u32(pbo.fused.edc_a, "A"),
+                    ),
+                    palette::TEAL,
+                ),
+            ];
+            if pbo.fused.soc_tdc_a.is_some() {
+                rows.push(kv_row(
+                    "Fused SoC TDC",
+                    format_opt_u32(pbo.fused.soc_tdc_a, "A"),
+                    palette::FG,
+                ));
+            }
+            if pbo.fused.slow_w.is_some() || pbo.fused.fast_w.is_some() {
+                rows.push(kv_row(
                     "Fused Slow / Fast",
                     format!(
                         "{} / {}",
@@ -2072,32 +2164,25 @@ fn draw_fused_pbo_table(frame: &mut Frame, area: Rect, app: &App) {
                         format_opt_u32(pbo.fused.fast_w, "W"),
                     ),
                     palette::FG,
-                ),
-                kv_row(
+                ));
+            }
+            if pbo.fused.apu_slow_w.is_some() {
+                rows.push(kv_row(
                     "Fused APU Slow",
                     format_opt_u32(pbo.fused.apu_slow_w, "W"),
                     palette::FG,
+                ));
+            }
+            rows.push(kv_row(
+                "PBO Scalar / Fmax",
+                format!(
+                    "{}  ·  {}",
+                    format_opt_f32(pbo.scalar, 2, "x"),
+                    format_opt_u32(pbo.fmax_mhz, "MHz"),
                 ),
-                kv_row(
-                    "Fused VDD / SoC TDC",
-                    format!(
-                        "{} / {}",
-                        format_opt_u32(pbo.fused.vdd_tdc_a, "A"),
-                        format_opt_u32(pbo.fused.soc_tdc_a, "A"),
-                    ),
-                    palette::TEAL,
-                ),
-                kv_row(
-                    "PBO Scalar / Fmax",
-                    format!(
-                        "{}  ·  {}",
-                        format_opt_f32(pbo.scalar, 2, "x"),
-                        format_opt_u32(pbo.fmax_mhz, "MHz"),
-                    ),
-                    palette::YELLOW,
-                ),
-                kv_row("Platform Flags", flags_str, palette::GREEN),
-            ];
+                palette::YELLOW,
+            ));
+            rows.push(kv_row("Platform Flags", flags_str, palette::GREEN));
 
             let widths = [Constraint::Length(20), Constraint::Min(16)];
             let table = Table::new(rows, widths).block(block).column_spacing(1);
@@ -2108,7 +2193,7 @@ fn draw_fused_pbo_table(frame: &mut Frame, area: Rect, app: &App) {
             frame.render_widget(block, area);
             frame.render_widget(
                 Paragraph::new(Line::from(Span::styled(
-                    format!(" {}", mailbox_status_label(other)),
+                    format!(" {}", mailbox_status_label(other, &hw.driver.smu_version)),
                     Style::default().fg(palette::MUTED),
                 ))),
                 inner,

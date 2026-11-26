@@ -1331,11 +1331,12 @@ pub fn render_pbo_limits(app: &mut ZensmuApp, ui: &mut Ui, ctx: &egui::Context) 
                         RichText::new(opt_f32(telem.as_ref().and_then(|t| t.edc_limit_a), "A"))
                             .monospace(),
                     );
-                    ui.label(
-                        RichText::new(format!("Soft max ≤ {EDC_SOFT_MAX_A} A"))
-                            .small()
-                            .color(TEXT_MUTED),
-                    );
+                    let fused_txt = fused
+                        .as_ref()
+                        .and_then(|f| f.edc_a)
+                        .map(|a| format!("Fused EDC: {a} A · soft ≤ {EDC_SOFT_MAX_A} A"))
+                        .unwrap_or_else(|| format!("Soft max ≤ {EDC_SOFT_MAX_A} A"));
+                    ui.label(RichText::new(fused_txt).small().color(TEXT_MUTED));
                     ui.end_row();
                 }
 
