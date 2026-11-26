@@ -17,6 +17,7 @@ use zensmu_core::ops::co::CoSnapshot;
 use zensmu_core::ops::pbo::{PboSetRequest, PboStatus, TCTL_MAX_C};
 use zensmu_core::ops::pm_table::{self, TelemetrySnapshot};
 use zensmu_core::safety::guard::{BootLoopGuard, SentinelInfo};
+use zensmu_core::safety::persist::{read_persist_status, PersistPaths, PersistStatus};
 use zensmu_core::safety::snapshot::{SmuStateSnapshot, SnapshotStore};
 use zensmu_core::transport::sysfs::SysfsTransport;
 use zensmu_core::types::{CurveShaperState, PlannedOp};
@@ -78,6 +79,24 @@ pub struct DryRunModal {
     pub title: String,
     pub ops: Vec<PlannedOp>,
     pub live_action: CliAction,
+}
+
+/// Action executed when the user confirms a boot persistence modal.
+#[derive(Debug, Clone)]
+pub enum PersistConfirmTarget {
+    Cli(CliAction),
+    EditorToml { enable: bool },
+}
+
+/// Confirmation modal explaining exact system changes before invoking `pkexec` for persistence.
+#[derive(Debug, Clone)]
+pub struct PersistConfirmModal {
+    pub title: String,
+    pub summary: String,
+    pub changes: Vec<String>,
+    pub confirm_label: String,
+    pub is_destructive: bool,
+    pub target: PersistConfirmTarget,
 }
 
 /// Editable Curve Optimizer UI state.
@@ -230,6 +249,11 @@ pub struct ZensmuApp {
     pub pbo_editor: PboEditorState,
     pub profile_editor: ProfileEditorState,
 
+    // Unprivileged boot/resume persistence status & confirmation modal
+    pub persist_status: PersistStatus,
+    pub persist_confirm: Option<PersistConfirmModal>,
+    staging_persist_path: Option<PathBuf>,
+
     // Dry-run confirmation modal & async pkexec runner
     pub pending_modal: Option<DryRunModal>,
     pub runner: CommandRunner,
@@ -266,6 +290,9 @@ impl ZensmuApp {
             shaper_editor: ShaperEditorState::default(),
             pbo_editor: PboEditorState::default(),
             profile_editor: ProfileEditorState::default(),
+            persist_status: read_persist_status(&PersistPaths::default(), None, None),
+            persist_confirm: None,
+            staging_persist_path: None,
             pending_modal: None,
             runner,
             toast: None,
@@ -274,6 +301,7 @@ impl ZensmuApp {
         app.set_ui_zoom(app.ui_zoom, &cc.egui_ctx);
         app.probe_hardware(&cc.egui_ctx);
         app.refresh_safety_files();
+        app.refresh_persist_status();
         app
     }
 
@@ -350,6 +378,16 @@ impl ZensmuApp {
                 );
             }
         }
+        self.refresh_persist_status();
+    }
+
+    /// Refresh read-only boot/resume persistence and systemd service status (unprivileged).
+    pub fn refresh_persist_status(&mut self) {
+        let host_codename = self.hw.as_ref().map(|h| h.codename);
+        let host_cores = self.hw.as_ref().map(|h| h.topology.physical_cores);
+        self.persist_status =
+            read_persist_status(&PersistPaths::default(), host_codename, host_cores);
+        self.profile_editor.boot_guard_tripped = self.persist_status.boot_guard_tripped;
     }
 
     /// Refresh on-disk snapshot and boot-loop guard indicators (read-only).
@@ -588,6 +626,66 @@ impl ZensmuApp {
         );
     }
 
+    /// Validate the TOML editor buffer against detected hardware; updates inline validation & toast on failure.
+    pub fn validate_editor_toml_for_persist(&mut self) -> bool {
+        let profile = match Profile::from_toml_str(&self.profile_editor.toml_text) {
+            Ok(p) => p,
+            Err(e) => {
+                let msg = format!("Invalid TOML: {e}");
+                self.profile_editor.validation = Some(Err(msg.clone()));
+                self.set_toast(ToastLevel::Error, msg);
+                return false;
+            }
+        };
+
+        if let Some(hw) = &self.hw {
+            if let Err(e) = profile.validate_for(
+                hw.codename,
+                hw.topology.physical_cores,
+                self.profile_editor.allow_extreme,
+            ) {
+                let msg = e.to_string();
+                self.profile_editor.validation = Some(Err(msg.clone()));
+                self.set_toast(ToastLevel::Error, msg);
+                return false;
+            }
+        }
+        true
+    }
+
+    /// Validate the editor TOML buffer, stage it to `/tmp/zensmu-gui-persist-<pid>.toml`,
+    /// and dispatch `zensmu persist save --from <tmp>` via `pkexec`.
+    pub fn persist_editor_toml(&mut self, enable: bool, ctx: &egui::Context) {
+        if !self.validate_editor_toml_for_persist() {
+            return;
+        }
+
+        let tmp_path = std::env::temp_dir().join(format!(
+            "zensmu-gui-persist-{}.toml",
+            std::process::id()
+        ));
+        if let Err(e) = fs::write(&tmp_path, &self.profile_editor.toml_text) {
+            self.set_toast(
+                ToastLevel::Error,
+                format!(
+                    "Failed to stage temporary profile '{}': {e}",
+                    tmp_path.display()
+                ),
+            );
+            return;
+        }
+
+        self.staging_persist_path = Some(tmp_path.clone());
+        self.dispatch_cli(
+            CliAction::PersistSave {
+                from_path: Some(tmp_path.display().to_string()),
+                enable,
+                allow_extreme: self.profile_editor.allow_extreme,
+            },
+            ctx,
+        );
+    }
+
     /// Export current live hardware state via `zensmu profile export` to a temp file and display it.
     pub fn export_current_profile(&mut self, ctx: &egui::Context) {
         let tmp_path = std::env::temp_dir().join(format!(
@@ -643,6 +741,7 @@ impl ZensmuApp {
                 ElevatedResult::Status(payload) => {
                     self.apply_status_payload(payload);
                     self.refresh_safety_files();
+                    self.refresh_persist_status();
                     self.set_toast(ToastLevel::Success, "Refreshed live SMU state.");
                 }
                 ElevatedResult::Co(snap) => {
@@ -671,6 +770,7 @@ impl ZensmuApp {
                 }
                 ElevatedResult::Applied { title, ops } => {
                     self.refresh_safety_files();
+                    self.refresh_persist_status();
                     self.set_toast(
                         ToastLevel::Success,
                         format!("{title}: applied {} verified SMU operation(s).", ops.len()),
@@ -691,7 +791,49 @@ impl ZensmuApp {
                     self.profile_editor.diff_entries = entries;
                     self.set_toast(ToastLevel::Info, "Updated profile diff.");
                 }
+                ElevatedResult::PersistUpdated {
+                    action,
+                    status,
+                    note,
+                } => {
+                    if let Some(tmp) = self.staging_persist_path.take() {
+                        let _ = fs::remove_file(tmp);
+                    }
+                    self.persist_status = status;
+                    self.refresh_safety_files();
+                    self.refresh_persist_status();
+                    let msg = match note {
+                        Some(n) if !n.trim().is_empty() => format!("{action}: {n}"),
+                        _ => format!(
+                            "{action}: boot service is now {}.",
+                            if self.persist_status.service_enabled {
+                                "enabled"
+                            } else {
+                                "disabled"
+                            }
+                        ),
+                    };
+                    self.set_toast(ToastLevel::Success, msg);
+                }
+                ElevatedResult::GuardCleared { cleared } => {
+                    self.refresh_safety_files();
+                    self.refresh_persist_status();
+                    if cleared {
+                        self.set_toast(
+                            ToastLevel::Success,
+                            "Boot-loop crash guard cleared — auto-apply is re-armed.",
+                        );
+                    } else {
+                        self.set_toast(
+                            ToastLevel::Info,
+                            "Boot-loop crash guard was already clean.",
+                        );
+                    }
+                }
                 ElevatedResult::Error { title, message } => {
+                    if let Some(tmp) = self.staging_persist_path.take() {
+                        let _ = fs::remove_file(tmp);
+                    }
                     self.set_toast(ToastLevel::Error, format!("{title}: {message}"));
                 }
             }
@@ -788,6 +930,7 @@ impl eframe::App for ZensmuApp {
             });
 
         views::render_dry_run_modal(self, ctx);
+        views::render_persist_confirm_modal(self, ctx);
     }
 }
 

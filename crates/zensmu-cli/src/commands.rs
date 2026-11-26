@@ -1,6 +1,6 @@
 //! Clap CLI argument definitions for `zensmu`.
 
-use clap::{ArgAction, Parser, Subcommand, ValueEnum};
+use clap::{ArgAction, Args, Parser, Subcommand, ValueEnum};
 use clap_complete::Shell;
 use std::path::PathBuf;
 use zensmu_core::types::ApuPowerMode;
@@ -115,6 +115,9 @@ pub enum Command {
         #[command(subcommand)]
         action: ProfileAction,
     },
+
+    /// Manage boot & suspend persistence (/etc/zensmu/active.toml, modules-load.d, zensmu-apply.service)
+    Persist(PersistCommand),
 
     /// Restore the pre-change SMU state snapshot from last-state.json
     Rollback,
@@ -345,6 +348,39 @@ pub enum ProfileAction {
         /// Directory to scan for .toml profiles
         #[arg(long, default_value = "/etc/zensmu", value_name = "DIR")]
         dir: PathBuf,
+    },
+}
+
+#[derive(Debug, Args)]
+pub struct PersistCommand {
+    #[command(subcommand)]
+    pub action: PersistAction,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum PersistAction {
+    /// Inspect active boot profile, module autoload, systemd service, resume hook, and boot guard (unprivileged)
+    Status,
+
+    /// Save a validated profile to /etc/zensmu/active.toml and configure ryzen_smu autoload
+    Save {
+        /// Load profile from an existing TOML file instead of capturing current live SMU state
+        #[arg(long, value_name = "PATH")]
+        from: Option<PathBuf>,
+
+        /// Also enable zensmu-apply.service after saving
+        #[arg(long)]
+        enable: bool,
+    },
+
+    /// Enable zensmu-apply.service (requires a valid /etc/zensmu/active.toml)
+    Enable,
+
+    /// Disable zensmu-apply.service (optionally removing /etc/zensmu/active.toml)
+    Disable {
+        /// Also remove /etc/zensmu/active.toml
+        #[arg(long)]
+        remove_profile: bool,
     },
 }
 
@@ -772,6 +808,83 @@ mod tests {
             .command
         {
             Command::Completions { shell } => assert_eq!(shell, CompletionShell::Fish),
+            other => panic!("unexpected command: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_persist_subcommands() {
+        let st = Cli::try_parse_from(["zensmu", "persist", "status", "--json"]).unwrap();
+        assert!(st.json);
+        assert!(matches!(
+            st.command,
+            Command::Persist(PersistCommand {
+                action: PersistAction::Status
+            })
+        ));
+
+        let save_live = Cli::try_parse_from(["zensmu", "persist", "save"]).unwrap();
+        match save_live.command {
+            Command::Persist(PersistCommand {
+                action: PersistAction::Save { from, enable },
+            }) => {
+                assert_eq!(from, None);
+                assert!(!enable);
+            }
+            other => panic!("unexpected command: {other:?}"),
+        }
+
+        let save_from_enable = Cli::try_parse_from([
+            "zensmu",
+            "persist",
+            "save",
+            "--from",
+            "/tmp/daily.toml",
+            "--enable",
+            "--dry-run",
+        ])
+        .unwrap();
+        assert!(save_from_enable.dry_run);
+        match save_from_enable.command {
+            Command::Persist(PersistCommand {
+                action: PersistAction::Save { from, enable },
+            }) => {
+                assert_eq!(from, Some(PathBuf::from("/tmp/daily.toml")));
+                assert!(enable);
+            }
+            other => panic!("unexpected command: {other:?}"),
+        }
+
+        let enable = Cli::try_parse_from(["zensmu", "persist", "enable", "--dry-run"]).unwrap();
+        assert!(enable.dry_run);
+        assert!(matches!(
+            enable.command,
+            Command::Persist(PersistCommand {
+                action: PersistAction::Enable
+            })
+        ));
+
+        let disable = Cli::try_parse_from(["zensmu", "persist", "disable"]).unwrap();
+        match disable.command {
+            Command::Persist(PersistCommand {
+                action: PersistAction::Disable { remove_profile },
+            }) => assert!(!remove_profile),
+            other => panic!("unexpected command: {other:?}"),
+        }
+
+        let disable_rm = Cli::try_parse_from([
+            "zensmu",
+            "persist",
+            "disable",
+            "--remove-profile",
+            "--json",
+        ])
+        .unwrap();
+        assert!(disable_rm.json);
+        match disable_rm.command {
+            Command::Persist(PersistCommand {
+                action: PersistAction::Disable { remove_profile },
+            }) => assert!(remove_profile),
             other => panic!("unexpected command: {other:?}"),
         }
     }

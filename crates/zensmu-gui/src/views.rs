@@ -1,8 +1,9 @@
 //! Dark cockpit UI panels, plots, tuning controls, and dry-run confirmation modal.
 
 use crate::app::{
-    Tab, ToastLevel, ZensmuApp, POLL_INTERVAL_OPTIONS_MS, TELEMETRY_RING_CAPACITY,
-    UI_ZOOM_DEFAULT, UI_ZOOM_MAX, UI_ZOOM_MIN, UI_ZOOM_STEP,
+    PersistConfirmModal, PersistConfirmTarget, Tab, ToastLevel, ZensmuApp,
+    POLL_INTERVAL_OPTIONS_MS, TELEMETRY_RING_CAPACITY, UI_ZOOM_DEFAULT, UI_ZOOM_MAX, UI_ZOOM_MIN,
+    UI_ZOOM_STEP,
 };
 use crate::elevate::CliAction;
 use eframe::egui::{self, Color32, RichText, Stroke, Ui};
@@ -16,6 +17,10 @@ use zensmu_core::ops::pbo::{
     TDC_MIN_A, TDC_SOFT_MAX_A,
 };
 use zensmu_core::ops::shaper::{SHAPER_MAX, SHAPER_MIN, SHAPER_SOFT_MIN};
+use zensmu_core::safety::persist::{
+    DEFAULT_ACTIVE_PROFILE_PATH, DEFAULT_MODULES_LOAD_PATH, DEFAULT_RESUME_HOOK_PATH,
+    DEFAULT_SERVICE_NAME,
+};
 use zensmu_core::transport::sysfs::{DEFAULT_LOCK_PATH, DEFAULT_SYSFS_PATH};
 use zensmu_core::types::{CoreInfo, CurveShaperState, FreqTier};
 
@@ -110,6 +115,38 @@ pub fn render_top_bar(app: &mut ZensmuApp, ctx: &egui::Context) {
                         ACCENT_EMERALD,
                         Color32::from_rgba_unmultiplied(34, 197, 94, 24),
                     );
+                }
+
+                let boot_on = app.persist_status.service_enabled
+                    && app.persist_status.active_profile_exists;
+                let (boot_text, boot_fg, boot_bg, boot_hover) = if boot_on {
+                    (
+                        "Boot: ON",
+                        ACCENT_EMERALD,
+                        Color32::from_rgba_unmultiplied(34, 197, 94, 28),
+                        "Boot persistence is active (zensmu-apply.service enabled with active profile). Click to manage in Profiles & Safety.",
+                    )
+                } else {
+                    (
+                        "Boot: OFF",
+                        TEXT_MUTED,
+                        Color32::from_rgb(30, 36, 48),
+                        "Boot persistence is inactive. Click to configure in Profiles & Safety.",
+                    )
+                };
+                if ui
+                    .add(
+                        egui::Button::new(RichText::new(boot_text).small().strong().color(boot_fg))
+                            .fill(boot_bg)
+                            .stroke(Stroke::new(1.0_f32, boot_fg.linear_multiply(0.45)))
+                            .corner_radius(egui::CornerRadius::same(12)),
+                    )
+                    .on_hover_text(boot_hover)
+                    .clicked()
+                {
+                    app.active_tab = Tab::ProfilesSafety;
+                    app.refresh_safety_files();
+                    app.refresh_persist_status();
                 }
 
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -303,7 +340,11 @@ pub fn render_sidebar(app: &mut ZensmuApp, ctx: &egui::Context) {
                 (Tab::CurveOptimizer, "Curve Optimizer", "All-core & per-core"),
                 (Tab::CurveShaper, "Curve Shaper", "Zen 5 5×3 matrix"),
                 (Tab::PboLimits, "PBO Limits", "PPT / TDC / EDC / Fmax"),
-                (Tab::ProfilesSafety, "Profiles & Safety", "TOML, rollback, guards"),
+                (
+                    Tab::ProfilesSafety,
+                    "Profiles & Safety",
+                    "Boot persist, TOML, guards",
+                ),
             ];
 
             for (tab, title, subtitle) in tabs {
@@ -346,6 +387,7 @@ pub fn render_sidebar(app: &mut ZensmuApp, ctx: &egui::Context) {
                     app.active_tab = tab;
                     if tab == Tab::ProfilesSafety {
                         app.refresh_safety_files();
+                        app.refresh_persist_status();
                     }
                 }
                 ui.add_space(4.0);
@@ -1563,6 +1605,10 @@ pub fn render_profiles_and_safety(app: &mut ZensmuApp, ui: &mut Ui, ctx: &egui::
     let busy = app.runner.is_busy();
     let has_hw = app.hw.is_some();
 
+    // Boot & Resume Persistence (systemd) Card
+    render_persistence_card(app, ui, ctx, has_hw, busy);
+    ui.add_space(12.0);
+
     // TOML Profile Card
     card_frame().show(ui, |ui| {
         ui.set_width(ui.available_width());
@@ -1841,6 +1887,454 @@ pub fn render_profiles_and_safety(app: &mut ZensmuApp, ui: &mut Ui, ctx: &egui::
             }
         });
     });
+}
+
+fn render_persistence_card(
+    app: &mut ZensmuApp,
+    ui: &mut Ui,
+    ctx: &egui::Context,
+    has_hw: bool,
+    busy: bool,
+) {
+    let status = app.persist_status.clone();
+    let service_name = if status.service_name.is_empty() {
+        DEFAULT_SERVICE_NAME
+    } else {
+        status.service_name.as_str()
+    };
+    let active_path = if status.active_profile_path.is_empty() {
+        DEFAULT_ACTIVE_PROFILE_PATH
+    } else {
+        status.active_profile_path.as_str()
+    };
+
+    card_frame().show(ui, |ui| {
+        ui.set_width(ui.available_width());
+        ui.horizontal_wrapped(|ui| {
+            ui.label(RichText::new("Boot & Resume Persistence (systemd)").strong());
+            if status.boot_guard_tripped {
+                pill(
+                    ui,
+                    "GUARD TRIPPED",
+                    ACCENT_CRIMSON,
+                    Color32::from_rgba_unmultiplied(224, 90, 71, 36),
+                );
+            } else if status.service_enabled
+                && status.active_profile_exists
+                && status.active_profile_valid != Some(false)
+            {
+                pill(
+                    ui,
+                    "ACTIVE",
+                    ACCENT_EMERALD,
+                    Color32::from_rgba_unmultiplied(34, 197, 94, 28),
+                );
+            } else {
+                pill(
+                    ui,
+                    "INACTIVE",
+                    TEXT_MUTED,
+                    Color32::from_rgb(30, 36, 48),
+                );
+            }
+
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if ui
+                    .button("Refresh Status")
+                    .on_hover_text("Re-check boot persistence & systemd status (unprivileged)")
+                    .clicked()
+                {
+                    app.refresh_persist_status();
+                    app.refresh_safety_files();
+                    app.set_toast(ToastLevel::Info, "Refreshed boot persistence status.");
+                }
+            });
+        });
+
+        ui.add_space(6.0);
+        egui::Grid::new("persist_status_grid")
+            .num_columns(2)
+            .striped(true)
+            .spacing([16.0, 6.0])
+            .show(ui, |ui| {
+                // 1. Active Profile
+                ui.label(
+                    RichText::new(format!("Active Profile ({active_path})"))
+                        .small()
+                        .color(TEXT_MUTED),
+                );
+                if status.active_profile_exists {
+                    match status.active_profile_valid {
+                        Some(true) => {
+                            let label = match status.active_profile_codename {
+                                Some(cn) => format!("Valid ({})", cn.display_name()),
+                                None => "Valid".to_string(),
+                            };
+                            ui.label(RichText::new(label).small().strong().color(ACCENT_EMERALD));
+                        }
+                        Some(false) => {
+                            let err = status
+                                .active_profile_error
+                                .as_deref()
+                                .unwrap_or("validation error");
+                            ui.label(
+                                RichText::new(format!("Invalid ({err})"))
+                                    .small()
+                                    .strong()
+                                    .color(ACCENT_CRIMSON),
+                            );
+                        }
+                        None => {
+                            ui.label(RichText::new("Present").small().color(ACCENT_CYAN));
+                        }
+                    }
+                } else {
+                    ui.label(RichText::new("Not saved").small().color(TEXT_MUTED));
+                }
+                ui.end_row();
+
+                // 2. Kernel Module Autoload
+                ui.label(
+                    RichText::new(format!(
+                        "Kernel Module Autoload ({DEFAULT_MODULES_LOAD_PATH})"
+                    ))
+                    .small()
+                    .color(TEXT_MUTED),
+                );
+                if status.modules_load_configured {
+                    ui.label(
+                        RichText::new("Configured")
+                            .small()
+                            .strong()
+                            .color(ACCENT_EMERALD),
+                    );
+                } else {
+                    ui.label(RichText::new("Not configured").small().color(TEXT_MUTED));
+                }
+                ui.end_row();
+
+                // 3. Boot Service
+                ui.label(
+                    RichText::new(format!("Boot Service ({service_name})"))
+                        .small()
+                        .color(TEXT_MUTED),
+                );
+                if status.service_enabled {
+                    ui.label(RichText::new("Enabled").small().strong().color(ACCENT_EMERALD));
+                } else if !status.service_installed {
+                    ui.label(
+                        RichText::new(format!("Not installed ({})", status.service_state))
+                            .small()
+                            .color(ACCENT_AMBER),
+                    );
+                } else {
+                    ui.label(RichText::new("Disabled").small().color(TEXT_MUTED));
+                }
+                ui.end_row();
+
+                // 4. Suspend/Resume Hook
+                ui.label(
+                    RichText::new("Suspend/Resume Hook (zensmu-resume)")
+                        .small()
+                        .color(TEXT_MUTED),
+                );
+                if status.resume_hook_installed {
+                    ui.label(
+                        RichText::new("Installed")
+                            .small()
+                            .strong()
+                            .color(ACCENT_EMERALD),
+                    );
+                } else {
+                    ui.label(
+                        RichText::new(format!("Missing ({DEFAULT_RESUME_HOOK_PATH})"))
+                            .small()
+                            .color(ACCENT_AMBER),
+                    );
+                }
+                ui.end_row();
+
+                // 5. Boot-Loop Crash Guard
+                ui.label(
+                    RichText::new("Boot-Loop Crash Guard")
+                        .small()
+                        .color(TEXT_MUTED),
+                );
+                if status.boot_guard_tripped {
+                    ui.horizontal_wrapped(|ui| {
+                        ui.label(
+                            RichText::new("TRIPPED — auto-apply halted")
+                                .small()
+                                .strong()
+                                .color(ACCENT_CRIMSON),
+                        );
+                        let clear_label = if app.is_root {
+                            "Clear Boot Guard"
+                        } else {
+                            "Clear Boot Guard (pkexec)"
+                        };
+                        if ui
+                            .add_enabled(
+                                !busy,
+                                egui::Button::new(clear_label)
+                                    .small()
+                                    .fill(ACCENT_CRIMSON),
+                            )
+                            .clicked()
+                        {
+                            app.dispatch_cli(CliAction::ClearBootGuard, ctx);
+                        }
+                    });
+                } else {
+                    ui.label(RichText::new("Clean").small().strong().color(ACCENT_EMERALD));
+                }
+                ui.end_row();
+            });
+
+        ui.add_space(10.0);
+        ui.horizontal_wrapped(|ui| {
+            let emerald_cta = Color32::from_rgb(22, 138, 72);
+            if ui
+                .add_enabled(
+                    has_hw && !busy,
+                    egui::Button::new(
+                        RichText::new("Persist Live SMU & Enable Service")
+                            .strong()
+                            .color(Color32::WHITE),
+                    )
+                    .fill(emerald_cta),
+                )
+                .on_hover_text(
+                    "Snapshot live SMU settings to /etc/zensmu/active.toml, configure ryzen_smu autoload, and enable zensmu-apply.service",
+                )
+                .clicked()
+            {
+                app.persist_confirm = Some(PersistConfirmModal {
+                    title: "Persist Live SMU & Enable Boot Service".into(),
+                    summary: "This will save your current live Ryzen SMU tuning for automatic re-application on boot and resume.".into(),
+                    changes: vec![
+                        format!("Export live SMU state and write {active_path}"),
+                        format!("Ensure `ryzen_smu` is configured in {DEFAULT_MODULES_LOAD_PATH}"),
+                        format!("Run `systemctl enable {service_name}`"),
+                    ],
+                    confirm_label: "Persist & Enable".into(),
+                    is_destructive: false,
+                    target: PersistConfirmTarget::Cli(CliAction::PersistSave {
+                        from_path: None,
+                        enable: true,
+                        allow_extreme: app.profile_editor.allow_extreme,
+                    }),
+                });
+            }
+
+            let editor_non_empty = !app.profile_editor.toml_text.trim().is_empty();
+            if ui
+                .add_enabled(
+                    has_hw && !busy && editor_non_empty,
+                    egui::Button::new("Persist Editor TOML & Enable Service"),
+                )
+                .on_hover_text(
+                    "Validate the TOML editor below, install it to /etc/zensmu/active.toml, and enable zensmu-apply.service",
+                )
+                .clicked()
+            {
+                if app.validate_editor_toml_for_persist() {
+                    app.persist_confirm = Some(PersistConfirmModal {
+                        title: "Persist Editor TOML & Enable Boot Service".into(),
+                        summary: "This will install the validated TOML from the editor below as the active boot profile.".into(),
+                        changes: vec![
+                            format!("Install validated editor TOML to {active_path}"),
+                            format!("Ensure `ryzen_smu` is configured in {DEFAULT_MODULES_LOAD_PATH}"),
+                            format!("Run `systemctl enable {service_name}`"),
+                        ],
+                        confirm_label: "Persist Editor & Enable".into(),
+                        is_destructive: false,
+                        target: PersistConfirmTarget::EditorToml { enable: true },
+                    });
+                }
+            }
+
+            if status.service_enabled {
+                if ui
+                    .add_enabled(!busy, egui::Button::new("Disable Boot Service"))
+                    .on_hover_text(
+                        "Disable zensmu-apply.service while keeping /etc/zensmu/active.toml on disk",
+                    )
+                    .clicked()
+                {
+                    app.persist_confirm = Some(PersistConfirmModal {
+                        title: "Disable Boot Service".into(),
+                        summary: "Automatic tuning on boot will be disabled. Your saved profile file will remain on disk.".into(),
+                        changes: vec![
+                            format!("Run `systemctl disable {service_name}`"),
+                            format!("Keep {active_path} intact for future use"),
+                        ],
+                        confirm_label: "Disable Service".into(),
+                        is_destructive: false,
+                        target: PersistConfirmTarget::Cli(CliAction::PersistSetService {
+                            enable: false,
+                            remove_profile: false,
+                            allow_extreme: false,
+                        }),
+                    });
+                }
+            } else {
+                let can_enable = has_hw
+                    && !busy
+                    && status.active_profile_exists
+                    && status.active_profile_valid != Some(false);
+                let hover = if !status.active_profile_exists {
+                    "Save an active profile first before enabling zensmu-apply.service"
+                } else if status.active_profile_valid == Some(false) {
+                    "Active profile is invalid — save a valid profile first"
+                } else {
+                    "Enable zensmu-apply.service using the existing /etc/zensmu/active.toml"
+                };
+                if ui
+                    .add_enabled(can_enable, egui::Button::new("Enable Boot Service"))
+                    .on_hover_text(hover)
+                    .clicked()
+                {
+                    app.persist_confirm = Some(PersistConfirmModal {
+                        title: "Enable Boot Service".into(),
+                        summary: "This will enable automatic application of the existing active profile on boot and resume.".into(),
+                        changes: vec![
+                            format!("Validate existing {active_path}"),
+                            format!("Ensure `ryzen_smu` is configured in {DEFAULT_MODULES_LOAD_PATH}"),
+                            format!("Run `systemctl enable {service_name}`"),
+                        ],
+                        confirm_label: "Enable Service".into(),
+                        is_destructive: false,
+                        target: PersistConfirmTarget::Cli(CliAction::PersistSetService {
+                            enable: true,
+                            remove_profile: false,
+                            allow_extreme: app.profile_editor.allow_extreme,
+                        }),
+                    });
+                }
+            }
+
+            if status.active_profile_exists {
+                if ui
+                    .add_enabled(
+                        !busy,
+                        egui::Button::new(
+                            RichText::new("Disable & Remove Active Profile").color(TEXT_MUTED),
+                        ),
+                    )
+                    .on_hover_text(
+                        "Disable zensmu-apply.service and delete /etc/zensmu/active.toml",
+                    )
+                    .clicked()
+                {
+                    app.persist_confirm = Some(PersistConfirmModal {
+                        title: "Disable & Remove Active Profile".into(),
+                        summary: "This will disable boot persistence and delete the active boot profile file.".into(),
+                        changes: vec![
+                            format!("Run `systemctl disable {service_name}`"),
+                            format!("Delete {active_path}"),
+                        ],
+                        confirm_label: "Disable & Remove".into(),
+                        is_destructive: true,
+                        target: PersistConfirmTarget::Cli(CliAction::PersistSetService {
+                            enable: false,
+                            remove_profile: true,
+                            allow_extreme: false,
+                        }),
+                    });
+                }
+            }
+        });
+    });
+}
+
+/// Modal confirming boot persistence & systemd changes before invoking `pkexec`.
+pub fn render_persist_confirm_modal(app: &mut ZensmuApp, ctx: &egui::Context) {
+    let Some(modal) = app.persist_confirm.clone() else {
+        return;
+    };
+
+    let mut close_modal = false;
+    let mut confirmed_target: Option<PersistConfirmTarget> = None;
+
+    egui::Window::new(format!("Confirm System Change — {}", modal.title))
+        .collapsible(false)
+        .resizable(false)
+        .default_width(560.0)
+        .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+        .show(ctx, |ui| {
+            ui.label(&modal.summary);
+            ui.add_space(8.0);
+
+            egui::Frame::NONE
+                .fill(BG_PANEL)
+                .stroke(Stroke::new(1.0_f32, BORDER_SUBTLE))
+                .corner_radius(egui::CornerRadius::same(6))
+                .inner_margin(egui::Margin::same(10))
+                .show(ui, |ui| {
+                    ui.set_width(ui.available_width());
+                    ui.label(
+                        RichText::new("EXACT SYSTEM CHANGES")
+                            .small()
+                            .strong()
+                            .color(TEXT_MUTED),
+                    );
+                    ui.add_space(4.0);
+                    for change in &modal.changes {
+                        ui.label(
+                            RichText::new(format!("• {change}"))
+                                .small()
+                                .monospace()
+                                .color(Color32::from_rgb(226, 232, 240)),
+                        );
+                    }
+                });
+
+            ui.add_space(12.0);
+            ui.separator();
+            ui.add_space(6.0);
+
+            ui.horizontal(|ui| {
+                if ui.button("Cancel").clicked() {
+                    close_modal = true;
+                }
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    let btn_label = if app.is_root {
+                        modal.confirm_label.clone()
+                    } else {
+                        format!("{} (pkexec)", modal.confirm_label)
+                    };
+                    let fill = if modal.is_destructive {
+                        ACCENT_CRIMSON
+                    } else {
+                        Color32::from_rgb(22, 138, 72)
+                    };
+                    if ui
+                        .add_enabled(
+                            !app.runner.is_busy(),
+                            egui::Button::new(
+                                RichText::new(btn_label).strong().color(Color32::WHITE),
+                            )
+                            .fill(fill),
+                        )
+                        .clicked()
+                    {
+                        confirmed_target = Some(modal.target.clone());
+                        close_modal = true;
+                    }
+                });
+            });
+        });
+
+    if close_modal {
+        app.persist_confirm = None;
+    }
+    if let Some(target) = confirmed_target {
+        match target {
+            PersistConfirmTarget::Cli(action) => app.dispatch_cli(action, ctx),
+            PersistConfirmTarget::EditorToml { enable } => app.persist_editor_toml(enable, ctx),
+        }
+    }
 }
 
 /// Modal displaying every planned SMU command from `--dry-run --json` before applying.

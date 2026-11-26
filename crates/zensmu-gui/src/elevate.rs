@@ -18,6 +18,7 @@ use zensmu_core::config::profile::ProfileDiffEntry;
 use zensmu_core::ops::co::{CoSnapshot, CoreCoMargin};
 use zensmu_core::ops::pbo::{PboSetRequest, PboStatus};
 use zensmu_core::ops::pm_table::TelemetrySnapshot;
+use zensmu_core::safety::persist::PersistStatus;
 use zensmu_core::safety::snapshot::SmuStateSnapshot;
 use zensmu_core::types::{CurveShaperState, FreqTier, PlannedOp, ShaperTierMargins};
 
@@ -146,6 +147,20 @@ pub enum CliAction {
     Rollback { dry_run: bool },
     /// `zensmu reset`
     Reset { dry_run: bool },
+    /// `zensmu persist save [--from <path>] [--enable] [--allow-extreme] --json`
+    PersistSave {
+        from_path: Option<String>,
+        enable: bool,
+        allow_extreme: bool,
+    },
+    /// `zensmu persist enable|disable [--remove-profile] [--allow-extreme] --json`
+    PersistSetService {
+        enable: bool,
+        remove_profile: bool,
+        allow_extreme: bool,
+    },
+    /// `zensmu profile clear-guard --json`
+    ClearBootGuard,
 }
 
 impl CliAction {
@@ -251,6 +266,24 @@ impl CliAction {
                     "Reset to Boot Baseline".into()
                 }
             }
+            Self::PersistSave {
+                from_path, enable, ..
+            } => match (from_path.is_some(), *enable) {
+                (true, true) => "Persist Editor TOML & Enable Boot Service".into(),
+                (true, false) => "Persist Editor TOML Profile".into(),
+                (false, true) => "Persist Live SMU & Enable Boot Service".into(),
+                (false, false) => "Persist Live SMU Profile".into(),
+            },
+            Self::PersistSetService {
+                enable,
+                remove_profile,
+                ..
+            } => match (*enable, *remove_profile) {
+                (true, _) => "Enable Boot Service".into(),
+                (false, true) => "Disable Boot Service & Remove Profile".into(),
+                (false, false) => "Disable Boot Service".into(),
+            },
+            Self::ClearBootGuard => "Clear Boot-Loop Crash Guard".into(),
         }
     }
 
@@ -360,7 +393,12 @@ impl CliAction {
             | Self::ShaperGet
             | Self::PboGet
             | Self::ProfileExport { .. } => true,
-            Self::Rollback { .. } | Self::Reset { .. } | Self::PboReset { .. } => true,
+            Self::Rollback { .. }
+            | Self::Reset { .. }
+            | Self::PboReset { .. }
+            | Self::PersistSave { .. }
+            | Self::PersistSetService { .. }
+            | Self::ClearBootGuard => true,
             action => !action.is_dry_run(),
         }
     }
@@ -517,6 +555,52 @@ impl CliAction {
                 args.push("--json".into());
                 vec![args]
             }
+            Self::PersistSave {
+                from_path,
+                enable,
+                allow_extreme,
+            } => {
+                let mut args = vec!["persist".into(), "save".into()];
+                if let Some(path) = from_path {
+                    args.push("--from".into());
+                    args.push(path.clone());
+                }
+                if *enable {
+                    args.push("--enable".into());
+                }
+                if *allow_extreme {
+                    args.push("--allow-extreme".into());
+                }
+                args.push("--json".into());
+                vec![args]
+            }
+            Self::PersistSetService {
+                enable,
+                remove_profile,
+                allow_extreme,
+            } => {
+                let mut args = vec![
+                    "persist".into(),
+                    if *enable {
+                        "enable".into()
+                    } else {
+                        "disable".into()
+                    },
+                ];
+                if !*enable && *remove_profile {
+                    args.push("--remove-profile".into());
+                }
+                if *enable && *allow_extreme {
+                    args.push("--allow-extreme".into());
+                }
+                args.push("--json".into());
+                vec![args]
+            }
+            Self::ClearBootGuard => vec![vec![
+                "profile".into(),
+                "clear-guard".into(),
+                "--json".into(),
+            ]],
         }
     }
 }
@@ -596,6 +680,21 @@ pub struct StatusPayload {
     pub telemetry: Option<TelemetrySnapshot>,
 }
 
+/// Response payload parsed from `zensmu persist save|enable|disable --json`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PersistActionOutput {
+    pub action: String,
+    #[serde(default)]
+    pub dry_run: bool,
+    #[serde(default)]
+    pub active_profile_path: String,
+    #[serde(default)]
+    pub service_enabled: bool,
+    pub status: PersistStatus,
+    #[serde(default)]
+    pub note: Option<String>,
+}
+
 /// Result delivered asynchronously from the background CLI worker thread back to the GUI.
 #[derive(Debug, Clone)]
 pub enum ElevatedResult {
@@ -619,6 +718,14 @@ pub enum ElevatedResult {
     #[allow(dead_code)]
     ProfileDiff {
         entries: Vec<ProfileDiffEntry>,
+    },
+    PersistUpdated {
+        action: String,
+        status: PersistStatus,
+        note: Option<String>,
+    },
+    GuardCleared {
+        cleared: bool,
     },
     Error {
         title: String,
@@ -728,6 +835,20 @@ fn execute_action(zensmu_bin: &Path, is_root: bool, action: CliAction) -> Elevat
                     path.display()
                 ),
             },
+        },
+        CliAction::PersistSave { .. } | CliAction::PersistSetService { .. } => {
+            match parse_persist_action_output(first) {
+                Ok(out) => ElevatedResult::PersistUpdated {
+                    action: out.action,
+                    status: out.status,
+                    note: out.note,
+                },
+                Err(message) => ElevatedResult::Error { title, message },
+            }
+        }
+        CliAction::ClearBootGuard => match parse_clear_guard_output(first) {
+            Ok(cleared) => ElevatedResult::GuardCleared { cleared },
+            Err(message) => ElevatedResult::Error { title, message },
         },
         write_action => {
             let mut all_ops = Vec::new();
@@ -1031,6 +1152,33 @@ pub fn parse_status_payload(json: &str) -> Result<StatusPayload, String> {
     }
 
     Ok(payload)
+}
+
+/// Parse `PersistActionOutput` from `zensmu persist save|enable|disable --json`.
+pub fn parse_persist_action_output(json: &str) -> Result<PersistActionOutput, String> {
+    let val: serde_json::Value = serde_json::from_str(json.trim())
+        .map_err(|e| format!("Invalid persist JSON from zensmu: {e}"))?;
+    if let Some(err) = extract_error_field(&val) {
+        return Err(err);
+    }
+    serde_json::from_value(val)
+        .map_err(|e| format!("Failed to decode persist action output from zensmu: {e}"))
+}
+
+/// Parse `cleared` boolean from `zensmu profile clear-guard --json`.
+pub fn parse_clear_guard_output(json: &str) -> Result<bool, String> {
+    let trimmed = json.trim();
+    if trimmed.is_empty() {
+        return Ok(true);
+    }
+    let val: serde_json::Value = serde_json::from_str(trimmed)
+        .map_err(|e| format!("Invalid clear-guard JSON from zensmu: {e}"))?;
+    if let Some(err) = extract_error_field(&val) {
+        return Err(err);
+    }
+    val.get("cleared")
+        .and_then(|v| v.as_bool())
+        .ok_or_else(|| format!("Unexpected JSON payload from clear-guard: {trimmed}"))
 }
 
 fn extract_error_field(val: &serde_json::Value) -> Option<String> {
@@ -1376,5 +1524,133 @@ mod tests {
             parse_cli_error("", "plain stderr error", Some(1), false),
             "plain stderr error"
         );
+    }
+
+    #[test]
+    fn persist_and_clear_guard_cli_args_match_frozen_contract() {
+        let save_live = CliAction::PersistSave {
+            from_path: None,
+            enable: true,
+            allow_extreme: false,
+        };
+        assert!(save_live.requires_privilege());
+        assert_eq!(
+            save_live.to_arg_batches(),
+            vec![vec!["persist", "save", "--enable", "--json"]]
+        );
+
+        let save_from = CliAction::PersistSave {
+            from_path: Some("/tmp/zensmu-gui-persist-42.toml".into()),
+            enable: true,
+            allow_extreme: true,
+        };
+        assert!(save_from.requires_privilege());
+        assert_eq!(
+            save_from.to_arg_batches(),
+            vec![vec![
+                "persist",
+                "save",
+                "--from",
+                "/tmp/zensmu-gui-persist-42.toml",
+                "--enable",
+                "--allow-extreme",
+                "--json"
+            ]]
+        );
+
+        let enable_svc = CliAction::PersistSetService {
+            enable: true,
+            remove_profile: false,
+            allow_extreme: true,
+        };
+        assert!(enable_svc.requires_privilege());
+        assert_eq!(
+            enable_svc.to_arg_batches(),
+            vec![vec!["persist", "enable", "--allow-extreme", "--json"]]
+        );
+
+        let disable_svc = CliAction::PersistSetService {
+            enable: false,
+            remove_profile: false,
+            allow_extreme: false,
+        };
+        assert!(disable_svc.requires_privilege());
+        assert_eq!(
+            disable_svc.to_arg_batches(),
+            vec![vec!["persist", "disable", "--json"]]
+        );
+
+        let disable_rm = CliAction::PersistSetService {
+            enable: false,
+            remove_profile: true,
+            allow_extreme: false,
+        };
+        assert!(disable_rm.requires_privilege());
+        assert_eq!(
+            disable_rm.to_arg_batches(),
+            vec![vec![
+                "persist",
+                "disable",
+                "--remove-profile",
+                "--json"
+            ]]
+        );
+
+        assert!(CliAction::ClearBootGuard.requires_privilege());
+        assert_eq!(
+            CliAction::ClearBootGuard.to_arg_batches(),
+            vec![vec!["profile", "clear-guard", "--json"]]
+        );
+    }
+
+    #[test]
+    fn parse_persist_action_and_clear_guard_decode_json_responses() {
+        let status = PersistStatus {
+            active_profile_path: "/etc/zensmu/active.toml".into(),
+            active_profile_exists: true,
+            active_profile_valid: Some(true),
+            active_profile_error: None,
+            active_profile_codename: Some(Codename::GraniteRidge),
+            modules_load_configured: true,
+            service_name: "zensmu-apply.service".into(),
+            service_installed: true,
+            service_enabled: true,
+            service_state: "enabled".into(),
+            resume_hook_installed: true,
+            boot_guard_tripped: false,
+        };
+
+        let payload = serde_json::json!({
+            "action": "persist save",
+            "dry_run": false,
+            "active_profile_path": "/etc/zensmu/active.toml",
+            "service_enabled": true,
+            "status": status,
+            "note": "Enabled zensmu-apply.service"
+        })
+        .to_string();
+
+        let decoded = parse_persist_action_output(&payload).unwrap();
+        assert_eq!(decoded.action, "persist save");
+        assert!(!decoded.dry_run);
+        assert!(decoded.service_enabled);
+        assert_eq!(decoded.status.active_profile_codename, Some(Codename::GraniteRidge));
+        assert_eq!(decoded.note.as_deref(), Some("Enabled zensmu-apply.service"));
+
+        let err_payload = r#"{"ok": false, "error": "cannot enable service without active profile"}"#;
+        assert!(parse_persist_action_output(err_payload)
+            .unwrap_err()
+            .contains("without active profile"));
+
+        let guard_json = r#"{"guard_path":"/var/lib/zensmu/applying.lock","was_tripped":true,"cleared":true}"#;
+        assert!(parse_clear_guard_output(guard_json).unwrap());
+
+        let guard_noop = r#"{"guard_path":"/var/lib/zensmu/applying.lock","was_tripped":false,"cleared":false}"#;
+        assert!(!parse_clear_guard_output(guard_noop).unwrap());
+
+        let guard_err = r#"{"ok":false,"error":"permission denied"}"#;
+        assert!(parse_clear_guard_output(guard_err)
+            .unwrap_err()
+            .contains("permission denied"));
     }
 }

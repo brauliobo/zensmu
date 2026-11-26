@@ -10,6 +10,7 @@ use zensmu_core::hw::topology::CpuTopology;
 use zensmu_core::ops::co::{CoSnapshot, CoreCoMargin};
 use zensmu_core::ops::pbo::PboStatus;
 use zensmu_core::ops::pm_table::TelemetrySnapshot;
+use zensmu_core::safety::persist::{DEFAULT_MODULES_LOAD_PATH, DEFAULT_RESUME_HOOK_PATH, PersistStatus};
 use zensmu_core::transport::DriverSysfsInfo;
 use zensmu_core::types::{Codename, CurveShaperState, FreqTier, PlannedOp};
 
@@ -173,6 +174,17 @@ pub struct ClearGuardOutput {
     pub guard_path: String,
     pub was_tripped: bool,
     pub cleared: bool,
+}
+
+#[derive(Debug, Serialize)]
+pub struct PersistActionOutput {
+    pub action: String,
+    pub dry_run: bool,
+    pub active_profile_path: String,
+    pub service_enabled: bool,
+    pub status: PersistStatus,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub note: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -707,6 +719,77 @@ pub fn print_profile_list(out: &ProfileListOutput) {
         };
         println!("{:<28} {:<24} {:<10}", p.name, target, status);
     }
+}
+
+pub fn print_persist_status(status: &PersistStatus) {
+    println!("Boot & Suspend Persistence");
+    println!("==========================");
+
+    let profile_summary = if !status.active_profile_exists {
+        format!("missing ({})", status.active_profile_path)
+    } else {
+        let cn = status
+            .active_profile_codename
+            .map(|c| c.display_name().to_string())
+            .unwrap_or_else(|| "unknown".into());
+        match status.active_profile_valid {
+            Some(true) => format!("valid ({}, target: {cn})", status.active_profile_path),
+            Some(false) => format!(
+                "INVALID ({}, {})",
+                status.active_profile_path,
+                status
+                    .active_profile_error
+                    .as_deref()
+                    .unwrap_or("validation error")
+            ),
+            None => format!("present ({}, target: {cn})", status.active_profile_path),
+        }
+    };
+    println!("Active Profile       : {profile_summary}");
+    println!(
+        "Module Autoload      : {} ({})",
+        if status.modules_load_configured {
+            "configured (ryzen_smu)"
+        } else {
+            "not configured"
+        },
+        DEFAULT_MODULES_LOAD_PATH
+    );
+    let svc_summary = if !status.service_installed {
+        format!("not installed ({})", status.service_name)
+    } else if status.service_enabled {
+        format!("enabled ({})", status.service_name)
+    } else {
+        format!("{} ({})", status.service_state, status.service_name)
+    };
+    println!("Boot Service         : {svc_summary}");
+    println!(
+        "Suspend Resume Hook  : {} ({})",
+        if status.resume_hook_installed {
+            "installed"
+        } else {
+            "not installed"
+        },
+        DEFAULT_RESUME_HOOK_PATH
+    );
+    println!(
+        "Boot-Loop Guard      : {}",
+        if status.boot_guard_tripped {
+            "TRIPPED (auto-apply blocked; run `sudo zensmu profile clear-guard`)"
+        } else {
+            "clean"
+        }
+    );
+}
+
+pub fn print_persist_action(out: &PersistActionOutput) {
+    let tag = if out.dry_run { "[DRY-RUN]" } else { "[OK]" };
+    println!("{tag} {}", out.action);
+    if let Some(ref note) = out.note {
+        println!("Note                 : {note}");
+    }
+    println!();
+    print_persist_status(&out.status);
 }
 
 fn fmt_opt_f32(v: Option<f32>, prec: usize, unit: &str) -> String {

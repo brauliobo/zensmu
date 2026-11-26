@@ -35,6 +35,8 @@ use zensmu_core::ops::co::{self, CoSnapshot};
 use zensmu_core::ops::pbo::{self, PboSetRequest, PboStatus};
 use zensmu_core::ops::pm_table::{self, TelemetrySnapshot};
 use zensmu_core::ops::shaper;
+use zensmu_core::safety::guard::BootLoopGuard;
+use zensmu_core::safety::persist::{self, PersistPaths, PersistStatus};
 use zensmu_core::safety::snapshot::{SmuStateSnapshot, SnapshotStore};
 use zensmu_core::session;
 use zensmu_core::transport::SmuTransport;
@@ -449,6 +451,22 @@ enum ConfirmAction {
     Rollback(SmuStateSnapshot),
     ResetBootBaseline(SmuStateSnapshot),
     ResetCoZero,
+    PersistLiveAndEnable,
+    ToggleBootService {
+        enable: bool,
+    },
+    ClearBootGuard,
+}
+
+impl ConfirmAction {
+    fn is_persist_action(&self) -> bool {
+        matches!(
+            self,
+            Self::PersistLiveAndEnable
+                | Self::ToggleBootService { .. }
+                | Self::ClearBootGuard
+        )
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -457,6 +475,7 @@ struct ConfirmModal {
     subtitle: String,
     action: ConfirmAction,
     ops: Vec<PlannedOp>,
+    steps: Vec<(String, String)>,
     scroll: usize,
     allow_extreme: bool,
 }
@@ -525,12 +544,33 @@ struct App {
     allow_extreme: bool,
     confirm_modal: Option<ConfirmModal>,
     snapshot_store: SnapshotStore,
+    persist_paths: PersistPaths,
+    persist_status: PersistStatus,
+}
+
+fn default_persist_status(paths: &PersistPaths) -> PersistStatus {
+    PersistStatus {
+        active_profile_path: paths.active_profile.display().to_string(),
+        active_profile_exists: false,
+        active_profile_valid: None,
+        active_profile_error: None,
+        active_profile_codename: None,
+        modules_load_configured: false,
+        service_name: paths.service_name.clone(),
+        service_installed: false,
+        service_enabled: false,
+        service_state: "unknown".to_string(),
+        resume_hook_installed: false,
+        boot_guard_tripped: false,
+    }
 }
 
 impl App {
     fn new(interval_ms: u64) -> Self {
         let clamped = clamp_interval_ms(interval_ms);
         let is_root = unsafe { libc::geteuid() == 0 };
+        let persist_paths = PersistPaths::default();
+        let persist_status = default_persist_status(&persist_paths);
         Self {
             active_tab: ViewTab::Overview,
             show_help: false,
@@ -553,7 +593,17 @@ impl App {
             allow_extreme: false,
             confirm_modal: None,
             snapshot_store: SnapshotStore::default(),
+            persist_paths,
+            persist_status,
         }
+    }
+
+    fn refresh_persist_status(&mut self, hw: &HardwareContext) {
+        self.persist_status = persist::read_persist_status(
+            &self.persist_paths,
+            Some(hw.codename),
+            Some(hw.topology.physical_cores),
+        );
     }
 
     fn can_write(&self) -> bool {
@@ -1394,6 +1444,7 @@ impl App {
                         apu: has_apu.then_some(apu_req),
                     },
                     ops,
+                    steps: Vec::new(),
                     scroll: 0,
                     allow_extreme,
                 });
@@ -1470,6 +1521,7 @@ impl App {
                     ),
                     action,
                     ops,
+                    steps: Vec::new(),
                     scroll: 0,
                     allow_extreme: true,
                 });
@@ -1540,6 +1592,7 @@ impl App {
                     ),
                     action: ConfirmAction::ResetCoZero,
                     ops,
+                    steps: Vec::new(),
                     scroll: 0,
                     allow_extreme: false,
                 });
@@ -1548,6 +1601,193 @@ impl App {
                 self.set_flash_kind(format!("CO reset unavailable: {err}"), FlashKind::Error);
             }
         }
+    }
+
+    fn open_persist_live_modal(&mut self) {
+        if !self.staged.is_empty() {
+            self.set_flash_kind(
+                "Apply (a) or discard (u) staged changes before persisting live state",
+                FlashKind::Warn,
+            );
+            return;
+        }
+
+        let steps = vec![
+            (
+                "1. Profile".to_string(),
+                format!(
+                    "Capture live SMU state → {}",
+                    self.persist_paths.active_profile.display()
+                ),
+            ),
+            (
+                "2. Module".to_string(),
+                format!(
+                    "Ensure {} contains ryzen_smu",
+                    self.persist_paths.modules_load.display()
+                ),
+            ),
+            (
+                "3. Service".to_string(),
+                format!(
+                    "Enable {} (boot + suspend resume with boot-loop guard)",
+                    self.persist_paths.service_name
+                ),
+            ),
+        ];
+
+        self.confirm_modal = Some(ConfirmModal {
+            title: " Confirm — Persist Live State & Enable Boot Service ".to_string(),
+            subtitle: "Save tested live SMU tuning for boot & suspend resume".to_string(),
+            action: ConfirmAction::PersistLiveAndEnable,
+            ops: Vec::new(),
+            steps,
+            scroll: 0,
+            allow_extreme: self.allow_extreme,
+        });
+    }
+
+    fn open_toggle_service_modal(&mut self, hw: &HardwareContext) {
+        if self.persist_status.service_enabled {
+            let steps = vec![
+                (
+                    "1. Service".to_string(),
+                    format!("Disable {} via systemctl", self.persist_paths.service_name),
+                ),
+                (
+                    "2. Profile".to_string(),
+                    format!(
+                        "Keep {} untouched on disk (live SMU unchanged)",
+                        self.persist_paths.active_profile.display()
+                    ),
+                ),
+            ];
+            self.confirm_modal = Some(ConfirmModal {
+                title: " Confirm — Disable Boot Persistence Service ".to_string(),
+                subtitle: format!(
+                    "Disable {} on boot and suspend resume",
+                    self.persist_paths.service_name
+                ),
+                action: ConfirmAction::ToggleBootService { enable: false },
+                ops: Vec::new(),
+                steps,
+                scroll: 0,
+                allow_extreme: false,
+            });
+            return;
+        }
+
+        let needs_save = !self.persist_status.active_profile_exists
+            || self.persist_status.active_profile_valid == Some(false);
+
+        if needs_save {
+            let steps = vec![
+                (
+                    "1. Profile".to_string(),
+                    format!(
+                        "Capture & save live SMU state → {}",
+                        self.persist_paths.active_profile.display()
+                    ),
+                ),
+                (
+                    "2. Module".to_string(),
+                    format!(
+                        "Ensure {} contains ryzen_smu",
+                        self.persist_paths.modules_load.display()
+                    ),
+                ),
+                (
+                    "3. Service".to_string(),
+                    format!(
+                        "Enable {} (boot + suspend resume with boot-loop guard)",
+                        self.persist_paths.service_name
+                    ),
+                ),
+            ];
+            self.confirm_modal = Some(ConfirmModal {
+                title: " Confirm — Save Live State & Enable Boot Service ".to_string(),
+                subtitle: format!(
+                    "{} not ready yet — will save live state first, then enable {}",
+                    self.persist_paths.active_profile.display(),
+                    self.persist_paths.service_name
+                ),
+                action: ConfirmAction::ToggleBootService { enable: true },
+                ops: Vec::new(),
+                steps,
+                scroll: 0,
+                allow_extreme: self.allow_extreme,
+            });
+        } else {
+            let steps = vec![
+                (
+                    "1. Profile".to_string(),
+                    format!(
+                        "Validate {} for {}",
+                        self.persist_paths.active_profile.display(),
+                        hw.codename.display_name()
+                    ),
+                ),
+                (
+                    "2. Module".to_string(),
+                    format!(
+                        "Ensure {} contains ryzen_smu",
+                        self.persist_paths.modules_load.display()
+                    ),
+                ),
+                (
+                    "3. Service".to_string(),
+                    format!(
+                        "Enable {} (boot + suspend resume with boot-loop guard)",
+                        self.persist_paths.service_name
+                    ),
+                ),
+            ];
+            self.confirm_modal = Some(ConfirmModal {
+                title: " Confirm — Enable Boot Persistence Service ".to_string(),
+                subtitle: format!(
+                    "Enable {} using existing {}",
+                    self.persist_paths.service_name,
+                    self.persist_paths.active_profile.display()
+                ),
+                action: ConfirmAction::ToggleBootService { enable: true },
+                ops: Vec::new(),
+                steps,
+                scroll: 0,
+                allow_extreme: self.allow_extreme,
+            });
+        }
+    }
+
+    fn open_clear_boot_guard_modal(&mut self) {
+        if !self.persist_status.boot_guard_tripped {
+            self.set_flash("Boot-loop guard is already clear");
+            return;
+        }
+        let steps = vec![
+            (
+                "1. Guard".to_string(),
+                format!(
+                    "Remove tripped sentinel {}",
+                    self.persist_paths.guard_path.display()
+                ),
+            ),
+            (
+                "2. Boot".to_string(),
+                format!(
+                    "Allow {} to auto-apply on next boot",
+                    self.persist_paths.service_name
+                ),
+            ),
+        ];
+        self.confirm_modal = Some(ConfirmModal {
+            title: " Confirm — Clear Boot-Loop Crash Guard ".to_string(),
+            subtitle: "Clear tripped sentinel after confirming system stability".to_string(),
+            action: ConfirmAction::ClearBootGuard,
+            ops: Vec::new(),
+            steps,
+            scroll: 0,
+            allow_extreme: false,
+        });
     }
 
     fn execute_confirmed_modal(
@@ -1560,11 +1800,112 @@ impl App {
         };
 
         if !self.can_write() {
-            self.set_flash_kind(
-                "Refused: root required to write SMU (relaunch with sudo zensmu top)",
-                FlashKind::Error,
-            );
+            let msg = if modal.action.is_persist_action() {
+                "Refused: root required to persist boot config & control service (relaunch with sudo zensmu top)"
+            } else {
+                "Refused: root required to write SMU (relaunch with sudo zensmu top)"
+            };
+            self.set_flash_kind(msg, FlashKind::Error);
             return;
+        }
+
+        // Persistence & systemd service actions (do not mutate SMU registers)
+        match &modal.action {
+            ConfirmAction::PersistLiveAndEnable => {
+                let res = (|| -> zensmu_core::Result<()> {
+                    let snap = session::capture_snapshot(transport, hw)?;
+                    let profile = Profile::from_snapshot(&snap);
+                    persist::persist_profile(
+                        &self.persist_paths,
+                        &profile,
+                        hw.codename,
+                        hw.topology.physical_cores,
+                        modal.allow_extreme,
+                    )?;
+                    persist::set_service_enabled(
+                        &self.persist_paths,
+                        true,
+                        hw.codename,
+                        hw.topology.physical_cores,
+                        modal.allow_extreme,
+                    )?;
+                    Ok(())
+                })();
+                self.refresh_persist_status(hw);
+                match res {
+                    Ok(()) => self.set_flash_kind(
+                        format!(
+                            "Persisted live state & enabled {}",
+                            self.persist_paths.service_name
+                        ),
+                        FlashKind::Success,
+                    ),
+                    Err(err) => {
+                        self.set_flash_kind(format!("Persist failed: {err}"), FlashKind::Error);
+                    }
+                }
+                return;
+            }
+            ConfirmAction::ToggleBootService { enable } => {
+                let enable = *enable;
+                let res = (|| -> zensmu_core::Result<()> {
+                    if enable
+                        && (!self.persist_paths.active_profile.exists()
+                            || self.persist_status.active_profile_valid == Some(false))
+                    {
+                        let snap = session::capture_snapshot(transport, hw)?;
+                        let profile = Profile::from_snapshot(&snap);
+                        persist::persist_profile(
+                            &self.persist_paths,
+                            &profile,
+                            hw.codename,
+                            hw.topology.physical_cores,
+                            modal.allow_extreme,
+                        )?;
+                    }
+                    persist::set_service_enabled(
+                        &self.persist_paths,
+                        enable,
+                        hw.codename,
+                        hw.topology.physical_cores,
+                        modal.allow_extreme,
+                    )?;
+                    Ok(())
+                })();
+                self.refresh_persist_status(hw);
+                match res {
+                    Ok(()) => self.set_flash_kind(
+                        if enable {
+                            format!("Enabled {}", self.persist_paths.service_name)
+                        } else {
+                            format!("Disabled {}", self.persist_paths.service_name)
+                        },
+                        FlashKind::Success,
+                    ),
+                    Err(err) => {
+                        self.set_flash_kind(
+                            format!("Service toggle failed: {err}"),
+                            FlashKind::Error,
+                        );
+                    }
+                }
+                return;
+            }
+            ConfirmAction::ClearBootGuard => {
+                let res = BootLoopGuard::new(self.persist_paths.guard_path.clone()).clear();
+                self.refresh_persist_status(hw);
+                match res {
+                    Ok(()) => self.set_flash_kind(
+                        "Cleared boot-loop crash guard sentinel",
+                        FlashKind::Success,
+                    ),
+                    Err(err) => {
+                        self.set_flash_kind(format!("Clear guard failed: {err}"), FlashKind::Error);
+                    }
+                }
+                return;
+            }
+            _ => {}
         }
 
         // Capture pre-change snapshot and persist boot-baseline + last-state best-effort
@@ -1632,6 +1973,9 @@ impl App {
                 }
                 Ok(applied)
             })(),
+            ConfirmAction::PersistLiveAndEnable
+            | ConfirmAction::ToggleBootService { .. }
+            | ConfirmAction::ClearBootGuard => unreachable!(),
         };
 
         // Always refresh live mailbox + telemetry right after write attempts
@@ -1705,8 +2049,16 @@ impl App {
                     self.execute_confirmed_modal(transport, hw);
                 }
                 KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => {
+                    let was_persist = self
+                        .confirm_modal
+                        .as_ref()
+                        .is_some_and(|m| m.action.is_persist_action());
                     self.confirm_modal = None;
-                    self.set_flash("Dry-run cancelled (no SMU writes sent)");
+                    if was_persist {
+                        self.set_flash("Persistence action cancelled");
+                    } else {
+                        self.set_flash("Dry-run cancelled (no SMU writes sent)");
+                    }
                 }
                 KeyCode::Up | KeyCode::Char('k') => {
                     if let Some(m) = self.confirm_modal.as_mut() {
@@ -1715,7 +2067,12 @@ impl App {
                 }
                 KeyCode::Down | KeyCode::Char('j') => {
                     if let Some(m) = self.confirm_modal.as_mut() {
-                        let max_scroll = m.ops.len().saturating_sub(1);
+                        let count = if m.steps.is_empty() {
+                            m.ops.len()
+                        } else {
+                            m.steps.len()
+                        };
+                        let max_scroll = count.saturating_sub(1);
                         m.scroll = (m.scroll + 1).min(max_scroll);
                     }
                 }
@@ -1768,7 +2125,7 @@ impl App {
                 self.clamp_tune_selection(hw);
                 return false;
             }
-            KeyCode::Char('p') | KeyCode::Char('P') | KeyCode::Char(' ') => {
+            KeyCode::Char('p') | KeyCode::Char(' ') => {
                 self.paused = !self.paused;
                 self.set_flash(if self.paused {
                     "Telemetry paused"
@@ -1780,10 +2137,11 @@ impl App {
             KeyCode::Char('r') => {
                 self.poll_telemetry(transport, hw);
                 self.refresh_mailbox(transport, hw);
+                self.refresh_persist_status(hw);
                 if self.mailbox_note.is_some() {
                     self.set_flash("Telemetry refreshed (SMU mailbox requires sudo)");
                 } else {
-                    self.set_flash("SMU mailbox & telemetry refreshed");
+                    self.set_flash("SMU mailbox, telemetry & persistence refreshed");
                 }
                 return false;
             }
@@ -1882,6 +2240,15 @@ impl App {
                 KeyCode::Char('s') => {
                     self.save_live_profile(transport, hw);
                 }
+                KeyCode::Char('P') => {
+                    self.open_persist_live_modal();
+                }
+                KeyCode::Char('E') => {
+                    self.open_toggle_service_modal(hw);
+                }
+                KeyCode::Char('C') => {
+                    self.open_clear_boot_guard_modal();
+                }
                 _ => {}
             }
         } else {
@@ -1892,13 +2259,22 @@ impl App {
                 KeyCode::Left | KeyCode::Char('h') => {
                     self.active_tab = self.active_tab.prev();
                 }
+                KeyCode::Char('P') => {
+                    self.paused = !self.paused;
+                    self.set_flash(if self.paused {
+                        "Telemetry paused"
+                    } else {
+                        "Telemetry resumed"
+                    });
+                }
                 KeyCode::Char('R') => {
                     self.poll_telemetry(transport, hw);
                     self.refresh_mailbox(transport, hw);
+                    self.refresh_persist_status(hw);
                     if self.mailbox_note.is_some() {
                         self.set_flash("Telemetry refreshed (SMU mailbox requires sudo)");
                     } else {
-                        self.set_flash("SMU mailbox & telemetry refreshed");
+                        self.set_flash("SMU mailbox, telemetry & persistence refreshed");
                     }
                 }
                 _ => {}
@@ -1922,9 +2298,10 @@ pub fn run_tui(
     let mut guard = TerminalGuard::new()?;
     let mut app = App::new(interval_ms);
 
-    // Initial unprivileged PM table read + best-effort mailbox readback.
+    // Initial unprivileged PM table read + best-effort mailbox & persistence readback.
     app.poll_telemetry(transport, hw);
     app.refresh_mailbox(transport, hw);
+    app.refresh_persist_status(hw);
 
     let mut last_tick = Instant::now();
 
@@ -2450,13 +2827,13 @@ fn draw_footer(frame: &mut Frame, area: Rect, app: &App) {
         left.extend(keycap("↑↓", "Scroll"));
     } else if app.active_tab == ViewTab::Tune {
         left.extend(keycap("↑↓", "Sel"));
-        left.extend(keycap("←→/hl", "Step"));
-        left.extend(keycap("H/L", "Coarse"));
-        left.extend(keycap("a/Enter", "DryRun"));
+        left.extend(keycap("←→", "Step"));
+        left.extend(keycap("a/Ent", "Apply"));
         left.extend(keycap("u", "Undo"));
         left.extend(keycap("x", "Ext"));
         left.extend(keycap("R/B/Z", "Reset"));
-        left.extend(keycap("s", "Save"));
+        left.extend(keycap("P", "Persist+Enable"));
+        left.extend(keycap("E", "Toggle Service"));
     } else {
         left.extend(keycap("q", "Quit"));
         left.extend(keycap("Tab/1-4", "Views"));
@@ -2503,10 +2880,13 @@ fn draw_footer(frame: &mut Frame, area: Rect, app: &App) {
         )])
     };
 
-    let right_w = if app.active_flash().is_some() {
-        (area.width / 2).clamp(24, 58)
-    } else {
+    let right_w = if let Some((flash, _)) = app.active_flash() {
+        let needed = (flash.chars().count() as u16).saturating_add(2);
+        needed.clamp(16, (area.width / 2).clamp(24, 58))
+    } else if app.active_tab == ViewTab::Tune && app.staged_count() > 0 {
         28
+    } else {
+        16
     };
     let cols = Layout::default()
         .direction(Direction::Horizontal)
@@ -3896,6 +4276,32 @@ fn draw_tune_telemetry_strip(frame: &mut Frame, area: Rect, app: &App) {
             .fg(palette::CYAN)
             .add_modifier(Modifier::BOLD),
     )];
+    let (boot_badge, boot_style) = if app.persist_status.service_enabled {
+        (
+            "[BOOT:ON] ",
+            Style::default()
+                .fg(palette::GREEN)
+                .add_modifier(Modifier::BOLD),
+        )
+    } else if app.persist_status.active_profile_exists {
+        (
+            "[BOOT:SAVED] ",
+            Style::default()
+                .fg(palette::CYAN)
+                .add_modifier(Modifier::BOLD),
+        )
+    } else {
+        ("[BOOT:OFF] ", Style::default().fg(palette::MUTED))
+    };
+    title_spans.push(Span::styled(boot_badge, boot_style));
+    if app.persist_status.boot_guard_tripped {
+        title_spans.push(Span::styled(
+            "[GUARD:TRIPPED] ",
+            Style::default()
+                .fg(palette::RED)
+                .add_modifier(Modifier::BOLD),
+        ));
+    }
     if app.paused {
         title_spans.push(Span::styled(
             "[PAUSED] ",
@@ -4245,9 +4651,22 @@ fn draw_tune_param_list(frame: &mut Frame, area: Rect, app: &App, hw: &HardwareC
 }
 
 fn draw_tune_inspector_pane(frame: &mut Frame, area: Rect, app: &App, hw: &HardwareContext) {
+    let constraints = if area.height >= 26 {
+        [
+            Constraint::Length(9),
+            Constraint::Length(9),
+            Constraint::Min(8),
+        ]
+    } else {
+        [
+            Constraint::Percentage(33),
+            Constraint::Percentage(34),
+            Constraint::Percentage(33),
+        ]
+    };
     let chunks = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([Constraint::Percentage(46), Constraint::Percentage(54)])
+        .constraints(constraints)
         .split(area);
 
     // Top: Selected parameter inspector
@@ -4320,37 +4739,133 @@ fn draw_tune_inspector_pane(frame: &mut Frame, area: Rect, app: &App, hw: &Hardw
         frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: true }), insp_inner);
     }
 
+    // Middle: Boot Persistence status & quick actions
+    let persist_accent = if app.persist_status.boot_guard_tripped {
+        palette::RED
+    } else if app.persist_status.service_enabled {
+        palette::GREEN
+    } else {
+        palette::TEAL
+    };
+    let persist_block =
+        styled_block(" Boot Persistence ", persist_accent).padding(Padding::horizontal(1));
+    let persist_inner = persist_block.inner(chunks[1]);
+    frame.render_widget(persist_block, chunks[1]);
+
+    let ps = &app.persist_status;
+    let (profile_text, profile_color) = if !ps.active_profile_exists {
+        ("missing (/etc/zensmu/active.toml)".to_string(), palette::MUTED)
+    } else {
+        match ps.active_profile_valid {
+            Some(true) => {
+                let cn = ps
+                    .active_profile_codename
+                    .map(|c| c.display_name())
+                    .unwrap_or("valid");
+                (format!("valid ({cn})"), palette::GREEN)
+            }
+            Some(false) => ("invalid (re-save with P)".to_string(), palette::RED),
+            None => ("present".to_string(), palette::CYAN),
+        }
+    };
+
+    let (svc_text, svc_color) = if ps.service_enabled {
+        (format!("enabled ({})", ps.service_name), palette::GREEN)
+    } else if !ps.service_installed && ps.service_state == "not-found" {
+        (format!("not installed ({})", ps.service_name), palette::YELLOW)
+    } else {
+        (format!("disabled ({})", ps.service_name), palette::MUTED)
+    };
+
+    let resume_span = if ps.resume_hook_installed {
+        Span::styled("installed", Style::default().fg(palette::GREEN))
+    } else {
+        Span::styled("none", Style::default().fg(palette::MUTED))
+    };
+    let guard_span = if ps.boot_guard_tripped {
+        Span::styled(
+            "TRIPPED!",
+            Style::default()
+                .fg(palette::RED)
+                .add_modifier(Modifier::BOLD),
+        )
+    } else {
+        Span::styled("clean", Style::default().fg(palette::GREEN))
+    };
+
+    let toggle_desc = if ps.service_enabled {
+        "Disable boot service"
+    } else {
+        "Enable boot service"
+    };
+
+    let mut persist_lines = vec![
+        Line::from(vec![
+            Span::styled("Profile: ", Style::default().fg(palette::MUTED)),
+            Span::styled(
+                profile_text,
+                Style::default()
+                    .fg(profile_color)
+                    .add_modifier(Modifier::BOLD),
+            ),
+        ]),
+        Line::from(vec![
+            Span::styled("Service: ", Style::default().fg(palette::MUTED)),
+            Span::styled(
+                svc_text,
+                Style::default()
+                    .fg(svc_color)
+                    .add_modifier(Modifier::BOLD),
+            ),
+        ]),
+        Line::from(vec![
+            Span::styled("Resume:  ", Style::default().fg(palette::MUTED)),
+            resume_span,
+            Span::styled("  ·  Guard: ", Style::default().fg(palette::MUTED)),
+            guard_span,
+        ]),
+        Line::from(""),
+        tune_key_line("P", "Persist live & enable service"),
+        tune_key_line("E", toggle_desc),
+    ];
+    if ps.boot_guard_tripped {
+        persist_lines.push(tune_key_line("C", "Clear boot guard"));
+    }
+
+    frame.render_widget(
+        Paragraph::new(persist_lines).wrap(Wrap { trim: true }),
+        persist_inner,
+    );
+
     // Bottom: Safety & Quick Actions
     let act_block =
         styled_block(" Safety & Quick Actions ", palette::PURPLE).padding(Padding::horizontal(1));
-    let act_inner = act_block.inner(chunks[1]);
-    frame.render_widget(act_block, chunks[1]);
+    let act_inner = act_block.inner(chunks[2]);
+    frame.render_widget(act_block, chunks[2]);
 
     let extreme_span = if app.allow_extreme {
         Span::styled(
-            " ON (hard bounds & 95°C Tctl active) ",
+            " ON (hard bounds) ",
             Style::default()
                 .fg(palette::BADGE_FG)
                 .bg(palette::ORANGE)
                 .add_modifier(Modifier::BOLD),
         )
     } else {
-        Span::styled(" OFF (conservative soft bounds)", Style::default().fg(palette::GREEN))
+        Span::styled(" OFF (soft bounds)", Style::default().fg(palette::GREEN))
     };
 
     let write_span = if app.can_write() {
         Span::styled("READY (root)", Style::default().fg(palette::GREEN).add_modifier(Modifier::BOLD))
     } else {
-        Span::styled("LOCKED (run with sudo)", Style::default().fg(palette::YELLOW))
+        Span::styled("LOCKED (sudo)", Style::default().fg(palette::YELLOW))
     };
 
     let action_lines = vec![
         Line::from(vec![
             Span::styled("Writes:  ", Style::default().fg(palette::MUTED)),
             write_span,
-        ]),
-        Line::from(vec![
-            Span::styled("Extreme: ", Style::default().fg(palette::MUTED)),
+            Span::styled(" · Ext:", Style::default().fg(palette::MUTED)),
             extreme_span,
         ]),
         Line::from(vec![
@@ -4366,15 +4881,11 @@ fn draw_tune_inspector_pane(frame: &mut Frame, area: Rect, app: &App, hw: &Hardw
                     .add_modifier(Modifier::BOLD),
             ),
         ]),
-        Line::from(""),
-        tune_key_line("a / Enter", "Dry-run preview & confirm apply"),
-        tune_key_line("0 / Bksp", "Reset param to 0 (CO/Shp) / live"),
-        tune_key_line("u", "Undo / discard all staged changes"),
-        tune_key_line("x", "Toggle Allow Extreme"),
-        tune_key_line("R", "Preview Rollback (last-state.json)"),
-        tune_key_line("B", "Preview Boot Baseline reset"),
-        tune_key_line("Z", "Preview Reset CO to 0"),
-        tune_key_line("s", "Save live state to TOML profile"),
+        tune_key_line("a / Enter", "Dry-run preview & apply"),
+        tune_key_line("0 / Bksp", "Reset param to 0 / live"),
+        tune_key_line("u / x", "Undo all · Toggle Extreme"),
+        tune_key_line("R / B / Z", "Rollback · Baseline · CO=0"),
+        tune_key_line("s", "Save live TOML profile"),
     ];
 
     frame.render_widget(Paragraph::new(action_lines).wrap(Wrap { trim: true }), act_inner);
@@ -4396,23 +4907,35 @@ fn draw_tune_compact_bar(frame: &mut Frame, area: Rect, app: &App, hw: &Hardware
         "No parameter selected".to_string()
     };
 
+    let mut key_spans = vec![
+        Span::styled("a/Ent", Style::default().fg(palette::GREEN).add_modifier(Modifier::BOLD)),
+        Span::styled(":DryRun ", Style::default().fg(palette::MUTED)),
+        Span::styled("u", Style::default().fg(palette::CYAN).add_modifier(Modifier::BOLD)),
+        Span::styled(":Undo ", Style::default().fg(palette::MUTED)),
+        Span::styled("x", Style::default().fg(palette::ORANGE).add_modifier(Modifier::BOLD)),
+        Span::styled(
+            if app.allow_extreme { ":Ext[ON] " } else { ":Ext " },
+            Style::default().fg(if app.allow_extreme { palette::ORANGE } else { palette::MUTED }),
+        ),
+        Span::styled("R/B/Z", Style::default().fg(palette::YELLOW).add_modifier(Modifier::BOLD)),
+        Span::styled(":Rst ", Style::default().fg(palette::MUTED)),
+        Span::styled("P", Style::default().fg(palette::GREEN).add_modifier(Modifier::BOLD)),
+        Span::styled(":Persist ", Style::default().fg(palette::MUTED)),
+        Span::styled("E", Style::default().fg(palette::TEAL).add_modifier(Modifier::BOLD)),
+        Span::styled(":Svc", Style::default().fg(palette::MUTED)),
+    ];
+    if app.persist_status.boot_guard_tripped {
+        key_spans.push(Span::raw(" "));
+        key_spans.push(Span::styled(
+            "C",
+            Style::default().fg(palette::RED).add_modifier(Modifier::BOLD),
+        ));
+        key_spans.push(Span::styled(":ClrGuard", Style::default().fg(palette::RED)));
+    }
+
     let lines = vec![
         Line::from(Span::styled(sel_info, Style::default().fg(palette::CYAN))),
-        Line::from(vec![
-            Span::styled("a/Ent", Style::default().fg(palette::GREEN).add_modifier(Modifier::BOLD)),
-            Span::styled(":DryRun ", Style::default().fg(palette::MUTED)),
-            Span::styled("u", Style::default().fg(palette::CYAN).add_modifier(Modifier::BOLD)),
-            Span::styled(":Undo ", Style::default().fg(palette::MUTED)),
-            Span::styled("x", Style::default().fg(palette::ORANGE).add_modifier(Modifier::BOLD)),
-            Span::styled(
-                if app.allow_extreme { ":Ext[ON] " } else { ":Ext " },
-                Style::default().fg(if app.allow_extreme { palette::ORANGE } else { palette::MUTED }),
-            ),
-            Span::styled("R/B/Z", Style::default().fg(palette::YELLOW).add_modifier(Modifier::BOLD)),
-            Span::styled(":Roll/Boot/CO=0 ", Style::default().fg(palette::MUTED)),
-            Span::styled("s", Style::default().fg(palette::TEAL).add_modifier(Modifier::BOLD)),
-            Span::styled(":Save", Style::default().fg(palette::MUTED)),
-        ]),
+        Line::from(key_spans),
     ];
 
     frame.render_widget(Paragraph::new(lines), inner);
@@ -4502,80 +5025,109 @@ fn draw_confirm_modal(frame: &mut Frame, root: Rect, app: &App, modal: &ConfirmM
         ));
     }
 
+    let safety_note = if modal.action.is_persist_action() {
+        "Boot persistence & systemd control · validated before writing · no SMU registers modified"
+    } else {
+        "Pre-change snapshot saved before writes · flock + SMN RSP + readback verification"
+    };
     let sub_lines = vec![
         Line::from(sub_spans),
-        Line::from(Span::styled(
-            "Pre-change snapshot saved before writes · flock + SMN RSP + readback verification",
-            Style::default().fg(palette::DIM),
-        )),
+        Line::from(Span::styled(safety_note, Style::default().fg(palette::DIM))),
     ];
     frame.render_widget(Paragraph::new(sub_lines), chunks[0]);
 
-    // PlannedOps table (scrollable)
-    let visible_ops = chunks[1].height.saturating_sub(1).max(1) as usize;
-    let start = modal
-        .scroll
-        .min(modal.ops.len().saturating_sub(1));
+    let visible_items = chunks[1].height.saturating_sub(1).max(1) as usize;
+    let total_items = if modal.steps.is_empty() {
+        modal.ops.len()
+    } else {
+        modal.steps.len()
+    };
+    let start = modal.scroll.min(total_items.saturating_sub(1));
 
-    let op_rows: Vec<Row<'_>> = modal
-        .ops
-        .iter()
-        .enumerate()
-        .skip(start)
-        .take(visible_ops)
-        .map(|(idx, op)| {
-            let cur = op.current.as_deref().unwrap_or("—");
-            let change = format!("{cur} → {}", op.target);
-            Row::new(vec![
-                Cell::from(format!("{}", idx + 1)).style(Style::default().fg(palette::DIM)),
-                Cell::from(op.mailbox.as_str()).style(Style::default().fg(palette::TEAL)),
-                Cell::from(format!("0x{:02X}", op.opcode))
-                    .style(Style::default().fg(palette::CYAN).add_modifier(Modifier::BOLD)),
-                Cell::from(format!("0x{:08X}", op.args[0])).style(Style::default().fg(palette::MUTED)),
-                Cell::from(change)
-                    .style(Style::default().fg(palette::ORANGE).add_modifier(Modifier::BOLD)),
-                Cell::from(op.description.as_str()).style(Style::default().fg(palette::FG)),
-            ])
-        })
-        .collect();
-
-    let header = Row::new(vec!["#", "MB", "Opcode", "Arg0", "Current → Target", "Description"])
-        .style(
+    if !modal.steps.is_empty() {
+        let mut step_lines: Vec<Line<'_>> = vec![Line::from(Span::styled(
+            "Planned System Actions:",
             Style::default()
                 .fg(palette::MUTED)
                 .add_modifier(Modifier::BOLD),
+        ))];
+        for (step_label, detail) in modal.steps.iter().skip(start).take(visible_items) {
+            step_lines.push(Line::from(vec![
+                Span::styled(
+                    format!("  {step_label:<11} "),
+                    Style::default()
+                        .fg(palette::CYAN)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(detail.as_str(), Style::default().fg(palette::FG)),
+            ]));
+        }
+        frame.render_widget(
+            Paragraph::new(step_lines).wrap(Wrap { trim: false }),
+            chunks[1],
         );
-
-    let widths = if chunks[1].width < 72 {
-        [
-            Constraint::Length(2),
-            Constraint::Length(4),
-            Constraint::Length(6),
-            Constraint::Length(10),
-            Constraint::Length(15),
-            Constraint::Min(12),
-        ]
     } else {
-        [
-            Constraint::Length(3),
-            Constraint::Length(5),
-            Constraint::Length(7),
-            Constraint::Length(11),
-            Constraint::Length(22),
-            Constraint::Min(20),
-        ]
-    };
+        // PlannedOps table (scrollable)
+        let op_rows: Vec<Row<'_>> = modal
+            .ops
+            .iter()
+            .enumerate()
+            .skip(start)
+            .take(visible_items)
+            .map(|(idx, op)| {
+                let cur = op.current.as_deref().unwrap_or("—");
+                let change = format!("{cur} → {}", op.target);
+                Row::new(vec![
+                    Cell::from(format!("{}", idx + 1)).style(Style::default().fg(palette::DIM)),
+                    Cell::from(op.mailbox.as_str()).style(Style::default().fg(palette::TEAL)),
+                    Cell::from(format!("0x{:02X}", op.opcode))
+                        .style(Style::default().fg(palette::CYAN).add_modifier(Modifier::BOLD)),
+                    Cell::from(format!("0x{:08X}", op.args[0])).style(Style::default().fg(palette::MUTED)),
+                    Cell::from(change)
+                        .style(Style::default().fg(palette::ORANGE).add_modifier(Modifier::BOLD)),
+                    Cell::from(op.description.as_str()).style(Style::default().fg(palette::FG)),
+                ])
+            })
+            .collect();
 
-    let table = Table::new(op_rows, widths).header(header).column_spacing(1);
-    frame.render_widget(table, chunks[1]);
+        let header = Row::new(vec!["#", "MB", "Opcode", "Arg0", "Current → Target", "Description"])
+            .style(
+                Style::default()
+                    .fg(palette::MUTED)
+                    .add_modifier(Modifier::BOLD),
+            );
+
+        let widths = if chunks[1].width < 72 {
+            [
+                Constraint::Length(2),
+                Constraint::Length(4),
+                Constraint::Length(6),
+                Constraint::Length(10),
+                Constraint::Length(15),
+                Constraint::Min(12),
+            ]
+        } else {
+            [
+                Constraint::Length(3),
+                Constraint::Length(5),
+                Constraint::Length(7),
+                Constraint::Length(11),
+                Constraint::Length(22),
+                Constraint::Min(20),
+            ]
+        };
+
+        let table = Table::new(op_rows, widths).header(header).column_spacing(1);
+        frame.render_widget(table, chunks[1]);
+    }
 
     // Footer action prompts
-    let scroll_hint = if modal.ops.len() > visible_ops {
+    let scroll_hint = if total_items > visible_items {
         format!(
             "  [{}-{}/{} · ↑/↓ Scroll]",
             start + 1,
-            (start + visible_ops).min(modal.ops.len()),
-            modal.ops.len()
+            (start + visible_items).min(total_items),
+            total_items
         )
     } else {
         String::new()
@@ -4667,6 +5219,9 @@ fn draw_help_popup(frame: &mut Frame, root: Rect) {
         help_entry("a / Enter", "Run dry-run validation & open Confirmation Modal"),
         help_entry("R / B / Z", "Preview Rollback (last-state), Boot Baseline reset, or CO=0"),
         help_entry("s", "Save live SMU state to TOML profile"),
+        help_entry("P", "Persist+Enable: save live state to /etc/zensmu/active.toml & enable service"),
+        help_entry("E", "Toggle Service: enable or disable zensmu-apply.service"),
+        help_entry("C", "Clear tripped boot-loop crash guard sentinel"),
         Line::from(""),
         Line::from(Span::styled(
             "Safety & Privileges",
@@ -5218,5 +5773,171 @@ mod tests {
             let mut terminal = Terminal::new(backend).unwrap();
             terminal.draw(|f| draw_ui(f, &app, &hw)).unwrap();
         }
+    }
+
+    #[test]
+    fn tune_persist_and_service_modal_transitions_and_rendering() {
+        let (transport, hw) = mock_9700x();
+        let tmp = tempfile::tempdir().unwrap();
+        let mut app = App::new(500);
+        app.persist_paths = PersistPaths {
+            active_profile: tmp.path().join("etc/zensmu/active.toml"),
+            modules_load: tmp.path().join("etc/modules-load.d/ryzen_smu.conf"),
+            guard_path: tmp.path().join("var/lib/zensmu/applying.lock"),
+            resume_hook: tmp.path().join("usr/lib/systemd/system-sleep/zensmu-resume"),
+            service_name: "zensmu-apply.service".to_string(),
+        };
+        app.persist_status = default_persist_status(&app.persist_paths);
+        app.poll_telemetry(&transport, &hw);
+        app.refresh_mailbox(&transport, &hw);
+
+        let press = |code| KeyEvent::new(code, KeyModifiers::NONE);
+        app.handle_key(press(KeyCode::Char('4')), &transport, &hw);
+        assert_eq!(app.active_tab, ViewTab::Tune);
+
+        // 1. Pressing 'P' while staged changes exist must refuse with warning flash and NOT open modal
+        app.handle_key(press(KeyCode::Char('H')), &transport, &hw);
+        assert_eq!(app.staged_count(), 1);
+        app.handle_key(press(KeyCode::Char('P')), &transport, &hw);
+        assert!(app.confirm_modal.is_none());
+        let (msg, kind) = app.active_flash().expect("warning flash");
+        assert_eq!(kind, FlashKind::Warn);
+        assert!(msg.contains("Apply (a) or discard (u) staged changes"));
+
+        // Discard staged changes via 'u'
+        app.handle_key(press(KeyCode::Char('u')), &transport, &hw);
+        assert!(app.staged.is_empty());
+
+        // 2. Pressing 'P' with clean staged state opens PersistLiveAndEnable confirmation modal
+        app.handle_key(press(KeyCode::Char('P')), &transport, &hw);
+        {
+            let modal = app.confirm_modal.as_ref().expect("persist modal should open");
+            assert!(matches!(modal.action, ConfirmAction::PersistLiveAndEnable));
+            assert_eq!(modal.steps.len(), 3);
+            assert!(modal.steps[0].1.contains("active.toml"));
+            assert!(modal.steps[1].1.contains("ryzen_smu"));
+            assert!(modal.steps[2].1.contains("zensmu-apply.service"));
+        }
+
+        // Render modal at 120x36 and 80x24
+        for (w, h) in [(120u16, 36u16), (80, 24)] {
+            let backend = TestBackend::new(w, h);
+            let mut terminal = Terminal::new(backend).unwrap();
+            terminal.draw(|f| draw_ui(f, &app, &hw)).unwrap();
+            let text = buffer_text(&terminal);
+            assert!(
+                text.contains("Persist Live State"),
+                "expected persist modal title at {w}x{h}"
+            );
+            assert!(
+                text.contains("ryzen_smu"),
+                "expected modules-load step at {w}x{h}"
+            );
+        }
+
+        // Confirming 'P' while unprivileged refuses with helpful sudo error
+        app.is_root = false;
+        app.test_allow_writes = false;
+        app.handle_key(press(KeyCode::Char('y')), &transport, &hw);
+        assert!(app.confirm_modal.is_none());
+        let (msg, kind) = app.active_flash().expect("unprivileged error flash");
+        assert_eq!(kind, FlashKind::Error);
+        assert!(msg.contains("root required"));
+
+        // 3. Pressing 'E' when disabled and active.toml missing states it will save live state first + enable
+        app.persist_status.service_enabled = false;
+        app.persist_status.active_profile_exists = false;
+        app.handle_key(press(KeyCode::Char('E')), &transport, &hw);
+        {
+            let modal = app.confirm_modal.as_ref().expect("enable modal should open");
+            assert!(matches!(
+                modal.action,
+                ConfirmAction::ToggleBootService { enable: true }
+            ));
+            assert!(modal.title.contains("Save Live State"));
+            assert!(modal.subtitle.contains("save live state first"));
+        }
+        app.handle_key(press(KeyCode::Esc), &transport, &hw);
+        assert!(app.confirm_modal.is_none());
+
+        // 4. Pressing 'E' when disabled and active.toml valid opens Enable modal using existing profile
+        app.persist_status.active_profile_exists = true;
+        app.persist_status.active_profile_valid = Some(true);
+        app.persist_status.active_profile_codename = Some(Codename::GraniteRidge);
+        app.handle_key(press(KeyCode::Char('E')), &transport, &hw);
+        {
+            let modal = app.confirm_modal.as_ref().expect("enable modal should open");
+            assert!(matches!(
+                modal.action,
+                ConfirmAction::ToggleBootService { enable: true }
+            ));
+            assert!(modal.subtitle.contains("using existing"));
+        }
+        app.handle_key(press(KeyCode::Char('n')), &transport, &hw);
+        assert!(app.confirm_modal.is_none());
+
+        // 5. Pressing 'E' when enabled opens Disable modal
+        app.persist_status.service_enabled = true;
+        app.handle_key(press(KeyCode::Char('E')), &transport, &hw);
+        {
+            let modal = app.confirm_modal.as_ref().expect("disable modal should open");
+            assert!(matches!(
+                modal.action,
+                ConfirmAction::ToggleBootService { enable: false }
+            ));
+            assert!(modal.title.contains("Disable"));
+        }
+        app.handle_key(press(KeyCode::Esc), &transport, &hw);
+        assert!(app.confirm_modal.is_none());
+
+        // 6. Test Boot Persistence badges & inspector block rendering on Tab 4 across all 3 states
+        for (enabled, exists, expected_badge) in [
+            (true, true, "[BOOT:ON]"),
+            (false, true, "[BOOT:SAVED]"),
+            (false, false, "[BOOT:OFF]"),
+        ] {
+            app.persist_status.service_enabled = enabled;
+            app.persist_status.active_profile_exists = exists;
+            let backend = TestBackend::new(120, 36);
+            let mut terminal = Terminal::new(backend).unwrap();
+            terminal.draw(|f| draw_ui(f, &app, &hw)).unwrap();
+            let text = buffer_text(&terminal);
+            assert!(
+                text.contains(expected_badge),
+                "expected badge {expected_badge} on Tab 4, got:\n{text}"
+            );
+            assert!(
+                text.contains("Boot Persistence"),
+                "expected Boot Persistence inspector block on Tab 4"
+            );
+            assert!(
+                text.contains("Persist+Enable"),
+                "expected Persist+Enable in Tab 4 footer"
+            );
+            assert!(
+                text.contains("Toggle Service"),
+                "expected Toggle Service in Tab 4 footer"
+            );
+        }
+
+        // 7. Test 'C' clears tripped boot guard after confirmation
+        let guard = BootLoopGuard::new(app.persist_paths.guard_path.clone());
+        let _armed = guard.check_and_arm("active.toml").unwrap();
+        assert!(guard.is_tripped());
+        app.persist_status.boot_guard_tripped = true;
+        app.test_allow_writes = true;
+
+        app.handle_key(press(KeyCode::Char('C')), &transport, &hw);
+        assert!(matches!(
+            app.confirm_modal.as_ref().map(|m| &m.action),
+            Some(ConfirmAction::ClearBootGuard)
+        ));
+        app.handle_key(press(KeyCode::Enter), &transport, &hw);
+        assert!(app.confirm_modal.is_none());
+        assert!(!guard.is_tripped());
+        assert!(!app.persist_status.boot_guard_tripped);
+        let (msg, kind) = app.active_flash().expect("clear guard success flash");
+        assert_eq!(kind, FlashKind::Success);
+        assert!(msg.contains("Cleared boot-loop"));
     }
 }

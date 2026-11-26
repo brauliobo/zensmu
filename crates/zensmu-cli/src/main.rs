@@ -8,16 +8,17 @@ mod tui;
 use clap::{CommandFactory, Parser};
 use clap_complete::Shell;
 use commands::{
-    ApuAction, Cli, CoAction, Command, PboAction, ProfileAction, ShaperAction, TelemetryAction,
+    ApuAction, Cli, CoAction, Command, PboAction, PersistAction, PersistCommand, ProfileAction,
+    ShaperAction, TelemetryAction,
 };
 use doctor::{is_effective_root, run_doctor};
 use output::{
     ActivePboLimits, ClearGuardOutput, CoGetOutput, InfoOutput, MutationOutput, PboGetOutput,
-    ProfileDiffOutput, ProfileListItem, ProfileListOutput, ProfileSaveOutput,
+    PersistActionOutput, ProfileDiffOutput, ProfileListItem, ProfileListOutput, ProfileSaveOutput,
     ProfileValidateOutput, ShaperGetOutput, StatusOutput, TelemetryDumpOutput, print_co_table,
     print_doctor, print_error, print_info, print_json, print_json_compact, print_mutation,
-    print_pbo_status, print_planned_ops, print_profile_diff, print_profile_list,
-    print_shaper_matrix, print_status, print_telemetry,
+    print_pbo_status, print_persist_action, print_persist_status, print_planned_ops,
+    print_profile_diff, print_profile_list, print_shaper_matrix, print_status, print_telemetry,
 };
 use std::fs;
 use std::io::{self, IsTerminal, Read, Write};
@@ -36,11 +37,14 @@ use zensmu_core::ops::pm_table;
 use zensmu_core::ops::shaper;
 use zensmu_core::safety::bounds;
 use zensmu_core::safety::guard::{BootLoopGuard, DEFAULT_GUARD_PATH};
+use zensmu_core::safety::persist::{self, PersistPaths};
 use zensmu_core::safety::snapshot::{DEFAULT_STATE_DIR, SmuStateSnapshot, SnapshotStore};
 use zensmu_core::session;
 use zensmu_core::transport::SmuTransport;
 use zensmu_core::transport::sysfs::{DEFAULT_SYSFS_PATH, SysfsTransport};
-use zensmu_core::types::{CurveShaperState, FreqTier, PlannedOp, ShaperTierMargins, TempBand};
+use zensmu_core::types::{
+    Codename, CurveShaperState, FreqTier, PlannedOp, ShaperTierMargins, TempBand,
+};
 
 static INTERRUPTED: AtomicBool = AtomicBool::new(false);
 
@@ -93,6 +97,13 @@ fn guard_path(cli: &Cli) -> PathBuf {
     cli.guard_path
         .clone()
         .unwrap_or_else(|| PathBuf::from(DEFAULT_GUARD_PATH))
+}
+
+fn persist_paths(cli: &Cli) -> PersistPaths {
+    PersistPaths {
+        guard_path: guard_path(cli),
+        ..PersistPaths::default()
+    }
 }
 
 fn build_transport(cli: &Cli) -> SysfsTransport {
@@ -149,6 +160,7 @@ fn run(cli: Cli) -> Result<CliOutcome> {
         Command::Telemetry { action } => cmd_telemetry(&cli, &transport, action.as_ref()),
         Command::Top { interval } => cmd_top(&cli, &transport, interval),
         Command::Profile { action } => cmd_profile(&cli, &transport, action),
+        Command::Persist(persist_cmd) => cmd_persist(&cli, &transport, persist_cmd),
         Command::Rollback => cmd_rollback(&cli, &transport),
         Command::Reset => cmd_reset(&cli, &transport),
         Command::Doctor | Command::Completions { .. } => unreachable!(),
@@ -1026,6 +1038,276 @@ fn cmd_profile_list(cli: &Cli, dir: &Path) -> Result<CliOutcome> {
         print_profile_list(&out);
     }
     Ok(CliOutcome::Success)
+}
+
+// ============================================================================
+// Boot & Suspend Persistence (`persist`)
+// ============================================================================
+
+fn cmd_persist(
+    cli: &Cli,
+    transport: &dyn SmuTransport,
+    cmd: &PersistCommand,
+) -> Result<CliOutcome> {
+    let paths = persist_paths(cli);
+
+    match &cmd.action {
+        PersistAction::Status => {
+            let (codename, cores) = match probe_hw(cli, transport) {
+                Ok(hw) => (Some(hw.codename), Some(hw.topology.physical_cores)),
+                Err(_) => (None, None),
+            };
+            let status = persist::read_persist_status(&paths, codename, cores);
+            if cli.json {
+                print_json(&status);
+            } else {
+                print_persist_status(&status);
+            }
+            Ok(CliOutcome::Success)
+        }
+        PersistAction::Save { from, enable } => {
+            let hw = probe_hw(cli, transport)?;
+            let profile = match from {
+                Some(path) => Profile::load(path)?,
+                None => {
+                    let snap = session::capture_snapshot(transport, &hw)?;
+                    Profile::from_snapshot(&snap)
+                }
+            };
+            profile.validate_for(hw.codename, hw.topology.physical_cores, cli.allow_extreme)?;
+
+            if cli.dry_run {
+                let status = persist::read_persist_status(
+                    &paths,
+                    Some(hw.codename),
+                    Some(hw.topology.physical_cores),
+                );
+                let note = if *enable {
+                    format!(
+                        "would write active profile to {}, ensure {}, and enable {}",
+                        paths.active_profile.display(),
+                        paths.modules_load.display(),
+                        paths.service_name
+                    )
+                } else {
+                    format!(
+                        "would write active profile to {} and ensure {}",
+                        paths.active_profile.display(),
+                        paths.modules_load.display()
+                    )
+                };
+                let out = PersistActionOutput {
+                    action: "persist save".into(),
+                    dry_run: true,
+                    active_profile_path: paths.active_profile.display().to_string(),
+                    service_enabled: status.service_enabled,
+                    status,
+                    note: Some(note),
+                };
+                if cli.json {
+                    print_json(&out);
+                } else {
+                    print_persist_action(&out);
+                }
+                return Ok(CliOutcome::Success);
+            }
+
+            persist::persist_profile(
+                &paths,
+                &profile,
+                hw.codename,
+                hw.topology.physical_cores,
+                cli.allow_extreme,
+            )?;
+            if *enable {
+                persist::set_service_enabled(
+                    &paths,
+                    true,
+                    hw.codename,
+                    hw.topology.physical_cores,
+                    cli.allow_extreme,
+                )?;
+            }
+
+            let status = persist::read_persist_status(
+                &paths,
+                Some(hw.codename),
+                Some(hw.topology.physical_cores),
+            );
+            let note = if *enable {
+                format!(
+                    "wrote active profile, ensured {}, and enabled {}",
+                    paths.modules_load.display(),
+                    paths.service_name
+                )
+            } else {
+                format!(
+                    "wrote active profile and ensured {}",
+                    paths.modules_load.display()
+                )
+            };
+            let out = PersistActionOutput {
+                action: "persist save".into(),
+                dry_run: false,
+                active_profile_path: paths.active_profile.display().to_string(),
+                service_enabled: status.service_enabled,
+                status,
+                note: Some(note),
+            };
+            if cli.json {
+                print_json(&out);
+            } else if !cli.quiet {
+                print_persist_action(&out);
+            }
+            Ok(CliOutcome::Success)
+        }
+        PersistAction::Enable => {
+            let hw = probe_hw(cli, transport)?;
+
+            if cli.dry_run {
+                if !paths.active_profile.exists() {
+                    return Err(Error::InvalidInput(format!(
+                        "cannot enable {} because {} does not exist yet (save a profile first)",
+                        paths.service_name,
+                        paths.active_profile.display()
+                    )));
+                }
+                let prof = Profile::load(&paths.active_profile)?;
+                prof.validate_for(hw.codename, hw.topology.physical_cores, cli.allow_extreme)?;
+
+                let status = persist::read_persist_status(
+                    &paths,
+                    Some(hw.codename),
+                    Some(hw.topology.physical_cores),
+                );
+                let out = PersistActionOutput {
+                    action: "persist enable".into(),
+                    dry_run: true,
+                    active_profile_path: paths.active_profile.display().to_string(),
+                    service_enabled: status.service_enabled,
+                    status,
+                    note: Some(format!(
+                        "would ensure {} and enable {}",
+                        paths.modules_load.display(),
+                        paths.service_name
+                    )),
+                };
+                if cli.json {
+                    print_json(&out);
+                } else {
+                    print_persist_action(&out);
+                }
+                return Ok(CliOutcome::Success);
+            }
+
+            persist::set_service_enabled(
+                &paths,
+                true,
+                hw.codename,
+                hw.topology.physical_cores,
+                cli.allow_extreme,
+            )?;
+            let status = persist::read_persist_status(
+                &paths,
+                Some(hw.codename),
+                Some(hw.topology.physical_cores),
+            );
+            let out = PersistActionOutput {
+                action: "persist enable".into(),
+                dry_run: false,
+                active_profile_path: paths.active_profile.display().to_string(),
+                service_enabled: status.service_enabled,
+                status,
+                note: Some(format!("enabled {}", paths.service_name)),
+            };
+            if cli.json {
+                print_json(&out);
+            } else if !cli.quiet {
+                print_persist_action(&out);
+            }
+            Ok(CliOutcome::Success)
+        }
+        PersistAction::Disable { remove_profile } => {
+            let hw_opt = probe_hw(cli, transport).ok();
+            let (codename_opt, cores_opt) = hw_opt
+                .as_ref()
+                .map(|h| (Some(h.codename), Some(h.topology.physical_cores)))
+                .unwrap_or((None, None));
+
+            if cli.dry_run {
+                let status = persist::read_persist_status(&paths, codename_opt, cores_opt);
+                let note = if *remove_profile {
+                    format!(
+                        "would disable {} and remove {}",
+                        paths.service_name,
+                        paths.active_profile.display()
+                    )
+                } else {
+                    format!("would disable {}", paths.service_name)
+                };
+                let out = PersistActionOutput {
+                    action: "persist disable".into(),
+                    dry_run: true,
+                    active_profile_path: paths.active_profile.display().to_string(),
+                    service_enabled: status.service_enabled,
+                    status,
+                    note: Some(note),
+                };
+                if cli.json {
+                    print_json(&out);
+                } else {
+                    print_persist_action(&out);
+                }
+                return Ok(CliOutcome::Success);
+            }
+
+            persist::set_service_enabled(
+                &paths,
+                false,
+                codename_opt.unwrap_or(Codename::GraniteRidge),
+                cores_opt.unwrap_or(0),
+                cli.allow_extreme,
+            )?;
+            let removed = if *remove_profile {
+                persist::remove_active_profile(&paths)?
+            } else {
+                false
+            };
+
+            let status = persist::read_persist_status(&paths, codename_opt, cores_opt);
+            let note = if *remove_profile {
+                if removed {
+                    format!(
+                        "disabled {} and removed {}",
+                        paths.service_name,
+                        paths.active_profile.display()
+                    )
+                } else {
+                    format!(
+                        "disabled {} ({} was already absent)",
+                        paths.service_name,
+                        paths.active_profile.display()
+                    )
+                }
+            } else {
+                format!("disabled {}", paths.service_name)
+            };
+            let out = PersistActionOutput {
+                action: "persist disable".into(),
+                dry_run: false,
+                active_profile_path: paths.active_profile.display().to_string(),
+                service_enabled: status.service_enabled,
+                status,
+                note: Some(note),
+            };
+            if cli.json {
+                print_json(&out);
+            } else if !cli.quiet {
+                print_persist_action(&out);
+            }
+            Ok(CliOutcome::Success)
+        }
+    }
 }
 
 // ============================================================================
