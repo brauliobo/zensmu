@@ -30,17 +30,185 @@ use zensmu_core::safety::persist::{
 use zensmu_core::transport::sysfs::{DEFAULT_LOCK_PATH, DEFAULT_SYSFS_PATH};
 use zensmu_core::types::{ApuPowerMode, CoreInfo, FreqTier};
 
-// Dark cockpit palette
-pub const BG_CANVAS: Color32 = Color32::from_rgb(13, 16, 23);
-pub const BG_PANEL: Color32 = Color32::from_rgb(18, 22, 31);
-pub const BG_CARD: Color32 = Color32::from_rgb(22, 27, 38);
-pub const BORDER_SUBTLE: Color32 = Color32::from_rgb(42, 49, 66);
-pub const TEXT_MUTED: Color32 = Color32::from_rgb(148, 163, 184);
-pub const ACCENT_CRIMSON: Color32 = Color32::from_rgb(224, 90, 71);
-pub const ACCENT_CYAN: Color32 = Color32::from_rgb(56, 189, 248);
-pub const ACCENT_AMBER: Color32 = Color32::from_rgb(245, 158, 11);
-pub const ACCENT_EMERALD: Color32 = Color32::from_rgb(34, 197, 94);
-pub const ACCENT_VIOLET: Color32 = Color32::from_rgb(167, 139, 250);
+// Dark cockpit palette — every foreground/background pair is validated against WCAG 2.1 AA
+// (>= 4.5:1 normal text, >= 3.0:1 graphical components) by the automated tests in `app::tests`.
+
+// Dark surfaces
+pub const BG_CANVAS: Color32 = Color32::from_rgb(13, 16, 23); // #0D1017 central backdrop
+pub const BG_EXTREME: Color32 = Color32::from_rgb(11, 13, 18); // #0B0D12 inputs, progress tracks, plots
+pub const BG_PANEL: Color32 = Color32::from_rgb(18, 22, 31); // #12161F top/bottom bars, sidebar
+pub const BG_CARD: Color32 = Color32::from_rgb(22, 27, 38); // #161B26 cards & modals
+pub const BG_STRIPE: Color32 = Color32::from_rgb(26, 32, 46); // #1A202E striped table rows (faint_bg_color)
+pub const BG_ELEVATED: Color32 = Color32::from_rgb(31, 37, 51); // #1F2533 buttons, muted pills, code chips
+pub const BG_HOVERED: Color32 = Color32::from_rgb(42, 49, 65); // #2A3141 hovered interactive controls
+pub const BG_OPEN: Color32 = Color32::from_rgb(37, 44, 59); // #252C3B open combo/menu controls
+
+// Borders
+pub const BORDER_SUBTLE: Color32 = Color32::from_rgb(48, 57, 77); // #30394D decorative card/panel dividers
+pub const BORDER_CONTROL: Color32 = Color32::from_rgb(96, 109, 136); // #606D88 interactive control boundaries (>= 3:1)
+pub const BORDER_HOVER: Color32 = Color32::from_rgb(148, 163, 184); // #94A3B8 hovered control boundaries
+
+// Text hierarchy
+pub const TEXT_BRIGHT: Color32 = Color32::from_rgb(248, 250, 252); // #F8FAFC hero numbers, active/selected labels
+pub const TEXT_PRIMARY: Color32 = Color32::from_rgb(226, 232, 240); // #E2E8F0 default body, buttons, inputs
+pub const TEXT_MUTED: Color32 = Color32::from_rgb(156, 171, 192); // #9CABC0 secondary labels, hints, headers
+pub const TEXT_ON_CTA: Color32 = Color32::WHITE; // #FFFFFF text on solid CTA buttons
+
+// Semantic foreground & graphical accents (all >= 4.98:1 on all dark surfaces & >= 5.11:1 in tinted pills)
+pub const ACCENT_CRIMSON: Color32 = Color32::from_rgb(255, 118, 102); // #FF7666 AMD coral-crimson alerts, brand, high util
+pub const ACCENT_CYAN: Color32 = Color32::from_rgb(56, 189, 248); // #38BDF8 telemetry info, power, undervolt
+pub const ACCENT_AMBER: Color32 = Color32::from_rgb(245, 166, 35); // #F5A623 thermal, soft-limit warnings
+pub const ACCENT_EMERALD: Color32 = Color32::from_rgb(52, 211, 153); // #34D399 healthy, active, verified
+pub const ACCENT_VIOLET: Color32 = Color32::from_rgb(176, 148, 255); // #B094FF EDC current & secondary metrics
+
+// Solid CTA & selection fills (paired with TEXT_ON_CTA / TEXT_BRIGHT for >= 5.4:1 contrast)
+pub const CTA_CRIMSON: Color32 = Color32::from_rgb(185, 34, 34); // #B92222 primary apply/danger buttons (6.34:1 w/ white)
+pub const CTA_EMERALD: Color32 = Color32::from_rgb(18, 122, 62); // #127A3E primary persist/enable buttons (5.41:1 w/ white)
+pub const SELECTION_BG: Color32 = Color32::from_rgb(104, 32, 36); // #682024 text/combo selection fill (11.02:1 w/ TEXT_BRIGHT)
+
+// Standardized tinted overlay alphas (validated over BG_CANVAS, BG_PANEL, BG_CARD, BG_STRIPE)
+pub const PILL_ALPHA_CRIMSON: u8 = 34;
+pub const PILL_ALPHA_AMBER: u8 = 28;
+pub const PILL_ALPHA_EMERALD: u8 = 28;
+pub const PILL_ALPHA_CYAN: u8 = 24;
+#[cfg(test)]
+pub const PILL_ALPHA_VIOLET: u8 = 26;
+pub const BANNER_ALPHA_CRIMSON: u8 = 30;
+pub const BANNER_ALPHA_AMBER: u8 = 24;
+pub const SIDEBAR_SELECTED_ALPHA: u8 = 36;
+
+/// Construct a translucent tint color from an opaque accent color and alpha byte.
+pub fn tinted_bg(accent: Color32, alpha: u8) -> Color32 {
+    let [r, g, b, _] = accent.to_array();
+    Color32::from_rgba_unmultiplied(r, g, b, alpha)
+}
+
+/// Primary or destructive solid CTA button with guaranteed WCAG AA (`>= 5.4:1`) white label.
+fn cta_button(label: impl Into<String>, fill: Color32) -> egui::Button<'static> {
+    egui::Button::new(RichText::new(label.into()).strong().color(TEXT_ON_CTA)).fill(fill)
+}
+
+#[derive(Clone, Copy, Debug)]
+struct SplitRowMemory {
+    single_line_width: f32,
+    wrapped: bool,
+}
+
+/// Lay out a left group and a right-aligned group on a single row when they fit within
+/// `ui.available_width()`, or stack them into two cleanly wrapped rows when narrow.
+///
+/// Unlike placing `Layout::right_to_left` inside `horizontal` / `horizontal_wrapped`,
+/// the right group is always positioned strictly past `left`, so widgets can never overlap
+/// at any window width or UI zoom factor.
+fn split_or_wrap_row(
+    ui: &mut Ui,
+    id_salt: impl std::hash::Hash,
+    left: impl FnOnce(&mut Ui),
+    right: impl FnOnce(&mut Ui),
+) {
+    let id = ui.make_persistent_id(id_salt);
+    let avail = ui.available_width();
+    let item_sp = ui.spacing().item_spacing.x;
+    let min_gap = (item_sp * 1.5).max(10.0);
+
+    let prev = ui.data(|d| d.get_temp::<SplitRowMemory>(id));
+    let use_wrapped = match prev {
+        Some(mem) if mem.wrapped => avail < mem.single_line_width + 8.0,
+        Some(mem) => avail < mem.single_line_width,
+        None => false,
+    };
+
+    if use_wrapped {
+        ui.vertical(|ui| {
+            ui.set_width(avail);
+            let l_rect = ui.horizontal_wrapped(left).response.rect;
+            let r_rect = ui.horizontal_wrapped(right).response.rect;
+            let single_row_h = ui.spacing().interact_size.y * 1.6;
+            if l_rect.height() <= single_row_h && r_rect.height() <= single_row_h {
+                let est = l_rect.width() + min_gap + r_rect.width();
+                if let Some(mut mem) = prev {
+                    if est + 2.0 < mem.single_line_width {
+                        mem.single_line_width = est;
+                        ui.data_mut(|d| d.insert_temp(id, mem));
+                    }
+                }
+            }
+        });
+    } else {
+        let prev_rw = ui.data(|d| d.get_temp::<f32>(id.with("rw"))).unwrap_or(0.0);
+        let mut left_w = 0.0_f32;
+        let mut right_w = 0.0_f32;
+        ui.horizontal(|ui| {
+            left_w = ui.horizontal(left).response.rect.width();
+            let extra_min = (min_gap - item_sp).max(0.0);
+            let extra_gap = if prev_rw > 0.0 {
+                (avail - left_w - prev_rw - item_sp).max(extra_min)
+            } else {
+                extra_min
+            };
+            if extra_gap > 0.0 {
+                ui.add_space(extra_gap);
+            }
+            right_w = ui.horizontal(right).response.rect.width();
+        });
+        let total = left_w + min_gap + right_w;
+        let overflowed = total > avail + 0.5;
+        ui.data_mut(|d| {
+            d.insert_temp(id.with("rw"), right_w);
+            d.insert_temp(
+                id,
+                SplitRowMemory {
+                    single_line_width: total,
+                    wrapped: overflowed,
+                },
+            );
+        });
+        if overflowed || (prev_rw - right_w).abs() > 1.0 {
+            ui.ctx().request_repaint();
+        }
+    }
+}
+
+/// Shorten verbose CPUID brand strings (e.g. `"AMD Ryzen 7 9700X 8-Core Processor"` -> `"Ryzen 7 9700X"`,
+/// `"AMD Ryzen 7 7840U w/ Radeon 780M Graphics"` -> `"Ryzen 7 7840U"`) so the top bar stays compact
+/// while preserving the full brand in hover tooltips.
+pub fn compact_cpu_label(raw: &str) -> String {
+    let trimmed = raw.trim();
+    let without_amd = trimmed
+        .strip_prefix("AMD ")
+        .or_else(|| trimmed.strip_prefix("amd "))
+        .unwrap_or(trimmed);
+    let mut words: Vec<&str> = without_amd.split_whitespace().collect();
+    if words
+        .last()
+        .is_some_and(|w| w.eq_ignore_ascii_case("Graphics"))
+    {
+        if let Some(pos) = words
+            .iter()
+            .position(|w| w.eq_ignore_ascii_case("w/") || w.eq_ignore_ascii_case("with"))
+        {
+            words.truncate(pos);
+        }
+    }
+    if words
+        .last()
+        .is_some_and(|w| w.eq_ignore_ascii_case("Processor"))
+    {
+        words.pop();
+    }
+    if words
+        .last()
+        .is_some_and(|w| w.to_ascii_lowercase().ends_with("-core"))
+    {
+        words.pop();
+    }
+    let compact = words.join(" ");
+    if compact.is_empty() {
+        trimmed.to_string()
+    } else {
+        compact
+    }
+}
 
 fn card_frame() -> egui::Frame {
     egui::Frame::NONE
@@ -60,7 +228,7 @@ fn panel_frame(margin: egui::Margin) -> egui::Frame {
 fn pill(ui: &mut Ui, text: &str, fg: Color32, bg: Color32) {
     egui::Frame::NONE
         .fill(bg)
-        .stroke(Stroke::new(1.0_f32, fg.linear_multiply(0.45)))
+        .stroke(Stroke::new(1.0_f32, fg.linear_multiply(0.50)))
         .corner_radius(egui::CornerRadius::same(12))
         .inner_margin(egui::Margin::symmetric(9, 3))
         .show(ui, |ui| {
@@ -69,22 +237,21 @@ fn pill(ui: &mut Ui, text: &str, fg: Color32, bg: Color32) {
 }
 
 fn tinted_pill(ui: &mut Ui, text: &str, fg: Color32, alpha: u8) {
-    let [r, g, b, _] = fg.to_array();
-    pill(
-        ui,
-        text,
-        fg,
-        Color32::from_rgba_unmultiplied(r, g, b, alpha),
-    );
+    pill(ui, text, fg, tinted_bg(fg, alpha));
 }
 
 fn muted_pill(ui: &mut Ui, text: &str) {
-    pill(ui, text, TEXT_MUTED, Color32::from_rgb(30, 36, 48));
+    pill(ui, text, TEXT_MUTED, BG_ELEVATED);
 }
 
 fn optional_fused_pill(ui: &mut Ui, label: &str, value: Option<u32>, unit: &str) {
     if let Some(v) = value {
-        tinted_pill(ui, &format!("{label}: {v} {unit}"), ACCENT_CYAN, 20);
+        tinted_pill(
+            ui,
+            &format!("{label}: {v} {unit}"),
+            ACCENT_CYAN,
+            PILL_ALPHA_CYAN,
+        );
     }
 }
 
@@ -186,174 +353,64 @@ fn render_limit_slider_row(ui: &mut Ui, row: LimitSliderRow<'_>) {
     ui.end_row();
 }
 
-/// Top command bar with identity pill, privilege badge, polling controls, and global actions.
+/// Top command bar with brand, compact CPU identity, global actions, and a clean non-overlapping status strip.
 pub fn render_top_bar(app: &mut ZensmuApp, ctx: &egui::Context) {
     egui::TopBottomPanel::top("top_bar")
-        .frame(panel_frame(egui::Margin::symmetric(14, 9)))
+        .frame(panel_frame(egui::Margin::symmetric(14, 8)))
         .show(ctx, |ui| {
-            ui.horizontal_wrapped(|ui| {
-                ui.label(
-                    RichText::new("zensmu")
-                        .strong()
-                        .size(22.0)
-                        .color(ACCENT_CRIMSON),
+            let busy = app.runner.is_busy();
+            let has_hw = app.hw.is_some();
+            let cpu_badge = app.hw.as_ref().map(|hw| {
+                let full_brand = hw
+                    .cpuid
+                    .as_ref()
+                    .map(|c| c.brand.as_str())
+                    .filter(|b| !b.is_empty())
+                    .unwrap_or_else(|| hw.codename.display_name());
+                let short_cpu = compact_cpu_label(full_brand);
+                let badge = format!("{short_cpu} · SMU {}", hw.driver.smu_version);
+                let hover = format!(
+                    "{full_brand}\nCodename: {} · {}C/{}T ({} CCD) · SMU {}",
+                    hw.codename.slug(),
+                    hw.topology.physical_cores,
+                    hw.topology.logical_cpus,
+                    hw.topology.ccd_count,
+                    hw.driver.smu_version
                 );
-                ui.separator();
+                (badge, hover)
+            });
 
-                if let Some(hw) = &app.hw {
-                    let cpu_label = hw
-                        .cpuid
-                        .as_ref()
-                        .map(|c| c.brand.as_str())
-                        .filter(|b| !b.is_empty())
-                        .unwrap_or_else(|| hw.codename.display_name());
-                    pill(
-                        ui,
-                        &format!(
-                            "{} · {} · SMU {}",
-                            cpu_label,
-                            hw.codename.slug(),
-                            hw.driver.smu_version
-                        ),
-                        Color32::from_rgb(226, 232, 240),
-                        Color32::from_rgb(30, 38, 54),
+            // Row 1: Brand + compact CPU pill (left) and global telemetry/SMU/zoom controls (right).
+            split_or_wrap_row(
+                ui,
+                "top_bar_primary_row",
+                |ui| {
+                    ui.label(
+                        RichText::new("zensmu")
+                            .strong()
+                            .size(21.0)
+                            .color(ACCENT_CRIMSON),
                     );
-                } else {
-                    pill(
-                        ui,
-                        "ryzen_smu not detected",
-                        ACCENT_AMBER,
-                        Color32::from_rgba_unmultiplied(245, 158, 11, 28),
-                    );
-                }
-
-                if app.is_root {
-                    pill(
-                        ui,
-                        "ROOT (uid 0) — run unprivileged!",
-                        ACCENT_CRIMSON,
-                        Color32::from_rgba_unmultiplied(224, 90, 71, 38),
-                    );
-                } else {
-                    pill(
-                        ui,
-                        "Unprivileged · pkexec on apply",
-                        ACCENT_EMERALD,
-                        Color32::from_rgba_unmultiplied(34, 197, 94, 24),
-                    );
-                }
-
-                let boot_on = app.persist_status.service_enabled
-                    && app.persist_status.active_profile_exists;
-                let (boot_text, boot_fg, boot_bg, boot_hover) = if boot_on {
-                    (
-                        "Boot: ON",
-                        ACCENT_EMERALD,
-                        Color32::from_rgba_unmultiplied(34, 197, 94, 28),
-                        "Boot persistence is active (zensmu-apply.service enabled with active profile). Click to manage in Profiles & Safety.",
-                    )
-                } else {
-                    (
-                        "Boot: OFF",
-                        TEXT_MUTED,
-                        Color32::from_rgb(30, 36, 48),
-                        "Boot persistence is inactive. Click to configure in Profiles & Safety.",
-                    )
-                };
-                if ui
-                    .add(
-                        egui::Button::new(RichText::new(boot_text).small().strong().color(boot_fg))
-                            .fill(boot_bg)
-                            .stroke(Stroke::new(1.0_f32, boot_fg.linear_multiply(0.45)))
-                            .corner_radius(egui::CornerRadius::same(12)),
-                    )
-                    .on_hover_text(boot_hover)
-                    .clicked()
-                {
-                    app.active_tab = Tab::ProfilesSafety;
-                    app.refresh_safety_files();
-                    app.refresh_persist_status();
-                }
-
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    let busy = app.runner.is_busy();
-                    let has_hw = app.hw.is_some();
-
-                    // Compact UI Zoom controls (rendered left-to-right as: A- | 100% | A+)
-                    if ui
-                        .add_enabled(
-                            app.ui_zoom < UI_ZOOM_MAX - 0.001,
-                            egui::Button::new("A+").small(),
-                        )
-                        .on_hover_text("Increase UI scale (Ctrl +)")
-                        .clicked()
-                    {
-                        app.adjust_ui_zoom(UI_ZOOM_STEP, ctx);
-                    }
-
-                    let zoom_pct = format!("{:.0}%", app.ui_zoom * 100.0);
-                    if ui
-                        .add(egui::Button::new(RichText::new(zoom_pct).monospace()).small())
-                        .on_hover_text("Reset UI scale to 100% (Ctrl 0)")
-                        .clicked()
-                    {
-                        app.set_ui_zoom(UI_ZOOM_DEFAULT, ctx);
-                    }
-
-                    if ui
-                        .add_enabled(
-                            app.ui_zoom > UI_ZOOM_MIN + 0.001,
-                            egui::Button::new("A-").small(),
-                        )
-                        .on_hover_text("Decrease UI scale (Ctrl -)")
-                        .clicked()
-                    {
-                        app.adjust_ui_zoom(-UI_ZOOM_STEP, ctx);
-                    }
-
                     ui.separator();
 
-                    if ui
-                        .add_enabled(has_hw && !busy, egui::Button::new("Reset"))
-                        .on_hover_text("Preview reset to boot baseline (dry-run first)")
-                        .clicked()
-                    {
-                        app.dispatch_cli(CliAction::Reset { dry_run: true }, ctx);
-                    }
-
-                    if ui
-                        .add_enabled(has_hw && !busy, egui::Button::new("Rollback"))
-                        .on_hover_text("Preview rollback to last pre-change snapshot (dry-run first)")
-                        .clicked()
-                    {
-                        app.dispatch_cli(CliAction::Rollback { dry_run: true }, ctx);
-                    }
-
-                    if ui
-                        .add_enabled(has_hw && !busy, egui::Button::new("Refresh SMU State"))
-                        .on_hover_text("Read current CO, Curve Shaper, and PBO state via pkexec")
-                        .clicked()
-                    {
-                        app.dispatch_cli(CliAction::Status, ctx);
-                    }
-
-                    ui.separator();
-
-                    let pause_label = if app.telemetry_paused {
-                        "Resume"
+                    if let Some((badge, hover)) = &cpu_badge {
+                        egui::Frame::NONE
+                            .fill(BG_ELEVATED)
+                            .stroke(Stroke::new(1.0_f32, BORDER_CONTROL))
+                            .corner_radius(egui::CornerRadius::same(12))
+                            .inner_margin(egui::Margin::symmetric(9, 3))
+                            .show(ui, |ui| {
+                                ui.label(RichText::new(badge).small().strong().color(TEXT_PRIMARY))
+                                    .on_hover_text(hover);
+                            });
                     } else {
-                        "Pause"
-                    };
-                    if ui
-                        .add_enabled(has_hw, egui::Button::new(pause_label))
-                        .clicked()
-                    {
-                        app.set_telemetry_paused(!app.telemetry_paused);
+                        tinted_pill(ui, "ryzen_smu not detected", ACCENT_AMBER, PILL_ALPHA_AMBER);
                     }
-
+                },
+                |ui| {
                     let mut selected_ms = app.poll_interval_ms;
                     egui::ComboBox::from_id_salt("poll_rate_combo")
-                        .width(92.0)
+                        .width(76.0)
                         .selected_text(format_interval_label(selected_ms))
                         .show_ui(ui, |ui| {
                             for ms in POLL_INTERVAL_OPTIONS_MS {
@@ -367,7 +424,183 @@ pub fn render_top_bar(app: &mut ZensmuApp, ctx: &egui::Context) {
                     if selected_ms != app.poll_interval_ms {
                         app.set_poll_interval_ms(selected_ms);
                     }
-                });
+
+                    let pause_label = if app.telemetry_paused {
+                        "Resume"
+                    } else {
+                        "Pause"
+                    };
+                    if ui
+                        .add_enabled(has_hw, egui::Button::new(pause_label))
+                        .on_hover_text("Pause or resume live PM table telemetry polling")
+                        .clicked()
+                    {
+                        app.set_telemetry_paused(!app.telemetry_paused);
+                    }
+
+                    ui.separator();
+
+                    if ui
+                        .add_enabled(has_hw && !busy, egui::Button::new("Refresh"))
+                        .on_hover_text("Read current CO, Curve Shaper, and PBO state via pkexec")
+                        .clicked()
+                    {
+                        app.dispatch_cli(CliAction::Status, ctx);
+                    }
+
+                    if ui
+                        .add_enabled(has_hw && !busy, egui::Button::new("Rollback"))
+                        .on_hover_text("Preview rollback to last pre-change snapshot (dry-run first)")
+                        .clicked()
+                    {
+                        app.dispatch_cli(CliAction::Rollback { dry_run: true }, ctx);
+                    }
+
+                    if ui
+                        .add_enabled(has_hw && !busy, egui::Button::new("Reset"))
+                        .on_hover_text("Preview reset to boot baseline (dry-run first)")
+                        .clicked()
+                    {
+                        app.dispatch_cli(CliAction::Reset { dry_run: true }, ctx);
+                    }
+
+                    ui.separator();
+
+                    if ui
+                        .add_enabled(
+                            app.ui_zoom > UI_ZOOM_MIN + 0.001,
+                            egui::Button::new("A-").small(),
+                        )
+                        .on_hover_text("Decrease UI scale (Ctrl -)")
+                        .clicked()
+                    {
+                        app.adjust_ui_zoom(-UI_ZOOM_STEP, ctx);
+                    }
+
+                    let zoom_pct = format!("{:.0}%", app.ui_zoom * 100.0);
+                    if ui
+                        .add(egui::Button::new(RichText::new(zoom_pct).monospace()).small())
+                        .on_hover_text("Reset UI scale to 100% (Ctrl 0)")
+                        .clicked()
+                    {
+                        app.set_ui_zoom(UI_ZOOM_DEFAULT, ctx);
+                    }
+
+                    if ui
+                        .add_enabled(
+                            app.ui_zoom < UI_ZOOM_MAX - 0.001,
+                            egui::Button::new("A+").small(),
+                        )
+                        .on_hover_text("Increase UI scale (Ctrl +)")
+                        .clicked()
+                    {
+                        app.adjust_ui_zoom(UI_ZOOM_STEP, ctx);
+                    }
+                },
+            );
+
+            ui.add_space(4.0);
+
+            // Row 2: Compact wrapped status strip (privilege, boot persistence, crash guard, topology).
+            ui.horizontal_wrapped(|ui| {
+                ui.spacing_mut().item_spacing = egui::vec2(8.0, 4.0);
+
+                if app.is_root {
+                    tinted_pill(
+                        ui,
+                        "ROOT (uid 0) · run unprivileged",
+                        ACCENT_CRIMSON,
+                        PILL_ALPHA_CRIMSON,
+                    );
+                } else {
+                    tinted_pill(
+                        ui,
+                        "Unprivileged · pkexec on apply",
+                        ACCENT_EMERALD,
+                        PILL_ALPHA_EMERALD,
+                    );
+                }
+
+                let boot_on = app.persist_status.service_enabled
+                    && app.persist_status.active_profile_exists;
+                let (boot_text, boot_fg, boot_bg, boot_stroke, boot_hover) = if boot_on {
+                    (
+                        "Boot: ON",
+                        ACCENT_EMERALD,
+                        tinted_bg(ACCENT_EMERALD, PILL_ALPHA_EMERALD),
+                        ACCENT_EMERALD.linear_multiply(0.55),
+                        "Boot persistence is active (zensmu-apply.service enabled with active profile). Click to manage in Profiles & Safety.",
+                    )
+                } else {
+                    (
+                        "Boot: OFF",
+                        TEXT_MUTED,
+                        BG_ELEVATED,
+                        BORDER_CONTROL,
+                        "Boot persistence is inactive. Click to configure in Profiles & Safety.",
+                    )
+                };
+                if ui
+                    .add(
+                        egui::Button::new(RichText::new(boot_text).small().strong().color(boot_fg))
+                            .fill(boot_bg)
+                            .stroke(Stroke::new(1.0_f32, boot_stroke))
+                            .corner_radius(egui::CornerRadius::same(12)),
+                    )
+                    .on_hover_text(boot_hover)
+                    .clicked()
+                {
+                    app.active_tab = Tab::ProfilesSafety;
+                    app.refresh_safety_files();
+                    app.refresh_persist_status();
+                }
+
+                let (guard_text, guard_fg, guard_bg, guard_stroke, guard_hover) =
+                    if app.profile_editor.boot_guard_tripped {
+                        (
+                            "Guard: TRIPPED",
+                            ACCENT_CRIMSON,
+                            tinted_bg(ACCENT_CRIMSON, PILL_ALPHA_CRIMSON),
+                            ACCENT_CRIMSON.linear_multiply(0.60),
+                            "Boot-loop crash guard tripped — auto-apply halted. Click to inspect or clear in Profiles & Safety.",
+                        )
+                    } else {
+                        (
+                            "Guard: Clean",
+                            ACCENT_EMERALD,
+                            tinted_bg(ACCENT_EMERALD, PILL_ALPHA_EMERALD),
+                            ACCENT_EMERALD.linear_multiply(0.55),
+                            "Boot-loop crash guard is armed and clean. Click to view safety status.",
+                        )
+                    };
+                if ui
+                    .add(
+                        egui::Button::new(
+                            RichText::new(guard_text).small().strong().color(guard_fg),
+                        )
+                        .fill(guard_bg)
+                        .stroke(Stroke::new(1.0_f32, guard_stroke))
+                        .corner_radius(egui::CornerRadius::same(12)),
+                    )
+                    .on_hover_text(guard_hover)
+                    .clicked()
+                {
+                    app.active_tab = Tab::ProfilesSafety;
+                    app.refresh_safety_files();
+                    app.refresh_persist_status();
+                }
+
+                if let Some(hw) = &app.hw {
+                    muted_pill(
+                        ui,
+                        &format!(
+                            "{} · {}C/{}T",
+                            hw.codename.slug(),
+                            hw.topology.physical_cores,
+                            hw.topology.logical_cpus
+                        ),
+                    );
+                }
             });
         });
 }
@@ -385,59 +618,63 @@ pub fn render_bottom_bar(app: &mut ZensmuApp, ctx: &egui::Context) {
     egui::TopBottomPanel::bottom("bottom_bar")
         .frame(panel_frame(egui::Margin::symmetric(14, 6)))
         .show(ctx, |ui| {
-            ui.horizontal(|ui| {
-                if let Some(label) = app.runner.in_flight_label() {
-                    ui.spinner();
-                    ui.label(RichText::new(format!("Running: {label}…")).color(ACCENT_CYAN));
-                } else if let Some(toast) = &app.toast {
-                    let color = match toast.level {
-                        ToastLevel::Info => ACCENT_CYAN,
-                        ToastLevel::Success => ACCENT_EMERALD,
-                        ToastLevel::Warning => ACCENT_AMBER,
-                        ToastLevel::Error => ACCENT_CRIMSON,
-                    };
-                    let age = toast.created_at.elapsed().as_secs();
-                    ui.label(RichText::new(&toast.message).color(color));
-                    if age > 2 {
+            let rate_text = if app.hw.is_none() {
+                "Telemetry offline".into()
+            } else if app.telemetry_paused {
+                format!(
+                    "Paused · {}/{} samples",
+                    app.samples.len(),
+                    TELEMETRY_RING_CAPACITY
+                )
+            } else {
+                let hz = 1000.0 / (app.poll_interval_ms.max(1) as f64);
+                format!(
+                    "{hz:.1} Hz ({}) · {}/{} samples",
+                    format_interval_label(app.poll_interval_ms),
+                    app.samples.len(),
+                    TELEMETRY_RING_CAPACITY
+                )
+            };
+
+            split_or_wrap_row(
+                ui,
+                "bottom_bar_row",
+                |ui| {
+                    if let Some(label) = app.runner.in_flight_label() {
+                        ui.spinner();
+                        ui.label(RichText::new(format!("Running: {label}…")).color(ACCENT_CYAN));
+                    } else if let Some(toast) = &app.toast {
+                        let color = match toast.level {
+                            ToastLevel::Info => ACCENT_CYAN,
+                            ToastLevel::Success => ACCENT_EMERALD,
+                            ToastLevel::Warning => ACCENT_AMBER,
+                            ToastLevel::Error => ACCENT_CRIMSON,
+                        };
+                        let age = toast.created_at.elapsed().as_secs();
+                        ui.label(RichText::new(&toast.message).color(color));
+                        if age > 2 {
+                            ui.label(
+                                RichText::new(format!("({age}s ago)"))
+                                    .small()
+                                    .color(TEXT_MUTED),
+                            );
+                        }
+                    } else {
                         ui.label(
-                            RichText::new(format!("({age}s ago)"))
-                                .small()
+                            RichText::new("Ready — telemetry reads sysfs without root.")
                                 .color(TEXT_MUTED),
                         );
                     }
-                } else {
-                    ui.label(
-                        RichText::new("Ready — telemetry reads sysfs without root.")
-                            .color(TEXT_MUTED),
-                    );
-                }
-
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    let rate_text = if app.hw.is_none() {
-                        "Telemetry offline".into()
-                    } else if app.telemetry_paused {
-                        format!(
-                            "Paused · {}/{} samples",
-                            app.samples.len(),
-                            TELEMETRY_RING_CAPACITY
-                        )
-                    } else {
-                        let hz = 1000.0 / (app.poll_interval_ms.max(1) as f64);
-                        format!(
-                            "{hz:.1} Hz ({}) · {}/{} samples",
-                            format_interval_label(app.poll_interval_ms),
-                            app.samples.len(),
-                            TELEMETRY_RING_CAPACITY
-                        )
-                    };
+                },
+                |ui| {
                     ui.label(
                         RichText::new(rate_text)
                             .small()
                             .monospace()
                             .color(TEXT_MUTED),
                     );
-                });
-            });
+                },
+            );
         });
 }
 
@@ -483,7 +720,7 @@ pub fn render_sidebar(app: &mut ZensmuApp, ctx: &egui::Context) {
             for (tab, title, subtitle) in tabs {
                 let selected = app.active_tab == tab;
                 let fill = if selected {
-                    Color32::from_rgba_unmultiplied(224, 90, 71, 36)
+                    tinted_bg(ACCENT_CRIMSON, SIDEBAR_SELECTED_ALPHA)
                 } else {
                     Color32::TRANSPARENT
                 };
@@ -502,9 +739,9 @@ pub fn render_sidebar(app: &mut ZensmuApp, ctx: &egui::Context) {
                         ui.set_width(ui.available_width());
                         ui.vertical(|ui| {
                             ui.label(RichText::new(title).strong().color(if selected {
-                                Color32::WHITE
+                                TEXT_BRIGHT
                             } else {
-                                Color32::from_rgb(203, 213, 225)
+                                TEXT_PRIMARY
                             }));
                             ui.label(RichText::new(subtitle).small().color(TEXT_MUTED));
                         });
@@ -561,19 +798,23 @@ pub fn render_sidebar(app: &mut ZensmuApp, ctx: &egui::Context) {
 }
 
 fn kv_small(ui: &mut Ui, key: &str, val: &str) {
-    ui.horizontal(|ui| {
-        ui.label(RichText::new(key).small().color(TEXT_MUTED));
-        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-            ui.label(RichText::new(val).small().monospace());
-        });
-    });
+    split_or_wrap_row(
+        ui,
+        ("sidebar_kv", key),
+        |ui| {
+            ui.label(RichText::new(key).small().color(TEXT_MUTED));
+        },
+        |ui| {
+            ui.label(RichText::new(val).small().monospace().color(TEXT_PRIMARY));
+        },
+    );
 }
 
 /// Warning / actionable banners shown above the main content area.
 pub fn render_banners(app: &mut ZensmuApp, ui: &mut Ui, ctx: &egui::Context) {
     if app.is_root {
         egui::Frame::NONE
-            .fill(Color32::from_rgba_unmultiplied(224, 90, 71, 32))
+            .fill(tinted_bg(ACCENT_CRIMSON, BANNER_ALPHA_CRIMSON))
             .stroke(Stroke::new(1.0_f32, ACCENT_CRIMSON))
             .corner_radius(egui::CornerRadius::same(8))
             .inner_margin(egui::Margin::same(12))
@@ -586,7 +827,10 @@ pub fn render_banners(app: &mut ZensmuApp, ui: &mut Ui, ctx: &egui::Context) {
                             .color(ACCENT_CRIMSON),
                     );
                     ui.label(
-                        "Please launch zensmu-gui as your normal user account. Telemetry reads sysfs without root, and PolicyKit (pkexec) elevates only individual zensmu CLI commands.",
+                        RichText::new(
+                            "Please launch zensmu-gui as your normal user account. Telemetry reads sysfs without root, and PolicyKit (pkexec) elevates only individual zensmu CLI commands.",
+                        )
+                        .color(TEXT_PRIMARY),
                     );
                 });
             });
@@ -595,36 +839,32 @@ pub fn render_banners(app: &mut ZensmuApp, ui: &mut Ui, ctx: &egui::Context) {
 
     if let Some(err) = app.hw_error.clone() {
         egui::Frame::NONE
-            .fill(Color32::from_rgba_unmultiplied(245, 158, 11, 24))
+            .fill(tinted_bg(ACCENT_AMBER, BANNER_ALPHA_AMBER))
             .stroke(Stroke::new(1.0_f32, ACCENT_AMBER))
             .corner_radius(egui::CornerRadius::same(8))
             .inner_margin(egui::Margin::same(12))
             .show(ui, |ui| {
                 ui.set_width(ui.available_width());
-                ui.horizontal_wrapped(|ui| {
-                    ui.vertical(|ui| {
-                        ui.label(
-                            RichText::new("ryzen_smu kernel module is not available")
-                                .strong()
-                                .color(ACCENT_AMBER),
-                        );
-                        ui.label(
-                            RichText::new(&err)
-                                .small()
-                                .color(Color32::from_rgb(226, 232, 240)),
-                        );
-                        ui.add_space(4.0);
-                        ui.horizontal(|ui| {
-                            ui.label("Load the driver with:");
-                            ui.code("sudo modprobe ryzen_smu");
-                        });
-                    });
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                ui.label(
+                    RichText::new("ryzen_smu kernel module is not available")
+                        .strong()
+                        .color(ACCENT_AMBER),
+                );
+                ui.label(RichText::new(&err).small().color(TEXT_PRIMARY));
+                ui.add_space(6.0);
+                split_or_wrap_row(
+                    ui,
+                    "hw_error_banner_actions",
+                    |ui| {
+                        ui.label(RichText::new("Load the driver with:").color(TEXT_PRIMARY));
+                        ui.code("sudo modprobe ryzen_smu");
+                    },
+                    |ui| {
                         if ui.button("Retry Hardware Probe").clicked() {
                             app.probe_hardware(ctx);
                         }
-                    });
-                });
+                    },
+                );
             });
         ui.add_space(10.0);
     }
@@ -660,41 +900,53 @@ pub fn render_dashboard(app: &mut ZensmuApp, ui: &mut Ui) {
 
     let snap = app.latest_telemetry.as_ref();
 
-    // Row 1: Power / Thermal / Current Limit Gauges
-    ui.columns(4, |cols| {
-        render_gauge_card(
-            &mut cols[0],
+    // Row 1: Power / Thermal / Current Limit Gauges (4 columns wide, or 2×2 when narrow/zoomed)
+    let gauge_specs = [
+        (
             "PPT Power",
             snap.and_then(|s| s.ppt_value_w),
             snap.and_then(|s| s.ppt_limit_w),
             "W",
             ACCENT_CYAN,
-        );
-        render_gauge_card(
-            &mut cols[1],
+        ),
+        (
             "Tctl Temp",
             snap.and_then(|s| s.tctl_value_c),
             snap.and_then(|s| s.tctl_limit_c),
             "°C",
             ACCENT_AMBER,
-        );
-        render_gauge_card(
-            &mut cols[2],
+        ),
+        (
             "TDC Current",
             snap.and_then(|s| s.tdc_value_a),
             snap.and_then(|s| s.tdc_limit_a),
             "A",
             ACCENT_EMERALD,
-        );
-        render_gauge_card(
-            &mut cols[3],
+        ),
+        (
             "EDC Current",
             snap.and_then(|s| s.edc_value_a),
             snap.and_then(|s| s.edc_limit_a),
             "A",
             ACCENT_VIOLET,
-        );
-    });
+        ),
+    ];
+    if ui.available_width() >= 680.0 {
+        ui.columns(4, |cols| {
+            for (idx, (title, value, limit, unit, accent)) in gauge_specs.iter().enumerate() {
+                render_gauge_card(&mut cols[idx], title, *value, *limit, unit, *accent);
+            }
+        });
+    } else {
+        for pair in gauge_specs.chunks(2) {
+            ui.columns(2, |cols| {
+                for (idx, (title, value, limit, unit, accent)) in pair.iter().enumerate() {
+                    render_gauge_card(&mut cols[idx], title, *value, *limit, unit, *accent);
+                }
+            });
+            ui.add_space(8.0);
+        }
+    }
 
     // Optional Row 1b: APU DPTC Limits card (only shown when APU telemetry fields are present)
     if let Some(s) = snap {
@@ -769,11 +1021,11 @@ pub fn render_dashboard(app: &mut ZensmuApp, ui: &mut Ui) {
                 ui.set_width(ui.available_width());
                 ui.horizontal_wrapped(|ui| {
                     ui.label(RichText::new("APU DPTC Limits").strong());
-                    pill(
+                    tinted_pill(
                         ui,
                         "Mobile Power & Thermal Telemetry",
                         ACCENT_CYAN,
-                        Color32::from_rgba_unmultiplied(56, 189, 248, 22),
+                        PILL_ALPHA_CYAN,
                     );
                 });
                 ui.add_space(8.0);
@@ -858,28 +1110,27 @@ pub fn render_dashboard(app: &mut ZensmuApp, ui: &mut Ui) {
     ui.columns(2, |cols| {
         card_frame().show(&mut cols[0], |ui| {
             ui.set_width(ui.available_width());
-            ui.horizontal(|ui| {
-                ui.label(RichText::new("Fabric & Memory Clocks").strong());
-                if let (Some(uclk), Some(mclk)) =
-                    (snap.and_then(|s| s.uclk_mhz), snap.and_then(|s| s.mclk_mhz))
-                {
-                    let ratio = if (uclk - mclk).abs() < 25.0 {
-                        "UCLK:MCLK 1:1"
-                    } else if (uclk * 2.0 - mclk).abs() < 50.0 {
-                        "UCLK:MCLK 1:2"
-                    } else {
-                        "Async"
-                    };
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        pill(
-                            ui,
-                            ratio,
-                            ACCENT_CYAN,
-                            Color32::from_rgba_unmultiplied(56, 189, 248, 24),
-                        );
-                    });
-                }
-            });
+            split_or_wrap_row(
+                ui,
+                "clocks_card_header",
+                |ui| {
+                    ui.label(RichText::new("Fabric & Memory Clocks").strong());
+                },
+                |ui| {
+                    if let (Some(uclk), Some(mclk)) =
+                        (snap.and_then(|s| s.uclk_mhz), snap.and_then(|s| s.mclk_mhz))
+                    {
+                        let ratio = if (uclk - mclk).abs() < 25.0 {
+                            "UCLK:MCLK 1:1"
+                        } else if (uclk * 2.0 - mclk).abs() < 50.0 {
+                            "UCLK:MCLK 1:2"
+                        } else {
+                            "Async"
+                        };
+                        tinted_pill(ui, ratio, ACCENT_CYAN, PILL_ALPHA_CYAN);
+                    }
+                },
+            );
             ui.add_space(8.0);
             egui::Grid::new("clocks_grid")
                 .num_columns(2)
@@ -944,19 +1195,23 @@ struct RollingPlotSpec<'a> {
 
 fn render_rolling_plot_card(ui: &mut Ui, spec: RollingPlotSpec<'_>) {
     card_frame().show(ui, |ui| {
-        ui.horizontal(|ui| {
-            ui.label(RichText::new(spec.title).strong());
-            if let Some(v) = spec.current {
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+        split_or_wrap_row(
+            ui,
+            ("plot_header", spec.plot_id),
+            |ui| {
+                ui.label(RichText::new(spec.title).strong());
+            },
+            |ui| {
+                if let Some(v) = spec.current {
                     ui.label(
                         RichText::new(format!("{v:.1} {}", spec.unit))
                             .monospace()
                             .strong()
                             .color(spec.accent),
                     );
-                });
-            }
-        });
+                }
+            },
+        );
         ui.add_space(4.0);
         let mut plot = Plot::new(spec.plot_id)
             .height(185.0)
@@ -980,7 +1235,7 @@ fn render_rolling_plot_card(ui: &mut Ui, spec: RollingPlotSpec<'_>) {
                 plot_ui.hline(
                     HLine::new(lim)
                         .name(spec.limit_name)
-                        .color(ACCENT_CRIMSON.linear_multiply(0.7))
+                        .color(ACCENT_CRIMSON)
                         .style(egui_plot::LineStyle::Dashed { length: 6.0 }),
                 );
             }
@@ -1008,24 +1263,55 @@ fn render_gauge_card(
                     RichText::new(format!("{val:.1} {unit}"))
                         .size(24.0)
                         .strong()
-                        .monospace(),
+                        .monospace()
+                        .color(TEXT_BRIGHT),
                 );
                 ui.add_space(4.0);
-                ui.add(egui::ProgressBar::new(frac).fill(fill).text(format!(
-                    "{:.0}% of {:.0} {unit}",
-                    frac * 100.0,
-                    lim
-                )));
+                split_or_wrap_row(
+                    ui,
+                    ("gauge_caption", title),
+                    |ui| {
+                        ui.label(
+                            RichText::new(format!("{:.0}%", frac * 100.0))
+                                .small()
+                                .strong()
+                                .monospace()
+                                .color(fill),
+                        );
+                    },
+                    |ui| {
+                        ui.label(
+                            RichText::new(format!("of {lim:.0} {unit}"))
+                                .small()
+                                .monospace()
+                                .color(TEXT_MUTED),
+                        );
+                    },
+                );
+                ui.add_space(3.0);
+                ui.add(
+                    egui::ProgressBar::new(frac)
+                        .desired_height(8.0)
+                        .corner_radius(egui::CornerRadius::same(4))
+                        .fill(fill),
+                );
             }
             (Some(val), _) => {
                 ui.label(
                     RichText::new(format!("{val:.1} {unit}"))
                         .size(24.0)
                         .strong()
-                        .monospace(),
+                        .monospace()
+                        .color(TEXT_BRIGHT),
                 );
                 ui.add_space(4.0);
                 ui.label(RichText::new("Limit N/A").small().color(TEXT_MUTED));
+                ui.add_space(3.0);
+                ui.add(
+                    egui::ProgressBar::new(0.0)
+                        .desired_height(8.0)
+                        .corner_radius(egui::CornerRadius::same(4)),
+                );
             }
             _ => {
                 ui.label(
@@ -1036,7 +1322,13 @@ fn render_gauge_card(
                         .color(TEXT_MUTED),
                 );
                 ui.add_space(4.0);
-                ui.add(egui::ProgressBar::new(0.0).text("No data"));
+                ui.label(RichText::new("No data").small().color(TEXT_MUTED));
+                ui.add_space(3.0);
+                ui.add(
+                    egui::ProgressBar::new(0.0)
+                        .desired_height(8.0)
+                        .corner_radius(egui::CornerRadius::same(4)),
+                );
             }
         }
     });
@@ -1058,14 +1350,25 @@ fn render_apu_limit_row(
             ui.label(
                 RichText::new(format!("{val:.1} / {lim:.0} {unit}"))
                     .monospace()
-                    .strong(),
+                    .strong()
+                    .color(TEXT_PRIMARY),
             );
-            ui.add(
-                egui::ProgressBar::new(frac)
-                    .desired_width(240.0)
-                    .fill(fill)
-                    .text(format!("{:.0}%", frac * 100.0)),
-            );
+            ui.horizontal(|ui| {
+                ui.add(
+                    egui::ProgressBar::new(frac)
+                        .desired_width(165.0)
+                        .desired_height(8.0)
+                        .corner_radius(egui::CornerRadius::same(4))
+                        .fill(fill),
+                );
+                ui.label(
+                    RichText::new(format!("{:.0}%", frac * 100.0))
+                        .small()
+                        .strong()
+                        .monospace()
+                        .color(fill),
+                );
+            });
         }
         (Some(val), Some(_)) => {
             ui.label(
@@ -1073,14 +1376,26 @@ fn render_apu_limit_row(
                     .monospace()
                     .color(TEXT_MUTED),
             );
-            ui.add(
-                egui::ProgressBar::new(0.0)
-                    .desired_width(240.0)
-                    .text("Inactive (0 limit)"),
-            );
+            ui.horizontal(|ui| {
+                ui.add(
+                    egui::ProgressBar::new(0.0)
+                        .desired_width(165.0)
+                        .desired_height(8.0)
+                        .corner_radius(egui::CornerRadius::same(4)),
+                );
+                ui.label(
+                    RichText::new("Inactive (0 limit)")
+                        .small()
+                        .color(TEXT_MUTED),
+                );
+            });
         }
         (Some(val), None) => {
-            ui.label(RichText::new(format!("{val:.1} {unit}")).monospace());
+            ui.label(
+                RichText::new(format!("{val:.1} {unit}"))
+                    .monospace()
+                    .color(TEXT_PRIMARY),
+            );
             ui.label(RichText::new("Limit N/A").small().color(TEXT_MUTED));
         }
         (None, Some(lim)) if lim > 0.0 => {
@@ -1089,19 +1404,32 @@ fn render_apu_limit_row(
                     .monospace()
                     .color(TEXT_MUTED),
             );
-            ui.add(
-                egui::ProgressBar::new(0.0)
-                    .desired_width(240.0)
-                    .text(format!("Limit {lim:.0} {unit}")),
-            );
+            ui.horizontal(|ui| {
+                ui.add(
+                    egui::ProgressBar::new(0.0)
+                        .desired_width(165.0)
+                        .desired_height(8.0)
+                        .corner_radius(egui::CornerRadius::same(4)),
+                );
+                ui.label(
+                    RichText::new(format!("Limit {lim:.0} {unit}"))
+                        .small()
+                        .monospace()
+                        .color(TEXT_MUTED),
+                );
+            });
         }
         _ => {
             ui.label(RichText::new("—").monospace().color(TEXT_MUTED));
-            ui.add(
-                egui::ProgressBar::new(0.0)
-                    .desired_width(240.0)
-                    .text("No data"),
-            );
+            ui.horizontal(|ui| {
+                ui.add(
+                    egui::ProgressBar::new(0.0)
+                        .desired_width(165.0)
+                        .desired_height(8.0)
+                        .corner_radius(egui::CornerRadius::same(4)),
+                );
+                ui.label(RichText::new("No data").small().color(TEXT_MUTED));
+            });
         }
     }
     ui.end_row();
@@ -1145,18 +1473,22 @@ pub fn render_curve_optimizer(app: &mut ZensmuApp, ui: &mut Ui, ctx: &egui::Cont
     // Safety bar + All-core card
     card_frame().show(ui, |ui| {
         ui.set_width(ui.available_width());
-        ui.horizontal_wrapped(|ui| {
-            ui.label(RichText::new("All-Core Curve Optimizer").strong());
-            pill(
-                ui,
-                &format!(
-                    "Bounds {}..=+{} · Soft floor {}",
-                    bounds.min, bounds.max, bounds.soft_min
-                ),
-                ACCENT_CYAN,
-                Color32::from_rgba_unmultiplied(56, 189, 248, 22),
-            );
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+        split_or_wrap_row(
+            ui,
+            "co_all_core_header",
+            |ui| {
+                ui.label(RichText::new("All-Core Curve Optimizer").strong());
+                tinted_pill(
+                    ui,
+                    &format!(
+                        "Bounds {}..=+{} · Soft floor {}",
+                        bounds.min, bounds.max, bounds.soft_min
+                    ),
+                    ACCENT_CYAN,
+                    PILL_ALPHA_CYAN,
+                );
+            },
+            |ui| {
                 if hw.capabilities.get_co_per_core.is_some()
                     && ui
                         .add_enabled(!busy, egui::Button::new("Read Current CO (pkexec)"))
@@ -1164,8 +1496,8 @@ pub fn render_curve_optimizer(app: &mut ZensmuApp, ui: &mut Ui, ctx: &egui::Cont
                 {
                     app.dispatch_cli(CliAction::CoGet, ctx);
                 }
-            });
-        });
+            },
+        );
 
         ui.add_space(8.0);
         ui.horizontal_wrapped(|ui| {
@@ -1209,8 +1541,7 @@ pub fn render_curve_optimizer(app: &mut ZensmuApp, ui: &mut Ui, ctx: &egui::Cont
             if ui
                 .add_enabled(
                     can_all,
-                    egui::Button::new("Preview (Dry-Run) & Apply All-Core")
-                        .fill(ACCENT_CRIMSON),
+                    cta_button("Preview (Dry-Run) & Apply All-Core", CTA_CRIMSON),
                 )
                 .clicked()
             {
@@ -1253,17 +1584,20 @@ pub fn render_curve_optimizer(app: &mut ZensmuApp, ui: &mut Ui, ctx: &egui::Cont
 
         card_frame().show(ui, |ui| {
             ui.set_width(ui.available_width());
-            ui.horizontal_wrapped(|ui| {
-                ui.label(RichText::new("Per-Core Curve Optimizer (by CCD)").strong());
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            split_or_wrap_row(
+                ui,
+                "co_per_core_header",
+                |ui| {
+                    ui.label(RichText::new("Per-Core Curve Optimizer (by CCD)").strong());
+                },
+                |ui| {
                     let any_below_soft =
                         app.co_editor.per_core.iter().any(|&v| v < bounds.soft_min);
                     let can_apply = !busy && (!any_below_soft || app.co_editor.allow_extreme);
                     if ui
                         .add_enabled(
                             can_apply,
-                            egui::Button::new("Preview (Dry-Run) & Apply Per-Core")
-                                .fill(ACCENT_CRIMSON),
+                            cta_button("Preview (Dry-Run) & Apply Per-Core", CTA_CRIMSON),
                         )
                         .clicked()
                     {
@@ -1303,8 +1637,8 @@ pub fn render_curve_optimizer(app: &mut ZensmuApp, ui: &mut Ui, ctx: &egui::Cont
                             );
                         }
                     }
-                });
-            });
+                },
+            );
 
             ui.add_space(8.0);
             for (ccd, cores) in by_ccd {
@@ -1379,11 +1713,11 @@ pub fn render_curve_optimizer(app: &mut ZensmuApp, ui: &mut Ui, ctx: &egui::Cont
             ui.horizontal_wrapped(|ui| {
                 ui.label(RichText::new("iGPU Curve Optimizer").strong());
                 if let Some(cur) = app.co_snapshot.as_ref().and_then(|s| s.igpu) {
-                    pill(
+                    tinted_pill(
                         ui,
                         &format!("Current: {cur:+}"),
                         ACCENT_EMERALD,
-                        Color32::from_rgba_unmultiplied(34, 197, 94, 24),
+                        PILL_ALPHA_EMERALD,
                     );
                 }
             });
@@ -1441,15 +1775,19 @@ pub fn render_curve_shaper(app: &mut ZensmuApp, ui: &mut Ui, ctx: &egui::Context
 
     card_frame().show(ui, |ui| {
         ui.set_width(ui.available_width());
-        ui.horizontal_wrapped(|ui| {
-            ui.label(RichText::new("5×3 Frequency / Temperature Matrix").strong());
-            pill(
-                ui,
-                &format!("Range {SHAPER_MIN}..=+{SHAPER_MAX} · Soft floor {SHAPER_SOFT_MIN}"),
-                ACCENT_CYAN,
-                Color32::from_rgba_unmultiplied(56, 189, 248, 22),
-            );
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+        split_or_wrap_row(
+            ui,
+            "shaper_matrix_header",
+            |ui| {
+                ui.label(RichText::new("5×3 Frequency / Temperature Matrix").strong());
+                tinted_pill(
+                    ui,
+                    &format!("Range {SHAPER_MIN}..=+{SHAPER_MAX} · Soft floor {SHAPER_SOFT_MIN}"),
+                    ACCENT_CYAN,
+                    PILL_ALPHA_CYAN,
+                );
+            },
+            |ui| {
                 if hw.capabilities.get_curve_shaper.is_some()
                     && ui
                         .add_enabled(!busy, egui::Button::new("Read Current Matrix (pkexec)"))
@@ -1457,8 +1795,8 @@ pub fn render_curve_shaper(app: &mut ZensmuApp, ui: &mut Ui, ctx: &egui::Context
                 {
                     app.dispatch_cli(CliAction::ShaperGet, ctx);
                 }
-            });
-        });
+            },
+        );
 
         ui.add_space(10.0);
 
@@ -1535,7 +1873,7 @@ pub fn render_curve_shaper(app: &mut ZensmuApp, ui: &mut Ui, ctx: &egui::Context
             if ui
                 .add_enabled(
                     !busy && (!any_extreme || app.shaper_editor.allow_extreme),
-                    egui::Button::new("Preview (Dry-Run) & Apply Matrix").fill(ACCENT_CRIMSON),
+                    cta_button("Preview (Dry-Run) & Apply Matrix", CTA_CRIMSON),
                 )
                 .clicked()
             {
@@ -1567,7 +1905,7 @@ fn shaper_cell(ui: &mut Ui, val: &mut i8, current: Option<i8>) {
     } else if *val > 0 {
         ACCENT_CRIMSON
     } else {
-        Color32::from_rgb(203, 213, 225)
+        TEXT_PRIMARY
     };
 
     ui.horizontal(|ui| {
@@ -1614,15 +1952,13 @@ pub fn render_pbo_limits(app: &mut ZensmuApp, ui: &mut Ui, ctx: &egui::Context) 
 
     card_frame().show(ui, |ui| {
         ui.set_width(ui.available_width());
-        ui.horizontal_wrapped(|ui| {
-            ui.label(RichText::new("PBO Controls").strong());
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                if ui
-                    .add_enabled(!busy, egui::Button::new("Read PBO Status & Fused Limits (pkexec)"))
-                    .clicked()
-                {
-                    app.dispatch_cli(CliAction::PboGet, ctx);
-                }
+        split_or_wrap_row(
+            ui,
+            "pbo_controls_header",
+            |ui| {
+                ui.label(RichText::new("PBO Controls").strong());
+            },
+            |ui| {
                 if ui
                     .button("Sync from Live")
                     .on_hover_text("Reset edited PBO sliders to live telemetry and mailbox values")
@@ -1636,8 +1972,14 @@ pub fn render_pbo_limits(app: &mut ZensmuApp, ui: &mut Ui, ctx: &egui::Context) 
                         app.pbo_editor.sync_from_status(&status, true);
                     }
                 }
-            });
-        });
+                if ui
+                    .add_enabled(!busy, egui::Button::new("Read PBO Status & Fused Limits (pkexec)"))
+                    .clicked()
+                {
+                    app.dispatch_cli(CliAction::PboGet, ctx);
+                }
+            },
+        );
 
         ui.add_space(10.0);
 
@@ -1855,7 +2197,7 @@ pub fn render_pbo_limits(app: &mut ZensmuApp, ui: &mut Ui, ctx: &egui::Context) 
             if ui
                 .add_enabled(
                     can_apply,
-                    egui::Button::new("Preview (Dry-Run) & Apply PBO").fill(ACCENT_CRIMSON),
+                    cta_button("Preview (Dry-Run) & Apply PBO", CTA_CRIMSON),
                 )
                 .clicked()
             {
@@ -1915,15 +2257,19 @@ fn render_apu_dptc_card(
     let caps = &hw.capabilities;
     card_frame().show(ui, |ui| {
         ui.set_width(ui.available_width());
-        ui.horizontal_wrapped(|ui| {
-            ui.label(RichText::new("APU DPTC Limits").strong());
-            tinted_pill(
-                ui,
-                &format!("{} · Mobile Power & Thermal", hw.codename.display_name()),
-                ACCENT_CYAN,
-                22,
-            );
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+        split_or_wrap_row(
+            ui,
+            "apu_dptc_header",
+            |ui| {
+                ui.label(RichText::new("APU DPTC Limits").strong());
+                tinted_pill(
+                    ui,
+                    &format!("{} · Mobile Power & Thermal", hw.codename.display_name()),
+                    ACCENT_CYAN,
+                    PILL_ALPHA_CYAN,
+                );
+            },
+            |ui| {
                 if ui
                     .button("Sync from Live")
                     .on_hover_text("Reset edited APU sliders to live PM table hardware limits")
@@ -1934,8 +2280,8 @@ fn render_apu_dptc_card(
                         app.apu_editor.sync_from_telemetry(&snap);
                     }
                 }
-            });
-        });
+            },
+        );
 
         ui.add_space(10.0);
 
@@ -2291,7 +2637,7 @@ fn render_apu_dptc_card(
             if ui
                 .add_enabled(
                     can_apply,
-                    egui::Button::new("Preview (Dry-Run) & Apply APU Limits").fill(ACCENT_CRIMSON),
+                    cta_button("Preview (Dry-Run) & Apply APU Limits", CTA_CRIMSON),
                 )
                 .clicked()
             {
@@ -2310,7 +2656,12 @@ fn opt_f32(v: Option<f32>, unit: &str) -> String {
 
 fn flag_pill(ui: &mut Ui, label: &str, val: Option<bool>) {
     match val {
-        Some(true) => tinted_pill(ui, &format!("{label}: Yes"), ACCENT_EMERALD, 24),
+        Some(true) => tinted_pill(
+            ui,
+            &format!("{label}: Yes"),
+            ACCENT_EMERALD,
+            PILL_ALPHA_EMERALD,
+        ),
         Some(false) => muted_pill(ui, &format!("{label}: No")),
         None => {}
     }
@@ -2370,7 +2721,7 @@ pub fn render_profiles_and_safety(app: &mut ZensmuApp, ui: &mut Ui, ctx: &egui::
             if ui
                 .add_enabled(
                     has_hw && !busy,
-                    egui::Button::new("Preview (Dry-Run) & Apply").fill(ACCENT_CRIMSON),
+                    cta_button("Preview (Dry-Run) & Apply", CTA_CRIMSON),
                 )
                 .clicked()
             {
@@ -2430,41 +2781,31 @@ pub fn render_profiles_and_safety(app: &mut ZensmuApp, ui: &mut Ui, ctx: &egui::
             ui.label(RichText::new("Rollback & Boot Baseline").strong());
             ui.add_space(6.0);
 
-            ui.horizontal(|ui| {
+            ui.horizontal_wrapped(|ui| {
                 ui.label("Last-change snapshot:");
                 if app.profile_editor.has_last_state {
-                    pill(
+                    tinted_pill(
                         ui,
                         "Present (/run/zensmu/last-state.json)",
                         ACCENT_EMERALD,
-                        Color32::from_rgba_unmultiplied(34, 197, 94, 24),
+                        PILL_ALPHA_EMERALD,
                     );
                 } else {
-                    pill(
-                        ui,
-                        "None yet this boot",
-                        TEXT_MUTED,
-                        Color32::from_rgb(30, 36, 48),
-                    );
+                    muted_pill(ui, "None yet this boot");
                 }
             });
 
-            ui.horizontal(|ui| {
+            ui.horizontal_wrapped(|ui| {
                 ui.label("Boot baseline snapshot:");
                 if app.profile_editor.has_boot_baseline {
-                    pill(
+                    tinted_pill(
                         ui,
                         "Captured (/run/zensmu/boot-baseline.json)",
                         ACCENT_EMERALD,
-                        Color32::from_rgba_unmultiplied(34, 197, 94, 24),
+                        PILL_ALPHA_EMERALD,
                     );
                 } else {
-                    pill(
-                        ui,
-                        "Captured on first write",
-                        TEXT_MUTED,
-                        Color32::from_rgb(30, 36, 48),
-                    );
+                    muted_pill(ui, "Captured on first write");
                 }
             });
 
@@ -2493,22 +2834,17 @@ pub fn render_profiles_and_safety(app: &mut ZensmuApp, ui: &mut Ui, ctx: &egui::
             ui.add_space(8.0);
             ui.separator();
             ui.add_space(4.0);
-            ui.horizontal(|ui| {
+            ui.horizontal_wrapped(|ui| {
                 ui.label("Boot-Loop Crash Guard:");
                 if app.profile_editor.boot_guard_tripped {
-                    pill(
+                    tinted_pill(
                         ui,
                         "TRIPPED — auto-apply halted",
                         ACCENT_CRIMSON,
-                        Color32::from_rgba_unmultiplied(224, 90, 71, 36),
+                        PILL_ALPHA_CRIMSON,
                     );
                 } else {
-                    pill(
-                        ui,
-                        "Armed & Clear",
-                        ACCENT_EMERALD,
-                        Color32::from_rgba_unmultiplied(34, 197, 94, 24),
-                    );
+                    tinted_pill(ui, "Armed & Clear", ACCENT_EMERALD, PILL_ALPHA_EMERALD);
                 }
             });
             if let Some(info) = &app.profile_editor.boot_guard_sentinel {
@@ -2632,35 +2968,23 @@ fn render_persistence_card(
 
     card_frame().show(ui, |ui| {
         ui.set_width(ui.available_width());
-        ui.horizontal_wrapped(|ui| {
-            ui.label(RichText::new("Boot & Resume Persistence (systemd)").strong());
-            if status.boot_guard_tripped {
-                pill(
-                    ui,
-                    "GUARD TRIPPED",
-                    ACCENT_CRIMSON,
-                    Color32::from_rgba_unmultiplied(224, 90, 71, 36),
-                );
-            } else if status.service_enabled
-                && status.active_profile_exists
-                && status.active_profile_valid != Some(false)
-            {
-                pill(
-                    ui,
-                    "ACTIVE",
-                    ACCENT_EMERALD,
-                    Color32::from_rgba_unmultiplied(34, 197, 94, 28),
-                );
-            } else {
-                pill(
-                    ui,
-                    "INACTIVE",
-                    TEXT_MUTED,
-                    Color32::from_rgb(30, 36, 48),
-                );
-            }
-
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+        split_or_wrap_row(
+            ui,
+            "persist_card_header",
+            |ui| {
+                ui.label(RichText::new("Boot & Resume Persistence (systemd)").strong());
+                if status.boot_guard_tripped {
+                    tinted_pill(ui, "GUARD TRIPPED", ACCENT_CRIMSON, PILL_ALPHA_CRIMSON);
+                } else if status.service_enabled
+                    && status.active_profile_exists
+                    && status.active_profile_valid != Some(false)
+                {
+                    tinted_pill(ui, "ACTIVE", ACCENT_EMERALD, PILL_ALPHA_EMERALD);
+                } else {
+                    muted_pill(ui, "INACTIVE");
+                }
+            },
+            |ui| {
                 if ui
                     .button("Refresh Status")
                     .on_hover_text("Re-check boot persistence & systemd status (unprivileged)")
@@ -2670,8 +2994,8 @@ fn render_persistence_card(
                     app.refresh_safety_files();
                     app.set_toast(ToastLevel::Info, "Refreshed boot persistence status.");
                 }
-            });
-        });
+            },
+        );
 
         ui.add_space(6.0);
         egui::Grid::new("persist_status_grid")
@@ -2796,12 +3120,7 @@ fn render_persistence_card(
                             "Clear Boot Guard (pkexec)"
                         };
                         if ui
-                            .add_enabled(
-                                !busy,
-                                egui::Button::new(clear_label)
-                                    .small()
-                                    .fill(ACCENT_CRIMSON),
-                            )
+                            .add_enabled(!busy, cta_button(clear_label, CTA_CRIMSON).small())
                             .clicked()
                         {
                             app.dispatch_cli(CliAction::ClearBootGuard, ctx);
@@ -2815,16 +3134,10 @@ fn render_persistence_card(
 
         ui.add_space(10.0);
         ui.horizontal_wrapped(|ui| {
-            let emerald_cta = Color32::from_rgb(22, 138, 72);
             if ui
                 .add_enabled(
                     has_hw && !busy,
-                    egui::Button::new(
-                        RichText::new("Persist Live SMU & Enable Service")
-                            .strong()
-                            .color(Color32::WHITE),
-                    )
-                    .fill(emerald_cta),
+                    cta_button("Persist Live SMU & Enable Service", CTA_EMERALD),
                 )
                 .on_hover_text(
                     "Snapshot live SMU settings to /etc/zensmu/active.toml, configure ryzen_smu autoload, and enable zensmu-apply.service",
@@ -2940,7 +3253,7 @@ fn render_persistence_card(
                     .add_enabled(
                         !busy,
                         egui::Button::new(
-                            RichText::new("Disable & Remove Active Profile").color(TEXT_MUTED),
+                            RichText::new("Disable & Remove Active Profile").color(ACCENT_CRIMSON),
                         ),
                     )
                     .on_hover_text(
@@ -3005,7 +3318,7 @@ pub fn render_persist_confirm_modal(app: &mut ZensmuApp, ctx: &egui::Context) {
                             RichText::new(format!("• {change}"))
                                 .small()
                                 .monospace()
-                                .color(Color32::from_rgb(226, 232, 240)),
+                                .color(TEXT_PRIMARY),
                         );
                     }
                 });
@@ -3014,36 +3327,37 @@ pub fn render_persist_confirm_modal(app: &mut ZensmuApp, ctx: &egui::Context) {
             ui.separator();
             ui.add_space(6.0);
 
-            ui.horizontal(|ui| {
-                if ui.button("Cancel").clicked() {
-                    close_modal = true;
-                }
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            let mut cancel_clicked = false;
+            let mut confirm_clicked = false;
+            split_or_wrap_row(
+                ui,
+                "persist_modal_actions",
+                |ui| {
+                    if ui.button("Cancel").clicked() {
+                        cancel_clicked = true;
+                    }
+                },
+                |ui| {
                     let btn_label = if app.is_root {
                         modal.confirm_label.clone()
                     } else {
                         format!("{} (pkexec)", modal.confirm_label)
                     };
                     let fill = if modal.is_destructive {
-                        ACCENT_CRIMSON
+                        CTA_CRIMSON
                     } else {
-                        Color32::from_rgb(22, 138, 72)
+                        CTA_EMERALD
                     };
                     if ui
-                        .add_enabled(
-                            !app.runner.is_busy(),
-                            egui::Button::new(
-                                RichText::new(btn_label).strong().color(Color32::WHITE),
-                            )
-                            .fill(fill),
-                        )
+                        .add_enabled(!app.runner.is_busy(), cta_button(btn_label, fill))
                         .clicked()
                     {
                         confirmed_target = Some(modal.target.clone());
-                        close_modal = true;
+                        confirm_clicked = true;
                     }
-                });
-            });
+                },
+            );
+            close_modal = cancel_clicked || confirm_clicked;
         });
 
     if close_modal {
@@ -3161,11 +3475,17 @@ pub fn render_dry_run_modal(app: &mut ZensmuApp, ctx: &egui::Context) {
             ui.separator();
             ui.add_space(6.0);
 
-            ui.horizontal(|ui| {
-                if ui.button("Cancel").clicked() {
-                    close_modal = true;
-                }
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            let mut cancel_clicked = false;
+            let mut confirm_clicked = false;
+            split_or_wrap_row(
+                ui,
+                "dry_run_modal_actions",
+                |ui| {
+                    if ui.button("Cancel").clicked() {
+                        cancel_clicked = true;
+                    }
+                },
+                |ui| {
                     let confirm_label = if app.is_root {
                         "Confirm & Apply"
                     } else {
@@ -3174,15 +3494,16 @@ pub fn render_dry_run_modal(app: &mut ZensmuApp, ctx: &egui::Context) {
                     if ui
                         .add_enabled(
                             !modal.ops.is_empty() && !app.runner.is_busy(),
-                            egui::Button::new(confirm_label).fill(ACCENT_CRIMSON),
+                            cta_button(confirm_label, CTA_CRIMSON),
                         )
                         .clicked()
                     {
                         confirm_action = Some(modal.live_action.clone());
-                        close_modal = true;
+                        confirm_clicked = true;
                     }
-                });
-            });
+                },
+            );
+            close_modal = cancel_clicked || confirm_clicked;
         });
 
     if let Some(action) = confirm_action {
