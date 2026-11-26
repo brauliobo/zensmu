@@ -1,0 +1,313 @@
+//! High-level transactional SMU session helpers shared by CLI, TUI, and GUI:
+//! snapshot capture, rollback/restore, and validated declarative profile application.
+
+use crate::config::profile::Profile;
+use crate::error::Result;
+use crate::hw::identity::HardwareContext;
+use crate::ops::{apu, co, pbo, pm_table, shaper};
+use crate::safety::snapshot::SmuStateSnapshot;
+use crate::transport::SmuTransport;
+use crate::types::{FreqTier, PlannedOp, ShaperTierMargins};
+
+/// Capture all currently readable SMU state into a `SmuStateSnapshot`.
+/// Optional subsystems (e.g. Curve Shaper on Zen 4, PM table on unverified versions)
+/// are recorded as `None` rather than failing the snapshot.
+pub fn capture_snapshot(
+    transport: &dyn SmuTransport,
+    hw: &HardwareContext,
+) -> Result<SmuStateSnapshot> {
+    let mut snap = SmuStateSnapshot::new(hw.codename, hw.topology.physical_cores);
+
+    if hw.capabilities.get_co_per_core.is_some() {
+        if let Ok(co_snap) = co::get_co(transport, hw) {
+            snap.co_per_core = Some(
+                co_snap
+                    .cores
+                    .iter()
+                    .map(|c| (c.core_index, c.margin))
+                    .collect(),
+            );
+            snap.igpu_co = co_snap.igpu;
+        }
+    }
+
+    if hw.capabilities.get_curve_shaper.is_some() {
+        if let Ok(cs) = shaper::get_curve_shaper(transport, hw) {
+            snap.curve_shaper = Some(cs);
+        }
+    }
+
+    if let Ok(pbo_st) = pbo::get_pbo_status(transport, hw) {
+        snap.pbo_scalar = pbo_st.scalar;
+        snap.fmax_mhz = pbo_st.fmax_mhz;
+    }
+
+    if let Ok(telem) = pm_table::read_telemetry(transport, hw) {
+        snap.ppt_w = telem.ppt_limit_w.map(|v| v.round() as u32);
+        snap.tdc_a = telem.tdc_limit_a.map(|v| v.round() as u32);
+        snap.edc_a = telem.edc_limit_a.map(|v| v.round() as u32);
+        snap.tctl_c = telem.tctl_limit_c.map(|v| v.round() as u32);
+    }
+
+    Ok(snap)
+}
+
+/// Restore hardware state from a previously captured `SmuStateSnapshot` (rollback / reset).
+pub fn apply_snapshot(
+    transport: &dyn SmuTransport,
+    hw: &HardwareContext,
+    snap: &SmuStateSnapshot,
+    allow_extreme: bool,
+    dry_run: bool,
+) -> Result<Vec<PlannedOp>> {
+    let mut ops = Vec::new();
+
+    if let Some(ref cores) = snap.co_per_core {
+        if !cores.is_empty() && hw.capabilities.set_co_per_core.is_some() {
+            let updates: Vec<(u32, i32)> = cores.iter().map(|&(idx, m)| (idx, m as i32)).collect();
+            ops.extend(co::set_co_cores(
+                transport,
+                hw,
+                &updates,
+                allow_extreme,
+                dry_run,
+            )?);
+        }
+    }
+
+    if let Some(igpu) = snap.igpu_co {
+        if hw.capabilities.set_igpu_co.is_some() {
+            ops.push(co::set_igpu_co(
+                transport,
+                hw,
+                igpu as i32,
+                allow_extreme,
+                dry_run,
+            )?);
+        }
+    }
+
+    if let Some(ref cs) = snap.curve_shaper {
+        if hw.capabilities.set_curve_shaper.is_some() {
+            ops.extend(shaper::set_curve_shaper_all(
+                transport,
+                hw,
+                cs,
+                allow_extreme,
+                dry_run,
+            )?);
+        }
+    }
+
+    let pbo_req = pbo::PboSetRequest {
+        ppt_w: snap.ppt_w,
+        tdc_a: snap.tdc_a,
+        edc_a: snap.edc_a,
+        tctl_c: snap.tctl_c,
+        scalar: snap.pbo_scalar.map(|s| s.round().clamp(1.0, 10.0) as u32),
+        fmax_mhz: snap.fmax_mhz,
+    };
+    if pbo_req.ppt_w.is_some()
+        || pbo_req.tdc_a.is_some()
+        || pbo_req.edc_a.is_some()
+        || pbo_req.tctl_c.is_some()
+        || pbo_req.scalar.is_some()
+        || pbo_req.fmax_mhz.is_some()
+    {
+        ops.extend(pbo::set_pbo(
+            transport,
+            hw,
+            &pbo_req,
+            allow_extreme,
+            dry_run,
+        )?);
+    }
+
+    Ok(ops)
+}
+
+/// Validate and apply a declarative `Profile` cleanly (supports `--dry-run`).
+pub fn apply_profile(
+    transport: &dyn SmuTransport,
+    hw: &HardwareContext,
+    profile: &Profile,
+    allow_extreme: bool,
+    dry_run: bool,
+) -> Result<Vec<PlannedOp>> {
+    profile.validate_for(hw.codename, hw.topology.physical_cores, allow_extreme)?;
+
+    let mut ops = Vec::new();
+
+    if let Some(ref co_prof) = profile.curve_optimizer {
+        if let Some(all_margin) = co_prof.all {
+            ops.extend(co::set_co_all(
+                transport,
+                hw,
+                all_margin,
+                allow_extreme,
+                dry_run,
+            )?);
+        }
+        if !co_prof.per_core.is_empty() {
+            let updates: Vec<(u32, i32)> = co_prof.per_core.iter().map(|(&k, &v)| (k, v)).collect();
+            ops.extend(co::set_co_cores(
+                transport,
+                hw,
+                &updates,
+                allow_extreme,
+                dry_run,
+            )?);
+        }
+        if let Some(igpu) = co_prof.igpu {
+            ops.push(co::set_igpu_co(
+                transport,
+                hw,
+                igpu,
+                allow_extreme,
+                dry_run,
+            )?);
+        }
+    }
+
+    if let Some(ref shaper_map) = profile.curve_shaper {
+        let current = if !dry_run && hw.capabilities.get_curve_shaper.is_some() {
+            shaper::get_curve_shaper(transport, hw).ok()
+        } else {
+            None
+        };
+
+        for tier in FreqTier::ALL {
+            if let Some(t_prof) = shaper_map.get(&tier) {
+                let base = current
+                    .map(|c| c.tier(tier))
+                    .unwrap_or(ShaperTierMargins::default());
+                let margins = ShaperTierMargins {
+                    low: t_prof.low.unwrap_or(base.low),
+                    med: t_prof.med.unwrap_or(base.med),
+                    high: t_prof.high.unwrap_or(base.high),
+                };
+                ops.push(shaper::set_curve_shaper_tier(
+                    transport,
+                    hw,
+                    tier,
+                    margins,
+                    allow_extreme,
+                    dry_run,
+                )?);
+            }
+        }
+    }
+
+    if let Some(ref pbo_prof) = profile.pbo {
+        let req = pbo::PboSetRequest {
+            ppt_w: pbo_prof.ppt_w,
+            tdc_a: pbo_prof.tdc_a,
+            edc_a: pbo_prof.edc_a,
+            tctl_c: pbo_prof.tctl_c,
+            scalar: pbo_prof.scalar,
+            fmax_mhz: pbo_prof.fmax_mhz,
+        };
+        if req.ppt_w.is_some()
+            || req.tdc_a.is_some()
+            || req.edc_a.is_some()
+            || req.tctl_c.is_some()
+            || req.scalar.is_some()
+            || req.fmax_mhz.is_some()
+        {
+            ops.extend(pbo::set_pbo(transport, hw, &req, allow_extreme, dry_run)?);
+        }
+    }
+
+    if let Some(ref apu_prof) = profile.apu {
+        let req = apu::ApuSetRequest {
+            stapm_w: apu_prof.stapm_w,
+            stapm_time_s: None,
+            fast_w: apu_prof.fast_w,
+            slow_w: apu_prof.slow_w,
+            slow_time_s: None,
+            apu_slow_w: apu_prof.apu_slow_w,
+            tdc_soc_a: None,
+            edc_soc_a: None,
+            apu_skin_temp_c: apu_prof.apu_skin_temp_c,
+            dgpu_skin_temp_c: apu_prof.dgpu_skin_temp_c,
+            power_mode: apu_prof.power_mode,
+        };
+        ops.extend(apu::set_apu(transport, hw, &req, allow_extreme, dry_run)?);
+    }
+
+    Ok(ops)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::hw::identity::detect_hardware;
+    use crate::hw::topology::CpuTopology;
+    use crate::transport::mock::MockTransport;
+
+    fn mock_hw(transport: &MockTransport) -> HardwareContext {
+        let mut hw = detect_hardware(transport, false).unwrap();
+        hw.topology = CpuTopology::synthetic(1, 8, 2);
+        hw
+    }
+
+    #[test]
+    fn profile_apply_and_snapshot_rollback_roundtrip() {
+        let transport = MockTransport::granite_ridge_9700x();
+        let hw = mock_hw(&transport);
+
+        let baseline = capture_snapshot(&transport, &hw).unwrap();
+        assert_eq!(baseline.ppt_w, Some(88));
+        assert_eq!(baseline.co_per_core.as_ref().unwrap()[0].1, 0);
+
+        let toml = r#"
+schema = 1
+[target]
+codename = "granite-ridge"
+physical_cores = 8
+
+[curve_optimizer]
+all = -20
+per_core = { 0 = -15, 3 = -25 }
+
+[curve_shaper.high]
+low = -10
+med = -15
+high = -5
+
+[pbo]
+ppt_w = 105
+tdc_a = 80
+edc_a = 160
+tctl_c = 85
+scalar = 1
+"#;
+        let profile = Profile::from_toml_str(toml).unwrap();
+
+        // Dry run must leave hardware untouched
+        let dry_ops = apply_profile(&transport, &hw, &profile, false, true).unwrap();
+        assert!(!dry_ops.is_empty());
+        let still_baseline = capture_snapshot(&transport, &hw).unwrap();
+        assert_eq!(still_baseline.ppt_w, Some(88));
+        assert_eq!(still_baseline.co_per_core.as_ref().unwrap()[0].1, 0);
+
+        // Live apply
+        let live_ops = apply_profile(&transport, &hw, &profile, false, false).unwrap();
+        assert!(!live_ops.is_empty());
+        let after = capture_snapshot(&transport, &hw).unwrap();
+        assert_eq!(after.ppt_w, Some(105));
+        assert_eq!(after.tctl_c, Some(85));
+        assert_eq!(after.co_per_core.as_ref().unwrap()[0].1, -15);
+        assert_eq!(after.co_per_core.as_ref().unwrap()[1].1, -20);
+        assert_eq!(after.co_per_core.as_ref().unwrap()[3].1, -25);
+        assert_eq!(after.curve_shaper.unwrap().high.med, -15);
+
+        // Rollback to baseline
+        apply_snapshot(&transport, &hw, &baseline, false, false).unwrap();
+        let restored = capture_snapshot(&transport, &hw).unwrap();
+        assert_eq!(restored.ppt_w, Some(88));
+        assert_eq!(restored.tctl_c, Some(95));
+        assert_eq!(restored.co_per_core.as_ref().unwrap()[0].1, 0);
+        assert_eq!(restored.curve_shaper.unwrap().high.med, 0);
+    }
+}

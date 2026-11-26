@@ -5,6 +5,7 @@ pub mod error;
 pub mod hw;
 pub mod ops;
 pub mod safety;
+pub mod session;
 pub mod transport;
 pub mod types;
 
