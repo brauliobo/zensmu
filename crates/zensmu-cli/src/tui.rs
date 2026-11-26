@@ -431,7 +431,7 @@ impl TuneValue {
 
 #[derive(Debug, Clone)]
 enum TuneRow {
-    SectionHeader(String),
+    SectionHeader(String, String),
     InfoBanner(String, Color),
     Param(TuneParam),
 }
@@ -648,12 +648,12 @@ impl App {
         if caps.set_co_per_core.is_some() || caps.set_co_all_cores.is_some() {
             let bounds_hint = caps
                 .co_bounds
-                .map(|b| format!("{}..={} (soft >= {})", b.min, b.max, b.soft_min))
+                .map(|b| format!("{}..=+{} (soft >= {})", b.min, b.max, b.soft_min))
                 .unwrap_or_default();
-            rows.push(TuneRow::SectionHeader(format!(
-                "{}  ·  {bounds_hint}",
-                TuneSection::CurveOptimizer.title()
-            )));
+            rows.push(TuneRow::SectionHeader(
+                TuneSection::CurveOptimizer.title().to_string(),
+                bounds_hint,
+            ));
             if caps.set_co_all_cores.is_some() {
                 rows.push(TuneRow::Param(TuneParam::CoAll));
             }
@@ -669,17 +669,19 @@ impl App {
 
         // 2. Curve Shaper (Zen 5)
         if caps.set_curve_shaper.is_some() {
-            rows.push(TuneRow::SectionHeader(format!(
-                "{}  ·  {}..=+{} (soft >= {})",
-                TuneSection::CurveShaper.title(),
-                shaper::SHAPER_MIN,
-                shaper::SHAPER_MAX,
-                shaper::SHAPER_SOFT_MIN
-            )));
+            rows.push(TuneRow::SectionHeader(
+                TuneSection::CurveShaper.title().to_string(),
+                format!(
+                    "{}..=+{} (soft >= {})",
+                    shaper::SHAPER_MIN,
+                    shaper::SHAPER_MAX,
+                    shaper::SHAPER_SOFT_MIN
+                ),
+            ));
             if let MailboxState::FirmwareUnsupported(code) = &self.shaper_state {
                 rows.push(TuneRow::InfoBanner(
                     format!(
-                        "Not exposed by SMU {} ({code}) — skipped",
+                        "Not exposed by SMU {} ({code})",
                         hw.driver.smu_version
                     ),
                     palette::YELLOW,
@@ -701,11 +703,10 @@ impl App {
             || caps.set_pbo_scalar.is_some()
             || caps.set_fmax.is_some();
         if has_pbo {
-            rows.push(TuneRow::SectionHeader(format!(
-                "{}  ·  Tctl hard max {}°C",
-                TuneSection::Pbo.title(),
-                pbo::TCTL_MAX_C
-            )));
+            rows.push(TuneRow::SectionHeader(
+                TuneSection::Pbo.title().to_string(),
+                format!("Tctl max {}°C", pbo::TCTL_MAX_C),
+            ));
             if caps.set_ppt.is_some() {
                 rows.push(TuneRow::Param(TuneParam::PboPpt));
             }
@@ -728,10 +729,10 @@ impl App {
 
         // 4. APU DPTC (automatically shown when set_stapm_limit is Some)
         if caps.set_stapm_limit.is_some() {
-            rows.push(TuneRow::SectionHeader(format!(
-                "{}  ·  Mobile Power & Thermal",
-                TuneSection::Apu.title()
-            )));
+            rows.push(TuneRow::SectionHeader(
+                TuneSection::Apu.title().to_string(),
+                "Mobile Power & Thermal".to_string(),
+            ));
             rows.push(TuneRow::Param(TuneParam::ApuStapm));
             if hw.codename.is_apu() && caps.set_ppt.is_some() {
                 rows.push(TuneRow::Param(TuneParam::ApuFast));
@@ -4107,7 +4108,7 @@ fn draw_tune_param_list(frame: &mut Frame, area: Rect, app: &App, hw: &HardwareC
         }
 
         match row {
-            TuneRow::SectionHeader(header_text) => {
+            TuneRow::SectionHeader(header_text, hint) => {
                 table_rows.push(
                     Row::new(vec![
                         Cell::from(format!("── {header_text}")).style(
@@ -4116,7 +4117,7 @@ fn draw_tune_param_list(frame: &mut Frame, area: Rect, app: &App, hw: &HardwareC
                                 .add_modifier(Modifier::BOLD),
                         ),
                         Cell::from(""),
-                        Cell::from(""),
+                        Cell::from(hint.as_str()).style(Style::default().fg(palette::MUTED)),
                     ])
                     .style(Style::default().bg(palette::BAR_BG)),
                 );
@@ -4124,8 +4125,8 @@ fn draw_tune_param_list(frame: &mut Frame, area: Rect, app: &App, hw: &HardwareC
             TuneRow::InfoBanner(msg, color) => {
                 table_rows.push(Row::new(vec![
                     Cell::from(format!("  ! {msg}")).style(Style::default().fg(*color)),
-                    Cell::from("skipped").style(Style::default().fg(palette::DIM)),
-                    Cell::from(""),
+                    Cell::from("n/a").style(Style::default().fg(palette::DIM)),
+                    Cell::from("BIOS / newer AGESA").style(Style::default().fg(palette::MUTED)),
                 ]));
             }
             TuneRow::Param(param) => {
@@ -4153,7 +4154,40 @@ fn draw_tune_param_list(frame: &mut Frame, area: Rect, app: &App, hw: &HardwareC
                         | TuneParam::CoIgpu
                         | TuneParam::Shaper { .. },
                         Some(TuneValue::Int(v)),
-                    ) => Style::default().fg(margin_color(v as i16)),
+                    ) => Style::default()
+                        .fg(margin_color(v as i16))
+                        .add_modifier(Modifier::BOLD),
+                    (
+                        TuneParam::PboPpt
+                        | TuneParam::ApuStapm
+                        | TuneParam::ApuFast
+                        | TuneParam::ApuSlow
+                        | TuneParam::ApuApuSlow
+                        | TuneParam::ApuPowerMode,
+                        Some(_),
+                    ) => Style::default()
+                        .fg(palette::CYAN)
+                        .add_modifier(Modifier::BOLD),
+                    (TuneParam::PboTdc | TuneParam::PboEdc, Some(_)) => Style::default()
+                        .fg(palette::TEAL)
+                        .add_modifier(Modifier::BOLD),
+                    (
+                        TuneParam::PboTctl | TuneParam::ApuSkinTemp | TuneParam::ApuDgpuSkinTemp,
+                        Some(TuneValue::Int(c)),
+                    ) => {
+                        let col = if c >= 90 {
+                            palette::ORANGE
+                        } else {
+                            palette::YELLOW
+                        };
+                        Style::default().fg(col).add_modifier(Modifier::BOLD)
+                    }
+                    (TuneParam::PboScalar, Some(_)) => Style::default()
+                        .fg(palette::PURPLE)
+                        .add_modifier(Modifier::BOLD),
+                    (TuneParam::PboFmax, Some(_)) => Style::default()
+                        .fg(palette::GREEN)
+                        .add_modifier(Modifier::BOLD),
                     _ => Style::default().fg(palette::MUTED),
                 };
 
@@ -4173,8 +4207,10 @@ fn draw_tune_param_list(frame: &mut Frame, area: Rect, app: &App, hw: &HardwareC
                     };
                     Cell::from(format!("→ {}{suffix}", format_tune_value(*param, sv)))
                         .style(Style::default().fg(col).add_modifier(Modifier::BOLD))
+                } else if is_selected {
+                    Cell::from("←/→ adjust").style(Style::default().fg(palette::CYAN))
                 } else {
-                    Cell::from("—").style(Style::default().fg(palette::DIM))
+                    Cell::from("·").style(Style::default().fg(palette::DIM))
                 };
 
                 let mut r = Row::new(vec![
