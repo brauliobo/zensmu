@@ -1,0 +1,28 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# zensmu-resume — systemd-sleep hook to re-apply the active zensmu profile on resume.
+#
+# Install to: /usr/lib/systemd/system-sleep/zensmu-resume (mode 0755)
+#
+# AMD Ryzen SMU runtime settings (Curve Optimizer, Curve Shaper, PBO limits,
+# APU DPTC limits) are volatile and reset across suspend/hibernate cycles.
+# This hook re-applies /etc/zensmu/active.toml on `post/*` resume events with
+# the boot-loop crash guard armed for 5 seconds (`--boot-guard --settle-secs 5`).
+#
+# If resuming with an unstable undervolt crashes the machine, the guard sentinel
+# remains armed and subsequent boots/resumes will refuse to auto-apply until you
+# relax /etc/zensmu/active.toml and clear the guard:
+#   sudo zensmu profile clear-guard
+
+PROFILE="/etc/zensmu/active.toml"
+SYSFS_CODENAME="/sys/kernel/ryzen_smu_drv/codename"
+ZENSMU_BIN="/usr/bin/zensmu"
+
+case "${1:-}/${2:-}" in
+    post/*)
+        if [[ -x "${ZENSMU_BIN}" && -f "${PROFILE}" && -r "${SYSFS_CODENAME}" ]]; then
+            exec "${ZENSMU_BIN}" profile apply "${PROFILE}" --yes --boot-guard --settle-secs 5
+        fi
+        ;;
+esac

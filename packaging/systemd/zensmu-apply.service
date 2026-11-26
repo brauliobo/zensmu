@@ -1,0 +1,52 @@
+# zensmu-apply.service — Apply active AMD Ryzen SMU profile at boot
+#
+# Install to: /usr/lib/systemd/system/zensmu-apply.service
+# Enable with: sudo systemctl enable zensmu-apply.service
+#
+# Prerequisites:
+#   1. Load the ryzen_smu kernel module at boot:
+#        echo "ryzen_smu" | sudo tee /etc/modules-load.d/ryzen_smu.conf
+#   2. Place your verified profile at:
+#        /etc/zensmu/active.toml
+#
+# How the Boot-Loop Crash Guard Works:
+#   When invoked with `--boot-guard --settle-secs 15`, zensmu:
+#     1. Checks whether a crash-guard sentinel already exists from a previous
+#        incomplete apply. If present, zensmu REFUSES to apply the profile
+#        (exit with BootGuardTripped), keeping your CPU at safe BIOS defaults.
+#     2. Writes and fsyncs a persistent sentinel file before issuing any SMU
+#        mailbox writes.
+#     3. Applies /etc/zensmu/active.toml with full SMN RSP & readback checks.
+#     4. Waits 15 seconds (`--settle-secs 15`) so the system runs under the
+#        new voltage/power settings while the sentinel stays armed.
+#     5. Only if the machine survives the full settle window does zensmu remove
+#        (disarm) the sentinel file.
+#
+#   If an overly aggressive Curve Optimizer undervolt causes a hard freeze,
+#   MCE, or sudden reboot during those 15 seconds, the sentinel remains on disk
+#   and the next boot will NOT re-apply the unstable profile.
+#
+# How to Clear a Tripped Guard:
+#   1. Inspect and relax the unstable settings in /etc/zensmu/active.toml.
+#   2. Clear the crash-guard sentinel:
+#        sudo zensmu profile clear-guard
+#   3. Test the updated profile safely before rebooting:
+#        sudo zensmu profile apply /etc/zensmu/active.toml --dry-run
+#        sudo zensmu profile apply /etc/zensmu/active.toml --confirm-within 30
+
+[Unit]
+Description=Apply active zensmu AMD Ryzen SMU profile with boot-loop guard
+Documentation=https://github.com/brauliobo/zensmu
+After=systemd-modules-load.service local-fs.target
+ConditionPathExists=/etc/zensmu/active.toml
+ConditionPathExists=/sys/kernel/ryzen_smu_drv/codename
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/bin/zensmu profile apply /etc/zensmu/active.toml --yes --boot-guard --settle-secs 15
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
