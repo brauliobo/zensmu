@@ -22,7 +22,7 @@ use ratatui::widgets::{
 };
 use ratatui::{Frame, Terminal};
 use std::borrow::Cow;
-use std::collections::{HashMap, VecDeque};
+use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::io::{self, Stdout, Write};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -36,6 +36,8 @@ use zensmu_core::ops::co::{self, CoSnapshot};
 use zensmu_core::ops::pbo::{self, FusedLimits, PboSetRequest, PboStatus};
 use zensmu_core::ops::pm_table::{self, TelemetrySnapshot};
 use zensmu_core::ops::shaper;
+use zensmu_core::recorder::{self, RecordConfig, RecordFormat, TelemetryRecorder};
+use zensmu_core::report::SystemBoardInfo;
 use zensmu_core::safety::guard::BootLoopGuard;
 use zensmu_core::safety::persist::{self, PersistPaths, PersistStatus};
 use zensmu_core::safety::snapshot::{SmuStateSnapshot, SnapshotStore};
@@ -410,6 +412,98 @@ impl TuneParam {
             Self::CoAll | Self::CoCore(_) | Self::CoIgpu | Self::Shaper { .. }
         )
     }
+
+    fn sort_key(self) -> (u8, u32, u8) {
+        match self {
+            Self::CoAll => (0, 0, 0),
+            Self::CoCore(idx) => (1, idx, 0),
+            Self::CoIgpu => (2, 0, 0),
+            Self::Shaper { tier, band } => {
+                let b = match band {
+                    TempBand::Low => 0,
+                    TempBand::Med => 1,
+                    TempBand::High => 2,
+                };
+                (3, tier.as_u32(), b)
+            }
+            Self::PboPpt => (4, 0, 0),
+            Self::PboTdc => (5, 0, 0),
+            Self::PboEdc => (6, 0, 0),
+            Self::PboTctl => (7, 0, 0),
+            Self::PboScalar => (8, 0, 0),
+            Self::PboFmax => (9, 0, 0),
+            Self::ApuStapm => (10, 0, 0),
+            Self::ApuStapmTime => (11, 0, 0),
+            Self::ApuFast => (12, 0, 0),
+            Self::ApuSlow => (13, 0, 0),
+            Self::ApuSlowTime => (14, 0, 0),
+            Self::ApuApuSlow => (15, 0, 0),
+            Self::ApuTdcSoc => (16, 0, 0),
+            Self::ApuEdcSoc => (17, 0, 0),
+            Self::ApuSkinTemp => (18, 0, 0),
+            Self::ApuDgpuSkinTemp => (19, 0, 0),
+            Self::ApuPowerMode => (20, 0, 0),
+        }
+    }
+}
+
+impl PartialOrd for TuneParam {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for TuneParam {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.sort_key().cmp(&other.sort_key())
+    }
+}
+
+fn tune_param_from_clamped_field(field: &str) -> Option<TuneParam> {
+    match field {
+        "pbo.ppt_w" => Some(TuneParam::PboPpt),
+        "pbo.tdc_a" => Some(TuneParam::PboTdc),
+        "pbo.edc_a" => Some(TuneParam::PboEdc),
+        "pbo.tctl_c" => Some(TuneParam::PboTctl),
+        "apu.stapm_w" => Some(TuneParam::ApuStapm),
+        "apu.fast_w" => Some(TuneParam::ApuFast),
+        "apu.slow_w" => Some(TuneParam::ApuSlow),
+        "apu.apu_slow_w" => Some(TuneParam::ApuApuSlow),
+        "apu.tdc_soc_a" => Some(TuneParam::ApuTdcSoc),
+        "apu.edc_soc_a" => Some(TuneParam::ApuEdcSoc),
+        "apu.apu_skin_temp_c" => Some(TuneParam::ApuSkinTemp),
+        "apu.dgpu_skin_temp_c" => Some(TuneParam::ApuDgpuSkinTemp),
+        _ => None,
+    }
+}
+
+fn param_unit(param: TuneParam) -> &'static str {
+    match param {
+        TuneParam::PboPpt
+        | TuneParam::ApuStapm
+        | TuneParam::ApuFast
+        | TuneParam::ApuSlow
+        | TuneParam::ApuApuSlow => "W",
+        TuneParam::PboTdc | TuneParam::PboEdc | TuneParam::ApuTdcSoc | TuneParam::ApuEdcSoc => "A",
+        TuneParam::PboTctl | TuneParam::ApuSkinTemp | TuneParam::ApuDgpuSkinTemp => "°C",
+        TuneParam::ApuStapmTime | TuneParam::ApuSlowTime => "s",
+        TuneParam::PboScalar => "x",
+        TuneParam::PboFmax => "MHz",
+        TuneParam::CoAll
+        | TuneParam::CoCore(_)
+        | TuneParam::CoIgpu
+        | TuneParam::Shaper { .. }
+        | TuneParam::ApuPowerMode => "",
+    }
+}
+
+fn format_board_cap(param: TuneParam, cap: u32) -> String {
+    let unit = param_unit(param);
+    if unit.is_empty() {
+        format!("board cap ≤{cap}")
+    } else {
+        format!("board cap ≤{cap} {unit}")
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -585,14 +679,23 @@ struct App {
     pbo_state: MailboxState<PboStatus>,
     mailbox_note: Option<String>,
     status_flash: Option<(String, FlashKind, Instant)>,
+    last_alert: Option<(String, FlashKind)>,
+    board_info: SystemBoardInfo,
     // Interactive Tune state (Tab 4)
     tune_selected: usize,
     staged: HashMap<TuneParam, TuneValue>,
+    board_caps: BTreeMap<TuneParam, u32>,
     allow_extreme: bool,
     confirm_modal: Option<ConfirmModal>,
     snapshot_store: SnapshotStore,
     persist_paths: PersistPaths,
     persist_status: PersistStatus,
+    // Live telemetry recording (unprivileged)
+    recorder: Option<TelemetryRecorder>,
+    record_started: Option<Instant>,
+    record_format: RecordFormat,
+    #[cfg(test)]
+    record_dir_override: Option<PathBuf>,
 }
 
 fn default_persist_status(paths: &PersistPaths) -> PersistStatus {
@@ -635,13 +738,21 @@ impl App {
             pbo_state: MailboxState::Unsupported,
             mailbox_note: None,
             status_flash: None,
+            last_alert: None,
+            board_info: crate::output::detected_board_info().clone(),
             tune_selected: 0,
             staged: HashMap::new(),
+            board_caps: BTreeMap::new(),
             allow_extreme: false,
             confirm_modal: None,
             snapshot_store: SnapshotStore::default(),
             persist_paths,
             persist_status,
+            recorder: None,
+            record_started: None,
+            record_format: RecordFormat::Csv,
+            #[cfg(test)]
+            record_dir_override: None,
         }
     }
 
@@ -693,6 +804,16 @@ impl App {
         match pm_table::read_telemetry(transport, hw) {
             Ok(snap) => {
                 self.history.record(&snap);
+                if let Some(ref mut rec) = self.recorder {
+                    if let Err(err) = rec.write_snapshot(&snap) {
+                        self.recorder = None;
+                        self.record_started = None;
+                        self.set_flash_kind(
+                            format!("Recording stopped (write error: {err})"),
+                            FlashKind::Error,
+                        );
+                    }
+                }
                 self.telemetry = Some(snap);
                 self.telemetry_error = None;
                 self.sample_count = self.sample_count.saturating_add(1);
@@ -701,6 +822,88 @@ impl App {
                 self.telemetry_error = Some(err.to_string());
             }
         }
+    }
+
+    fn toggle_recording(&mut self, hw: &HardwareContext) {
+        if let Some(mut rec) = self.recorder.take() {
+            self.record_started = None;
+            let flush_res = rec.flush();
+            let stats = rec.stats();
+            match flush_res {
+                Ok(()) => {
+                    self.set_flash_kind(
+                        format!(
+                            "Saved {} samples -> {}",
+                            stats.samples_written,
+                            stats.path.display()
+                        ),
+                        FlashKind::Success,
+                    );
+                }
+                Err(err) => {
+                    self.set_flash_kind(format!("Recording flush error: {err}"), FlashKind::Error);
+                }
+            }
+            return;
+        }
+
+        #[cfg(test)]
+        let path = if let Some(ref dir) = self.record_dir_override {
+            dir.join(format!(
+                "zensmu-{}.{}",
+                hw.codename.slug(),
+                self.record_format.extension()
+            ))
+        } else {
+            recorder::default_recording_path(hw.codename, self.record_format)
+        };
+        #[cfg(not(test))]
+        let path = recorder::default_recording_path(hw.codename, self.record_format);
+
+        let config = RecordConfig {
+            path,
+            format: self.record_format,
+            append: false,
+            max_file_bytes: None,
+            max_rotated_files: 0,
+            flush_every: 1,
+            tag: None,
+        };
+
+        match TelemetryRecorder::open(config) {
+            Ok(rec) => {
+                let path_str = rec.path().display().to_string();
+                let fmt_label = self.record_format.as_str().to_ascii_uppercase();
+                self.recorder = Some(rec);
+                self.record_started = Some(Instant::now());
+                self.set_flash_kind(
+                    format!("Recording telemetry ({fmt_label}) -> {path_str}"),
+                    FlashKind::Success,
+                );
+            }
+            Err(err) => {
+                self.set_flash_kind(
+                    format!("Failed to start recording: {err}"),
+                    FlashKind::Error,
+                );
+            }
+        }
+    }
+
+    fn cycle_record_format(&mut self) {
+        if self.recorder.is_some() {
+            self.set_flash_kind("Stop recording (w) before changing format", FlashKind::Warn);
+            return;
+        }
+        self.record_format = match self.record_format {
+            RecordFormat::Csv => RecordFormat::Jsonl,
+            RecordFormat::Jsonl => RecordFormat::Pts,
+            RecordFormat::Pts => RecordFormat::Csv,
+        };
+        self.set_flash(format!(
+            "Record format: {}",
+            self.record_format.as_str().to_ascii_uppercase()
+        ));
     }
 
     fn refresh_mailbox(&mut self, transport: &dyn SmuTransport, hw: &HardwareContext) {
@@ -812,9 +1015,26 @@ impl App {
         if !pbo_params.iter().any(|(supported, _)| *supported) {
             return;
         }
+        let pbo_hint = match self.pbo_state.as_loaded() {
+            Some(pbo) => {
+                let mut parts = Vec::new();
+                if let Some(tdp) = pbo.fused.tdp_w {
+                    parts.push(format!("TDP {tdp}W"));
+                }
+                if let Some(tjmax) = pbo.fused.tjmax_c {
+                    parts.push(format!("TjMax {tjmax}°C"));
+                }
+                if parts.is_empty() {
+                    format!("Tctl max {}°C", pbo::TCTL_MAX_C)
+                } else {
+                    parts.join(" · ")
+                }
+            }
+            None => format!("Tctl max {}°C", pbo::TCTL_MAX_C),
+        };
         rows.push(TuneRow::SectionHeader(
             TuneSection::Pbo.title().to_string(),
-            format!("Tctl max {}°C", pbo::TCTL_MAX_C),
+            pbo_hint,
         ));
         for (supported, param) in pbo_params {
             if supported {
@@ -1982,13 +2202,32 @@ impl App {
                         self.staged.clear();
                     }
                 }
+                self.last_alert = None;
                 self.set_flash_kind(
                     format!("Applied {n} SMU operation(s) & verified"),
                     FlashKind::Success,
                 );
             }
+            Err(Error::HardwareClamped { summary, clamped }) => {
+                for item in &clamped {
+                    if let Some(param) = tune_param_from_clamped_field(&item.field) {
+                        self.board_caps.insert(param, item.actual_value);
+                    }
+                }
+                self.refresh_all(transport, hw);
+                self.staged.clear();
+                let msg = format!("Board/BIOS cap hit: {summary} (check BIOS PBO Limits)");
+                self.last_alert = Some((msg.clone(), FlashKind::Warn));
+                self.set_flash_kind(msg, FlashKind::Warn);
+            }
             Err(err) => {
-                self.set_flash_kind(format!("SMU apply failed: {err}"), FlashKind::Error);
+                let msg = if err.suggests_report() {
+                    format!("SMU apply failed: {err} · run 'zensmu report --open'")
+                } else {
+                    format!("SMU apply failed: {err}")
+                };
+                self.last_alert = Some((msg.clone(), FlashKind::Error));
+                self.set_flash_kind(msg, FlashKind::Error);
             }
         }
     }
@@ -2109,6 +2348,8 @@ impl App {
                 self.clamp_tune_selection(hw);
             }
             KeyCode::Char('p') | KeyCode::Char(' ') => self.toggle_pause(),
+            KeyCode::Char('w') => self.toggle_recording(hw),
+            KeyCode::Char('W') => self.cycle_record_format(),
             KeyCode::Char('r') => self.refresh_all(transport, hw),
             KeyCode::Char('+') | KeyCode::Char('=') => {
                 self.interval_ms = adjust_interval_ms(self.interval_ms, true);
@@ -2280,6 +2521,10 @@ pub fn run_tui(
             app.poll_telemetry(transport, hw);
             last_tick = Instant::now();
         }
+    }
+
+    if let Some(mut rec) = app.recorder.take() {
+        let _ = rec.flush();
     }
 
     Ok(())
@@ -2633,6 +2878,21 @@ fn draw_header_top_row(frame: &mut Frame, area: Rect, app: &App, hw: &HardwareCo
         Span::raw(" "),
     ];
 
+    if let Some(ref rec) = app.recorder {
+        let elapsed_secs = app
+            .record_started
+            .map(|t| t.elapsed().as_secs())
+            .unwrap_or(0);
+        let mins = elapsed_secs / 60;
+        let secs = elapsed_secs % 60;
+        let samples = rec.stats().samples_written;
+        right_spans.push(badge_span(
+            format!(" ● REC {mins:02}:{secs:02} ({samples}) "),
+            palette::RED,
+        ));
+        right_spans.push(Span::raw(" "));
+    }
+
     if app.allow_extreme {
         right_spans.push(badge_span(" EXTREME ", palette::ORANGE));
         right_spans.push(Span::raw(" "));
@@ -2652,7 +2912,13 @@ fn draw_header_top_row(frame: &mut Frame, area: Rect, app: &App, hw: &HardwareCo
     };
     right_spans.push(badge_span(priv_label, priv_bg));
 
-    let right_w = if area.width < 92 { 44 } else { 62 };
+    let base_right_w: u16 = if area.width < 92 { 44 } else { 62 };
+    let needed_right_w: u16 = right_spans
+        .iter()
+        .map(|s| s.width() as u16)
+        .fold(0u16, u16::saturating_add);
+    let max_right_w = area.width.saturating_sub(18);
+    let right_w = needed_right_w.max(base_right_w).min(max_right_w);
     let row1_split = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([Constraint::Min(18), Constraint::Length(right_w)])
@@ -2784,11 +3050,13 @@ fn draw_footer(frame: &mut Frame, area: Rect, app: &App) {
         left.extend(keycap("R/B/Z", "Reset"));
         left.extend(keycap("P", "Persist+Enable"));
         left.extend(keycap("E", "Toggle Service"));
+        left.extend(keycap("w", "Rec"));
     } else {
         left.extend(keycap("q", "Quit"));
         left.extend(keycap("Tab/1-4", "Views"));
         left.extend(keycap("t", "Tune"));
         left.extend(keycap("p", "Pause"));
+        left.extend(keycap("w", "Rec"));
         left.extend(keycap("r", "Refresh"));
         left.extend(keycap("+/-", "Int"));
         left.extend(keycap("?", "Help"));
@@ -2830,17 +3098,25 @@ fn draw_footer(frame: &mut Frame, area: Rect, app: &App) {
         )])
     };
 
-    let right_w = if let Some((flash, _)) = app.active_flash() {
+    let (left_min, right_w) = if let Some((flash, kind)) = app.active_flash() {
         let needed = (flash.chars().count() as u16).saturating_add(2);
-        needed.clamp(16, (area.width / 2).clamp(24, 58))
+        match kind {
+            FlashKind::Warn | FlashKind::Error => {
+                let max_w = area.width.saturating_sub(12).max(16);
+                (12u16.min(area.width), needed.clamp(16, max_w))
+            }
+            FlashKind::Info | FlashKind::Success => {
+                (30u16, needed.clamp(16, (area.width / 2).clamp(24, 58)))
+            }
+        }
     } else if app.active_tab == ViewTab::Tune && app.staged_count() > 0 {
-        28
+        (30u16, 28)
     } else {
-        16
+        (30u16, 16)
     };
     let cols = Layout::default()
         .direction(Direction::Horizontal)
-        .constraints([Constraint::Min(30), Constraint::Length(right_w)])
+        .constraints([Constraint::Min(left_min), Constraint::Length(right_w)])
         .split(area);
 
     frame.render_widget(
@@ -3398,7 +3674,7 @@ fn draw_locked_mailbox_banner(frame: &mut Frame, area: Rect, note: &str) {
 
 fn build_pbo_summary_line<'a>(app: &'a App, hw: &'a HardwareContext) -> Line<'a> {
     if let Some(pbo) = app.pbo_state.as_loaded() {
-        Line::from(vec![
+        let mut spans = vec![
             Span::styled("Scalar ", Style::default().fg(palette::MUTED)),
             Span::styled(
                 format_opt_f32(pbo.scalar, 2, "x"),
@@ -3413,13 +3689,37 @@ fn build_pbo_summary_line<'a>(app: &'a App, hw: &'a HardwareContext) -> Line<'a>
                     .fg(palette::TEAL)
                     .add_modifier(Modifier::BOLD),
             ),
+        ];
+        if let Some(tdp) = pbo.fused.tdp_w {
+            spans.push(Span::styled("  TDP ", Style::default().fg(palette::MUTED)));
+            spans.push(Span::styled(
+                format!("{tdp}W"),
+                Style::default()
+                    .fg(palette::CYAN)
+                    .add_modifier(Modifier::BOLD),
+            ));
+        }
+        if let Some(tjmax) = pbo.fused.tjmax_c {
+            spans.push(Span::styled(
+                "  TjMax ",
+                Style::default().fg(palette::MUTED),
+            ));
+            spans.push(Span::styled(
+                format!("{tjmax}°C"),
+                Style::default()
+                    .fg(palette::ORANGE)
+                    .add_modifier(Modifier::BOLD),
+            ));
+        }
+        spans.extend([
             Span::raw("  "),
             flag_pill("OC", pbo.flags.overclockable),
             Span::raw(" "),
             flag_pill("EXPO", pbo.flags.expo_active),
             Span::raw(" "),
             flag_pill("LN2", pbo.flags.ln2_mode),
-        ])
+        ]);
+        Line::from(spans)
     } else {
         Line::from(vec![
             Span::styled("PBO: ", Style::default().fg(palette::MUTED)),
@@ -4226,6 +4526,17 @@ fn draw_fused_pbo_table(frame: &mut Frame, area: Rect, app: &App, hw: &HardwareC
                     palette::TEAL,
                 ),
             ];
+            if pbo.fused.tdp_w.is_some() || pbo.fused.tjmax_c.is_some() {
+                rows.push(kv_row(
+                    "Fused TDP / TjMax",
+                    format!(
+                        "{} / {}",
+                        format_opt_u32(pbo.fused.tdp_w, "W"),
+                        format_opt_u32(pbo.fused.tjmax_c, "°C"),
+                    ),
+                    palette::ORANGE,
+                ));
+            }
             if pbo.fused.soc_tdc_a.is_some() {
                 rows.push(kv_row(
                     "Fused SoC TDC",
@@ -4381,7 +4692,7 @@ fn format_live_param_display(app: &App, param: TuneParam) -> String {
         .unwrap_or_else(|| "—".to_string())
 }
 
-fn param_bounds_summary(app: &App, param: TuneParam, hw: &HardwareContext) -> String {
+fn param_base_bounds_summary(app: &App, param: TuneParam, hw: &HardwareContext) -> String {
     match param {
         TuneParam::CoAll | TuneParam::CoCore(_) => hw
             .capabilities
@@ -4478,6 +4789,44 @@ fn param_bounds_summary(app: &App, param: TuneParam, hw: &HardwareContext) -> St
     }
 }
 
+fn param_bounds_summary(app: &App, param: TuneParam, hw: &HardwareContext) -> String {
+    let mut base = param_base_bounds_summary(app, param, hw);
+    if let Some(&cap) = app.board_caps.get(&param) {
+        base.push_str(&format!(" · {}", format_board_cap(param, cap)));
+    }
+    base
+}
+
+fn estimate_wrapped_lines(text: &str, width: usize) -> usize {
+    if width == 0 {
+        return 1;
+    }
+    let mut lines = 1usize;
+    let mut col = 0usize;
+    for word in text.split_whitespace() {
+        let wlen = word.chars().count();
+        if col == 0 {
+            if wlen > width {
+                lines += wlen.saturating_sub(1) / width;
+                col = ((wlen - 1) % width) + 1;
+            } else {
+                col = wlen;
+            }
+        } else if col + 1 + wlen <= width {
+            col += 1 + wlen;
+        } else {
+            lines += 1;
+            if wlen > width {
+                lines += wlen.saturating_sub(1) / width;
+                col = ((wlen - 1) % width) + 1;
+            } else {
+                col = wlen;
+            }
+        }
+    }
+    lines
+}
+
 fn draw_tune_tab(frame: &mut Frame, area: Rect, app: &App, hw: &HardwareContext) {
     let rows = Layout::default()
         .direction(Direction::Vertical)
@@ -4494,9 +4843,17 @@ fn draw_tune_tab(frame: &mut Frame, area: Rect, app: &App, hw: &HardwareContext)
         draw_tune_param_list(frame, cols[0], app, hw);
         draw_tune_inspector_pane(frame, cols[1], app, hw);
     } else {
+        let compact_h = if let Some((ref msg, _)) = app.last_alert {
+            let inner_w = rows[1].width.saturating_sub(4).max(12) as usize;
+            let alert_lines =
+                estimate_wrapped_lines(&format!("Last Event: {msg}"), inner_w).clamp(1, 4) as u16;
+            (4 + alert_lines).min(rows[1].height.saturating_sub(5).max(4))
+        } else {
+            4
+        };
         let split = Layout::default()
             .direction(Direction::Vertical)
-            .constraints([Constraint::Min(6), Constraint::Length(4)])
+            .constraints([Constraint::Min(5), Constraint::Length(compact_h)])
             .split(rows[1]);
         draw_tune_param_list(frame, split[0], app, hw);
         draw_tune_compact_bar(frame, split[1], app, hw);
@@ -4761,8 +5118,14 @@ fn format_staged_cell(
 ) -> Cell<'static> {
     if let Some(sv) = staged_val {
         let exceeds = app.param_exceeds_soft_limit(param, sv, hw);
+        let exceeds_cap = app
+            .board_caps
+            .get(&param)
+            .is_some_and(|&cap| sv.as_int().is_some_and(|v| v > cap as i32));
         let suffix = if exceeds && !app.allow_extreme {
             " [!soft]"
+        } else if exceeds_cap {
+            " [!cap]"
         } else if exceeds {
             " [EXT]"
         } else {
@@ -4770,11 +5133,19 @@ fn format_staged_cell(
         };
         let col = if exceeds && !app.allow_extreme {
             palette::RED
+        } else if exceeds_cap {
+            palette::YELLOW
         } else {
             palette::ORANGE
         };
         Cell::from(format!("→ {}{suffix}", format_tune_value(param, sv)))
             .style(Style::default().fg(col).add_modifier(Modifier::BOLD))
+    } else if let Some(&cap) = app.board_caps.get(&param) {
+        Cell::from(format!("· {}", format_board_cap(param, cap))).style(
+            Style::default()
+                .fg(palette::ORANGE)
+                .add_modifier(Modifier::BOLD),
+        )
     } else if is_selected {
         Cell::from("←/→ adjust").style(Style::default().fg(palette::CYAN))
     } else {
@@ -4931,17 +5302,52 @@ fn draw_tune_param_list(frame: &mut Frame, area: Rect, app: &App, hw: &HardwareC
 }
 
 fn draw_tune_inspector_pane(frame: &mut Frame, area: Rect, app: &App, hw: &HardwareContext) {
+    if let Some((ref msg, kind)) = app.last_alert {
+        let inner_w = area.width.saturating_sub(4).max(12) as usize;
+        let alert_h = (estimate_wrapped_lines(msg, inner_w).clamp(1, 5) as u16) + 2;
+        let constraints = if area.height >= 26 {
+            [
+                Constraint::Length(alert_h),
+                Constraint::Length(10),
+                Constraint::Length(7),
+                Constraint::Min(5),
+            ]
+        } else {
+            [
+                Constraint::Length(alert_h.min(area.height / 2).max(3)),
+                Constraint::Percentage(36),
+                Constraint::Percentage(32),
+                Constraint::Percentage(32),
+            ]
+        };
+        let chunks = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints(constraints)
+            .split(area);
+
+        draw_last_event_card(frame, chunks[0], msg, kind);
+        draw_selected_param_card(frame, chunks[1], app, hw);
+        draw_boot_persistence_card(frame, chunks[2], app);
+        draw_safety_actions_card(frame, chunks[3], app);
+        return;
+    }
+
+    let persist_h = if app.persist_status.boot_guard_tripped {
+        9
+    } else {
+        8
+    };
     let constraints = if area.height >= 26 {
         [
-            Constraint::Length(9),
-            Constraint::Length(9),
+            Constraint::Length(11),
+            Constraint::Length(persist_h),
             Constraint::Min(8),
         ]
     } else {
         [
-            Constraint::Percentage(33),
-            Constraint::Percentage(34),
-            Constraint::Percentage(33),
+            Constraint::Percentage(36),
+            Constraint::Percentage(32),
+            Constraint::Percentage(32),
         ]
     };
     let chunks = Layout::default()
@@ -4952,6 +5358,27 @@ fn draw_tune_inspector_pane(frame: &mut Frame, area: Rect, app: &App, hw: &Hardw
     draw_selected_param_card(frame, chunks[0], app, hw);
     draw_boot_persistence_card(frame, chunks[1], app);
     draw_safety_actions_card(frame, chunks[2], app);
+}
+
+fn draw_last_event_card(frame: &mut Frame, area: Rect, msg: &str, kind: FlashKind) {
+    let accent = match kind {
+        FlashKind::Warn => palette::YELLOW,
+        FlashKind::Error => palette::RED,
+        FlashKind::Success => palette::GREEN,
+        FlashKind::Info => palette::TEAL,
+    };
+    let block = styled_block(" Last Event ", accent)
+        .border_style(Style::default().fg(accent))
+        .padding(Padding::horizontal(1));
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+
+    let para = Paragraph::new(Line::from(Span::styled(
+        msg,
+        Style::default().fg(accent).add_modifier(Modifier::BOLD),
+    )))
+    .wrap(Wrap { trim: true });
+    frame.render_widget(para, inner);
 }
 
 fn draw_selected_param_card(frame: &mut Frame, area: Rect, app: &App, hw: &HardwareContext) {
@@ -4970,7 +5397,21 @@ fn draw_selected_param_card(frame: &mut Frame, area: Rect, app: &App, hw: &Hardw
         .map(|v| format_tune_value(param, *v))
         .unwrap_or_else(|| "(unchanged)".to_string());
     let (fine, coarse) = App::param_steps(param);
-    let bounds = param_bounds_summary(app, param, hw);
+    let base_bounds = param_base_bounds_summary(app, param, hw);
+    let board_cap = app.board_caps.get(&param).copied();
+
+    let mut bounds_spans = vec![
+        Span::styled("Bounds:  ", Style::default().fg(palette::MUTED)),
+        Span::styled(base_bounds, Style::default().fg(palette::FG)),
+    ];
+    if let Some(cap) = board_cap {
+        bounds_spans.push(Span::styled(
+            format!(" · {}", format_board_cap(param, cap)),
+            Style::default()
+                .fg(palette::ORANGE)
+                .add_modifier(Modifier::BOLD),
+        ));
+    }
 
     let mut lines = vec![
         Line::from(Span::styled(
@@ -5003,10 +5444,7 @@ fn draw_selected_param_card(frame: &mut Frame, area: Rect, app: &App, hw: &Hardw
                 }),
             ),
         ]),
-        Line::from(vec![
-            Span::styled("Bounds:  ", Style::default().fg(palette::MUTED)),
-            Span::styled(bounds, Style::default().fg(palette::FG)),
-        ]),
+        Line::from(bounds_spans),
         Line::from(vec![
             Span::styled("Step:    ", Style::default().fg(palette::MUTED)),
             Span::styled(
@@ -5025,6 +5463,26 @@ fn draw_selected_param_card(frame: &mut Frame, area: Rect, app: &App, hw: &Hardw
                     .add_modifier(Modifier::BOLD),
             )));
         }
+    }
+
+    if let Some(cap) = board_cap {
+        let unit = param_unit(param);
+        let cap_label = if unit.is_empty() {
+            format!("Board cap ≤{cap}")
+        } else {
+            format!("Board cap ≤{cap} {unit}")
+        };
+        lines.push(Line::from(Span::styled(
+            format!("! {cap_label} (check BIOS PBO Limits)"),
+            Style::default()
+                .fg(palette::YELLOW)
+                .add_modifier(Modifier::BOLD),
+        )));
+    } else if matches!(param.section(), TuneSection::Pbo | TuneSection::Apu) {
+        lines.push(Line::from(Span::styled(
+            crate::output::format_board_vrm_note(&app.board_info),
+            Style::default().fg(palette::MUTED),
+        )));
     }
 
     frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: true }), inner);
@@ -5118,10 +5576,12 @@ fn draw_boot_persistence_card(frame: &mut Frame, area: Rect, app: &App) {
             Span::styled("  ·  Guard: ", Style::default().fg(palette::MUTED)),
             guard_span,
         ]),
-        Line::from(""),
-        tune_key_line("P", "Persist live & enable service"),
-        tune_key_line("E", toggle_desc),
     ];
+    if inner.height > 5 {
+        persist_lines.push(Line::from(""));
+    }
+    persist_lines.push(tune_key_line("P", "Persist live & enable service"));
+    persist_lines.push(tune_key_line("E", toggle_desc));
     if ps.boot_guard_tripped {
         persist_lines.push(tune_key_line("C", "Clear boot guard"));
     }
@@ -5155,7 +5615,7 @@ fn draw_safety_actions_card(frame: &mut Frame, area: Rect, app: &App) {
         Span::styled("LOCKED (sudo)", Style::default().fg(palette::YELLOW))
     };
 
-    let action_lines = vec![
+    let mut action_lines = vec![
         Line::from(vec![
             Span::styled("Writes:  ", Style::default().fg(palette::MUTED)),
             write_span,
@@ -5181,6 +5641,12 @@ fn draw_safety_actions_card(frame: &mut Frame, area: Rect, app: &App) {
         tune_key_line("R / B / Z", "Rollback · Baseline · CO=0"),
         tune_key_line("s", "Save live TOML profile"),
     ];
+    if inner.height >= 8 {
+        action_lines.push(Line::from(Span::styled(
+            crate::output::format_board_vrm_note(&app.board_info),
+            Style::default().fg(palette::DIM),
+        )));
+    }
 
     frame.render_widget(
         Paragraph::new(action_lines).wrap(Wrap { trim: true }),
@@ -5270,12 +5736,25 @@ fn draw_tune_compact_bar(frame: &mut Frame, area: Rect, app: &App, hw: &Hardware
         key_spans.push(Span::styled(":ClrGuard", Style::default().fg(palette::RED)));
     }
 
-    let lines = vec![
-        Line::from(Span::styled(sel_info, Style::default().fg(palette::CYAN))),
-        Line::from(key_spans),
-    ];
+    let mut lines = vec![Line::from(Span::styled(
+        sel_info,
+        Style::default().fg(palette::CYAN),
+    ))];
+    if let Some((ref msg, kind)) = app.last_alert {
+        let col = match kind {
+            FlashKind::Warn => palette::YELLOW,
+            FlashKind::Error => palette::RED,
+            FlashKind::Success => palette::GREEN,
+            FlashKind::Info => palette::TEAL,
+        };
+        lines.push(Line::from(Span::styled(
+            format!("Last Event: {msg}"),
+            Style::default().fg(col).add_modifier(Modifier::BOLD),
+        )));
+    }
+    lines.push(Line::from(key_spans));
 
-    frame.render_widget(Paragraph::new(lines), inner);
+    frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: true }), inner);
 }
 
 fn tune_key_line<'a>(key: &'a str, desc: &'a str) -> Line<'a> {
@@ -5535,6 +6014,8 @@ fn draw_help_popup(frame: &mut Frame, root: Rect) {
         help_entry("t", "Jump straight to [4:Tune] from any tab"),
         help_entry("Tab / Shift+Tab", "Cycle forward / backward through views"),
         help_entry("p / Space", "Pause or resume live PM table polling"),
+        help_entry("w", "Start or stop live telemetry recording (unprivileged)"),
+        help_entry("W", "Cycle recording format (CSV / JSONL / PTS) when idle"),
         help_entry(
             "r",
             "Force refresh of PM telemetry and SMU mailbox readback",
@@ -6512,5 +6993,207 @@ mod tests {
         let (msg, kind) = app.active_flash().expect("clear guard success flash");
         assert_eq!(kind, FlashKind::Success);
         assert!(msg.contains("Cleared boot-loop"));
+    }
+
+    #[test]
+    fn tune_hardware_clamped_records_board_caps_and_renders_untruncated_warning() {
+        let (transport, hw) = mock_9700x();
+        transport.set_clamp_tdc_a(Some(100));
+        transport.set_clamp_edc_a(Some(120));
+        transport.set_sustained_power_thm_raw(0x0069_005A); // 105 W TDP, 90 °C TjMax
+
+        let tmp = tempfile::tempdir().unwrap();
+        let mut app = App::new(500);
+        app.test_allow_writes = true;
+        app.snapshot_store = SnapshotStore::new(tmp.path().join("state"));
+        app.board_info = SystemBoardInfo {
+            board_vendor: Some("Gigabyte Technology Co., Ltd.".into()),
+            board_name: Some("B450M DS3H V2".into()),
+            bios_version: Some("F66".into()),
+            ..Default::default()
+        };
+        app.poll_telemetry(&transport, &hw);
+        app.refresh_mailbox(&transport, &hw);
+
+        // Verify proactive board/BIOS VRM note is shown on PBO param before any clamp occurs
+        app.active_tab = ViewTab::Tune;
+        let params = app.tune_params(&hw);
+        app.tune_selected = params.iter().position(|p| *p == TuneParam::PboPpt).unwrap();
+        {
+            let backend = TestBackend::new(120, 36);
+            let mut terminal = Terminal::new(backend).unwrap();
+            terminal.draw(|f| draw_ui(f, &app, &hw)).unwrap();
+            let pre_text = buffer_text(&terminal);
+            assert!(
+                pre_text.contains("B450M")
+                    && pre_text.contains("DS3H V2")
+                    && pre_text.contains("BIOS F66")
+                    && pre_text.contains("BIOS PBO Limits")
+                    && pre_text.contains("PPT/TDC/EDC"),
+                "expected proactive board/BIOS VRM note before clamp:\n{pre_text}"
+            );
+            assert!(
+                pre_text.contains("TDP 105W") && pre_text.contains("TjMax 90°C"),
+                "expected fused TDP & TjMax in Tune PBO section header:\n{pre_text}"
+            );
+        }
+
+        // Verify Overview and CO/Shaper tabs show TDP & TjMax
+        {
+            let backend = TestBackend::new(120, 36);
+            let mut terminal = Terminal::new(backend).unwrap();
+            app.active_tab = ViewTab::Overview;
+            terminal.draw(|f| draw_ui(f, &app, &hw)).unwrap();
+            let over_text = buffer_text(&terminal);
+            assert!(
+                over_text.contains("105W") && over_text.contains("90°C"),
+                "expected TDP/TjMax in Overview PBO summary:\n{over_text}"
+            );
+
+            app.active_tab = ViewTab::CoShaper;
+            terminal.draw(|f| draw_ui(f, &app, &hw)).unwrap();
+            let co_text = buffer_text(&terminal);
+            assert!(
+                co_text.contains("Fused TDP / TjMax") && co_text.contains("105 W / 90 °C"),
+                "expected Fused TDP / TjMax in CO/Shaper fused PBO table:\n{co_text}"
+            );
+        }
+
+        // Stage PBO PPT=142W (not clamped), TDC=140A (clamped to 100A), EDC=220A (clamped to 120A)
+        app.active_tab = ViewTab::Tune;
+        app.allow_extreme = true;
+        app.staged.insert(TuneParam::PboPpt, TuneValue::Int(142));
+        app.staged.insert(TuneParam::PboTdc, TuneValue::Int(140));
+        app.staged.insert(TuneParam::PboEdc, TuneValue::Int(220));
+
+        let press = |code| KeyEvent::new(code, KeyModifiers::NONE);
+        app.handle_key(press(KeyCode::Char('a')), &transport, &hw);
+        assert!(app.confirm_modal.is_some());
+        app.handle_key(press(KeyCode::Char('y')), &transport, &hw);
+
+        // Modal closed, staged cleared, board_caps recorded for both clamped params
+        assert!(app.confirm_modal.is_none());
+        assert!(app.staged.is_empty());
+        assert_eq!(app.board_caps.get(&TuneParam::PboPpt), None);
+        assert_eq!(app.board_caps.get(&TuneParam::PboTdc), Some(&100));
+        assert_eq!(app.board_caps.get(&TuneParam::PboEdc), Some(&120));
+
+        let expected_msg = "Board/BIOS cap hit: pbo.tdc_a (req 140 A -> cap 100 A), pbo.edc_a (req 220 A -> cap 120 A) (check BIOS PBO Limits)";
+        let (flash_msg, flash_kind) = app.active_flash().expect("board-cap warning flash");
+        assert_eq!(flash_kind, FlashKind::Warn);
+        assert_eq!(flash_msg, expected_msg);
+        assert_eq!(
+            app.last_alert.as_ref(),
+            Some(&(expected_msg.to_string(), FlashKind::Warn))
+        );
+
+        // param_bounds_summary includes learned board cap
+        let edc_bounds = param_bounds_summary(&app, TuneParam::PboEdc, &hw);
+        assert!(
+            edc_bounds.contains("board cap ≤120 A"),
+            "expected board cap in bounds summary, got: {edc_bounds}"
+        );
+
+        // Select PboEdc and render at both 120x36 and 80x24: verify learned cap + full untruncated warning
+        app.tune_selected = params.iter().position(|p| *p == TuneParam::PboEdc).unwrap();
+        for (w, h) in [(120u16, 36u16), (80, 24)] {
+            let backend = TestBackend::new(w, h);
+            let mut terminal = Terminal::new(backend).unwrap();
+            terminal.draw(|f| draw_ui(f, &app, &hw)).unwrap();
+            let text = buffer_text(&terminal);
+            assert!(
+                text.contains("board cap ≤120 A"),
+                "expected learned board cap hint at {w}x{h}:\n{text}"
+            );
+            assert!(
+                text.contains("Board/BIOS cap hit:")
+                    && text.contains("pbo.tdc_a")
+                    && text.contains("100 A")
+                    && text.contains("pbo.edc_a")
+                    && text.contains("120 A")
+                    && text.contains("BIOS PBO Limits"),
+                "expected full board-cap warning without truncation at {w}x{h}:\n{text}"
+            );
+        }
+    }
+
+    #[test]
+    fn tui_recording_toggle_writes_and_saves_valid_csv() {
+        let dir = tempfile::tempdir().unwrap();
+        let (transport, hw) = mock_9700x();
+        let mut app = App::new(500);
+        // Explicitly unprivileged: telemetry recording must work without root!
+        app.is_root = false;
+        app.test_allow_writes = false;
+        app.record_dir_override = Some(dir.path().to_path_buf());
+
+        let press = |code| KeyEvent::new(code, KeyModifiers::NONE);
+
+        // Press 'w' to start recording in default CSV format
+        assert!(!app.handle_key(press(KeyCode::Char('w')), &transport, &hw));
+        assert!(app.recorder.is_some());
+        assert!(app.record_started.is_some());
+        let rec_path = app.recorder.as_ref().unwrap().path().to_path_buf();
+        let (start_flash, start_kind) = app.active_flash().expect("recording start flash");
+        assert_eq!(start_kind, FlashKind::Success);
+        assert!(
+            start_flash.contains("Recording telemetry (CSV) ->"),
+            "unexpected start flash: {start_flash}"
+        );
+
+        // Pressing Shift+W while recording must not change format
+        assert!(!app.handle_key(press(KeyCode::Char('W')), &transport, &hw));
+        assert_eq!(app.record_format, RecordFormat::Csv);
+
+        // Poll 3 telemetry samples while recording
+        app.poll_telemetry(&transport, &hw);
+        app.poll_telemetry(&transport, &hw);
+        app.poll_telemetry(&transport, &hw);
+        assert_eq!(app.recorder.as_ref().unwrap().stats().samples_written, 3);
+
+        // Render UI and verify red REC badge and w:Rec keycap appear
+        let backend = TestBackend::new(120, 36);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|f| draw_ui(f, &app, &hw)).unwrap();
+        let rendered = buffer_text(&terminal);
+        assert!(
+            rendered.contains("● REC") && rendered.contains("(3)"),
+            "expected REC badge with sample count in top bar:\n{rendered}"
+        );
+        assert!(
+            rendered.contains("w:Rec"),
+            "expected w:Rec keycap in footer:\n{rendered}"
+        );
+
+        // Press 'w' again (even from another tab!) to stop, flush, and save
+        app.active_tab = ViewTab::Tune;
+        assert!(!app.handle_key(press(KeyCode::Char('w')), &transport, &hw));
+        assert!(app.recorder.is_none());
+        assert!(app.record_started.is_none());
+        let (stop_flash, stop_kind) = app.active_flash().expect("recording stop flash");
+        assert_eq!(stop_kind, FlashKind::Success);
+        assert!(
+            stop_flash.contains("Saved 3 samples ->"),
+            "unexpected stop flash: {stop_flash}"
+        );
+
+        // Verify saved CSV file contains header + 3 valid rows
+        let content = std::fs::read_to_string(&rec_path).unwrap();
+        let lines: Vec<&str> = content.lines().collect();
+        assert_eq!(lines.len(), 4, "expected CSV header + 3 rows:\n{content}");
+        assert_eq!(lines[0], recorder::CSV_HEADER);
+        let expected_cols = recorder::CSV_HEADER.split(',').count();
+        for row in &lines[1..] {
+            assert_eq!(row.split(',').count(), expected_cols);
+            assert!(row.contains("granite-ridge"), "row missing codename: {row}");
+        }
+
+        // When idle, Shift+W cycles CSV -> JSONL -> PTS -> CSV
+        assert!(!app.handle_key(press(KeyCode::Char('W')), &transport, &hw));
+        assert_eq!(app.record_format, RecordFormat::Jsonl);
+        assert!(!app.handle_key(press(KeyCode::Char('W')), &transport, &hw));
+        assert_eq!(app.record_format, RecordFormat::Pts);
+        assert!(!app.handle_key(press(KeyCode::Char('W')), &transport, &hw));
+        assert_eq!(app.record_format, RecordFormat::Csv);
     }
 }

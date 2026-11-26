@@ -39,6 +39,13 @@ struct MockState {
     fused_vdd_tdc_a: u32,
     fused_edc_a: u32,
     fused_apu_slow_w: u32,
+    /// Raw `GetSustainedPowerAndThmLimit` word (`(tdp_w << 16) | tjmax_c`)
+    sustained_power_thm_raw: u32,
+    /// Optional simulated motherboard/BIOS ceilings for hardware clamp tests
+    clamp_ppt_w: Option<u32>,
+    clamp_tdc_a: Option<u32>,
+    clamp_edc_a: Option<u32>,
+    clamp_stapm_w: Option<u32>,
     /// Flags
     overclockable: bool,
     expo_active: bool,
@@ -105,6 +112,11 @@ impl MockTransport {
                 fused_vdd_tdc_a: 75,
                 fused_edc_a: 150,
                 fused_apu_slow_w: 65,
+                sustained_power_thm_raw: (65 << 16) | 95,
+                clamp_ppt_w: None,
+                clamp_tdc_a: None,
+                clamp_edc_a: None,
+                clamp_stapm_w: None,
                 overclockable: true,
                 expo_active: true,
                 ln2_mode: false,
@@ -176,6 +188,11 @@ impl MockTransport {
                 fused_vdd_tdc_a: 40,
                 fused_edc_a: 75,
                 fused_apu_slow_w: 30,
+                sustained_power_thm_raw: (28 << 16) | 100,
+                clamp_ppt_w: None,
+                clamp_tdc_a: None,
+                clamp_edc_a: None,
+                clamp_stapm_w: None,
                 overclockable: true,
                 expo_active: false,
                 ln2_mode: false,
@@ -197,6 +214,26 @@ impl MockTransport {
 
     pub fn set_simulate_false_ok_bug(&self, enabled: bool) {
         self.lock_state().simulate_driver_false_ok_bug = enabled;
+    }
+
+    pub fn set_sustained_power_thm_raw(&self, raw: u32) {
+        self.lock_state().sustained_power_thm_raw = raw;
+    }
+
+    pub fn set_clamp_ppt_w(&self, cap: Option<u32>) {
+        self.lock_state().clamp_ppt_w = cap;
+    }
+
+    pub fn set_clamp_tdc_a(&self, cap: Option<u32>) {
+        self.lock_state().clamp_tdc_a = cap;
+    }
+
+    pub fn set_clamp_edc_a(&self, cap: Option<u32>) {
+        self.lock_state().clamp_edc_a = cap;
+    }
+
+    pub fn set_clamp_stapm_w(&self, cap: Option<u32>) {
+        self.lock_state().clamp_stapm_w = cap;
     }
 
     pub fn history(&self) -> Vec<RecordedCommand> {
@@ -287,7 +324,11 @@ impl SmuTransport for MockTransport {
                     st.igpu_co = (args[0] & 0xFFFF) as u16 as i16;
                 }
                 (Mailbox::Mp1, 0x14) | (Mailbox::Rsmu, 0x31) => {
-                    write_f32(&mut st.pm_table, 0x000, args[0] as f32 / 1000.0);
+                    let mut w = args[0] as f32 / 1000.0;
+                    if let Some(cap) = st.clamp_stapm_w {
+                        w = w.min(cap as f32);
+                    }
+                    write_f32(&mut st.pm_table, 0x000, w);
                 }
                 (Mailbox::Mp1, 0x15) | (Mailbox::Rsmu, 0x32) => {
                     st.ppt_mw = args[0];
@@ -352,6 +393,7 @@ impl SmuTransport for MockTransport {
                 (Mailbox::Rsmu, 0x14) => out[0] = st.fused_apu_slow_w * 1000,
                 (Mailbox::Rsmu, 0x15) => out[0] = st.fused_vdd_tdc_a * 1000,
                 (Mailbox::Rsmu, 0x16) => out[0] = 20_000,
+                (Mailbox::Mp1, 0x5F) => out[0] = st.sustained_power_thm_raw,
                 (Mailbox::Rsmu, 0x0B) => {
                     let idx = args[0];
                     out[0] = 200u32.saturating_sub(idx * 5);
@@ -410,17 +452,26 @@ impl SmuTransport for MockTransport {
                 }
                 (Mailbox::Rsmu, 0x56) | (Mailbox::Mp1, 0x3E) => {
                     st.ppt_mw = args[0];
-                    let w = args[0] as f32 / 1000.0;
+                    let mut w = args[0] as f32 / 1000.0;
+                    if let Some(cap) = st.clamp_ppt_w {
+                        w = w.min(cap as f32);
+                    }
                     write_f32(&mut st.pm_table, 0x008, w);
                 }
                 (Mailbox::Rsmu, 0x57) | (Mailbox::Mp1, 0x3C) => {
                     st.tdc_ma = args[0];
-                    let a = args[0] as f32 / 1000.0;
+                    let mut a = args[0] as f32 / 1000.0;
+                    if let Some(cap) = st.clamp_tdc_a {
+                        a = a.min(cap as f32);
+                    }
                     write_f32(&mut st.pm_table, 0x020, a);
                 }
                 (Mailbox::Rsmu, 0x58) | (Mailbox::Mp1, 0x3D) => {
                     st.edc_ma = args[0];
-                    let a = args[0] as f32 / 1000.0;
+                    let mut a = args[0] as f32 / 1000.0;
+                    if let Some(cap) = st.clamp_edc_a {
+                        a = a.min(cap as f32);
+                    }
                     write_f32(&mut st.pm_table, 0x0FC, a);
                 }
                 (Mailbox::Rsmu, 0x59) | (Mailbox::Mp1, 0x3F) => {
@@ -460,6 +511,9 @@ impl SmuTransport for MockTransport {
                 }
                 (Mailbox::Rsmu, 0xDA) => {
                     out[0] = st.fused_apu_slow_w * 1000;
+                }
+                (Mailbox::Mp1, 0x23) => {
+                    out[0] = st.sustained_power_thm_raw;
                 }
                 (Mailbox::Rsmu, 0x5C) => {
                     // CPPC perf score mock: higher on core 0 & 3

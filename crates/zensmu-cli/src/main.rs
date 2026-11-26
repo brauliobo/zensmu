@@ -9,21 +9,25 @@ use clap::{CommandFactory, Parser};
 use clap_complete::Shell;
 use commands::{
     ApuAction, Cli, CoAction, Command, PboAction, PersistAction, PersistCommand, ProfileAction,
-    ShaperAction, TelemetryAction,
+    RecordAction, RecordCommand, RecordFormatArg, RecordServiceAction, ShaperAction,
+    TelemetryAction,
 };
 use doctor::{is_effective_root, run_doctor};
 use output::{
     print_co_table, print_doctor, print_error, print_info, print_json, print_json_compact,
     print_mutation, print_pbo_status, print_persist_action, print_persist_status,
-    print_planned_ops, print_profile_diff, print_profile_list, print_shaper_matrix, print_status,
-    print_telemetry, ActivePboLimits, ClearGuardOutput, CoGetOutput, InfoOutput, MutationOutput,
-    PboGetOutput, PersistActionOutput, ProfileDiffOutput, ProfileListItem, ProfileListOutput,
-    ProfileSaveOutput, ProfileValidateOutput, ShaperGetOutput, StatusOutput, TelemetryDumpOutput,
+    print_planned_ops, print_profile_diff, print_profile_list, print_record_export_pts,
+    print_record_service_action, print_record_service_status, print_record_stats,
+    print_report_footer, print_shaper_matrix, print_status, print_telemetry, ActivePboLimits,
+    ClearGuardOutput, CoGetOutput, InfoOutput, MutationOutput, PboGetOutput, PersistActionOutput,
+    ProfileDiffOutput, ProfileListItem, ProfileListOutput, ProfileSaveOutput,
+    ProfileValidateOutput, RecordExportPtsOutput, RecordServiceActionOutput, ReportOutput,
+    ShaperGetOutput, StatusOutput, TelemetryDumpOutput,
 };
 use std::fs;
 use std::io::{self, IsTerminal, Read, Write};
 use std::path::{Path, PathBuf};
-use std::process::ExitCode;
+use std::process::{Command as ProcessCommand, ExitCode, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -35,6 +39,8 @@ use zensmu_core::ops::co;
 use zensmu_core::ops::pbo::{self, PboSetRequest};
 use zensmu_core::ops::pm_table;
 use zensmu_core::ops::shaper;
+use zensmu_core::recorder::{self, RecordConfig, RecordFormat, TelemetryRecorder};
+use zensmu_core::report::{collect_debug_report, ReportOptions, GITHUB_REPO};
 use zensmu_core::safety::bounds;
 use zensmu_core::safety::guard::{BootLoopGuard, DEFAULT_GUARD_PATH};
 use zensmu_core::safety::persist::{self, PersistPaths, PersistStatus};
@@ -56,6 +62,14 @@ fn install_sigint_handler() {
     INTERRUPTED.store(false, Ordering::SeqCst);
     unsafe {
         libc::signal(libc::SIGINT, handle_sigint as *const () as usize);
+    }
+}
+
+fn install_stop_signal_handlers() {
+    INTERRUPTED.store(false, Ordering::SeqCst);
+    unsafe {
+        libc::signal(libc::SIGINT, handle_sigint as *const () as usize);
+        libc::signal(libc::SIGTERM, handle_sigint as *const () as usize);
     }
 }
 
@@ -127,6 +141,23 @@ fn run(cli: Cli) -> Result<CliOutcome> {
     match &cli.command {
         Command::Completions { shell } => cmd_completions(*shell),
         Command::Doctor => cmd_doctor(&cli, &transport),
+        Command::Report {
+            note,
+            raw_pm_table,
+            no_mailbox,
+            output,
+            open,
+            create,
+        } => cmd_report(
+            &cli,
+            &transport,
+            note.as_deref(),
+            *raw_pm_table,
+            *no_mailbox,
+            output.as_deref(),
+            *open,
+            *create,
+        ),
         Command::Info => cmd_info(&cli, &transport),
         Command::Status => cmd_status(&cli, &transport),
         Command::Co { action } => cmd_co(&cli, &transport, action),
@@ -134,6 +165,7 @@ fn run(cli: Cli) -> Result<CliOutcome> {
         Command::Pbo { action } => cmd_pbo(&cli, &transport, action),
         Command::Apu { action } => cmd_apu(&cli, &transport, action),
         Command::Telemetry { action } => cmd_telemetry(&cli, &transport, action.as_ref()),
+        Command::Record(rec_cmd) => cmd_record(&cli, &transport, rec_cmd),
         Command::Top { interval } => cmd_top(&cli, &transport, interval),
         Command::Profile { action } => cmd_profile(&cli, &transport, action),
         Command::Persist(persist_cmd) => cmd_persist(&cli, &transport, persist_cmd),
@@ -189,6 +221,171 @@ fn cmd_doctor(cli: &Cli, transport: &dyn SmuTransport) -> Result<CliOutcome> {
         Ok(CliOutcome::Success)
     } else {
         Ok(CliOutcome::ExitWithCode(1))
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn cmd_report(
+    cli: &Cli,
+    transport: &dyn SmuTransport,
+    note: Option<&str>,
+    raw_pm_table: bool,
+    no_mailbox: bool,
+    output: Option<&Path>,
+    open: bool,
+    create: bool,
+) -> Result<CliOutcome> {
+    let opts = ReportOptions {
+        include_raw_pm_table: raw_pm_table,
+        include_mailbox_probes: !no_mailbox && is_effective_root(),
+        user_note: note.map(str::to_string),
+        no_cpuid_check: cli.no_cpuid_check,
+    };
+
+    let report = collect_debug_report(transport, &opts);
+    let issue_title = report.suggested_issue_title();
+    let issue_labels: Vec<String> = report
+        .suggested_labels()
+        .into_iter()
+        .map(str::to_string)
+        .collect();
+    let issue_url = report.github_issue_url();
+    let markdown = report.to_markdown();
+
+    let out = ReportOutput {
+        report,
+        issue_title,
+        issue_labels,
+        issue_url,
+        markdown,
+    };
+
+    if let Some(path) = output {
+        if let Some(parent) = path.parent() {
+            if !parent.as_os_str().is_empty() {
+                fs::create_dir_all(parent).map_err(|source| Error::Io {
+                    path: parent.display().to_string(),
+                    source,
+                })?;
+            }
+        }
+        fs::write(path, &out.markdown).map_err(|source| Error::Io {
+            path: path.display().to_string(),
+            source,
+        })?;
+    }
+
+    if cli.json {
+        print_json(&out);
+        return Ok(CliOutcome::Success);
+    }
+
+    print!("{}", out.markdown);
+    if !cli.quiet {
+        print_report_footer(&out, output);
+    }
+
+    if open {
+        if cli.dry_run {
+            println!(
+                "[DRY-RUN] Would open GitHub issue URL via xdg-open: {}",
+                out.issue_url
+            );
+        } else {
+            ProcessCommand::new("xdg-open")
+                .arg(&out.issue_url)
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+                .map_err(|source| Error::Io {
+                    path: "xdg-open".into(),
+                    source,
+                })?;
+            if !cli.quiet {
+                println!("Opened prefilled GitHub issue URL in default browser via xdg-open.");
+            }
+        }
+    }
+
+    if create {
+        if cli.dry_run {
+            println!(
+                "[DRY-RUN] Would run: gh issue create --repo {GITHUB_REPO} --title {:?} --body-file -",
+                out.issue_title
+            );
+            return Ok(CliOutcome::Success);
+        }
+
+        if !confirm_github_issue_create(cli, &out.issue_title)? {
+            return Ok(CliOutcome::ExitWithCode(1));
+        }
+
+        let mut child = ProcessCommand::new("gh")
+            .args([
+                "issue",
+                "create",
+                "--repo",
+                GITHUB_REPO,
+                "--title",
+                &out.issue_title,
+                "--body-file",
+                "-",
+            ])
+            .stdin(Stdio::piped())
+            .spawn()
+            .map_err(|source| Error::Io {
+                path: "gh".into(),
+                source,
+            })?;
+
+        if let Some(mut stdin) = child.stdin.take() {
+            stdin
+                .write_all(out.markdown.as_bytes())
+                .map_err(|source| Error::Io {
+                    path: "gh stdin".into(),
+                    source,
+                })?;
+        }
+
+        let status = child.wait().map_err(|source| Error::Io {
+            path: "gh".into(),
+            source,
+        })?;
+        if !status.success() {
+            return Err(Error::InvalidInput(format!(
+                "gh issue create exited with status {status} (ensure `gh` is installed and authenticated via `gh auth login`)"
+            )));
+        }
+    }
+
+    Ok(CliOutcome::Success)
+}
+
+fn confirm_github_issue_create(cli: &Cli, title: &str) -> Result<bool> {
+    if cli.yes || !io::stdin().is_terminal() {
+        return Ok(true);
+    }
+
+    eprintln!();
+    eprintln!("About to create a public GitHub issue on {GITHUB_REPO}:");
+    eprintln!("  Title: {title}");
+    eprint!("Create this GitHub issue now via `gh`? [y/N]: ");
+    let _ = io::stderr().flush();
+
+    let mut line = String::new();
+    io::stdin()
+        .read_line(&mut line)
+        .map_err(|source| Error::Io {
+            path: "stdin".into(),
+            source,
+        })?;
+    let trimmed = line.trim();
+    if trimmed.eq_ignore_ascii_case("y") || trimmed.eq_ignore_ascii_case("yes") {
+        Ok(true)
+    } else {
+        eprintln!("Aborted; no GitHub issue was created.");
+        Ok(false)
     }
 }
 
@@ -719,6 +916,317 @@ fn cmd_top(cli: &Cli, transport: &dyn SmuTransport, interval: &str) -> Result<Cl
     let interval_ms = bounds::parse_duration_ms(interval)?;
     let hw = probe_hw(cli, transport)?;
     tui::run_tui(transport, &hw, interval_ms)?;
+    Ok(CliOutcome::Success)
+}
+
+// ============================================================================
+// Telemetry Recording (`record`) — Zero Root Required
+// ============================================================================
+
+fn resolved_pts_result_name(output: &Path, requested: &str) -> String {
+    output
+        .parent()
+        .and_then(|p| p.file_name())
+        .and_then(|n| n.to_str())
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .unwrap_or_else(|| requested.to_string())
+}
+
+fn emit_record_service_action(
+    cli: &Cli,
+    action: &str,
+    dry_run: bool,
+    status: recorder::RecordServiceStatus,
+    note: String,
+) {
+    let out = RecordServiceActionOutput {
+        action: action.to_string(),
+        dry_run,
+        status,
+        note: Some(note),
+    };
+    if cli.json {
+        print_json(&out);
+    } else if dry_run || !cli.quiet {
+        print_record_service_action(&out);
+    }
+}
+
+fn cmd_record(cli: &Cli, transport: &dyn SmuTransport, rec: &RecordCommand) -> Result<CliOutcome> {
+    match &rec.action {
+        Some(RecordAction::Service { action }) => match action {
+            RecordServiceAction::Status => {
+                let status = recorder::read_record_service_status();
+                if cli.json {
+                    print_json(&status);
+                } else {
+                    print_record_service_status(&status);
+                }
+                Ok(CliOutcome::Success)
+            }
+            RecordServiceAction::Enable => {
+                if cli.dry_run {
+                    let status = recorder::read_record_service_status();
+                    emit_record_service_action(
+                        cli,
+                        "record service enable",
+                        true,
+                        status,
+                        format!(
+                            "would run `systemctl --user enable --now {}`",
+                            recorder::USER_RECORD_SERVICE_NAME
+                        ),
+                    );
+                    return Ok(CliOutcome::Success);
+                }
+                let status = recorder::set_record_service_enabled(true)?;
+                emit_record_service_action(
+                    cli,
+                    "record service enable",
+                    false,
+                    status,
+                    format!("enabled and started {}", recorder::USER_RECORD_SERVICE_NAME),
+                );
+                Ok(CliOutcome::Success)
+            }
+            RecordServiceAction::Disable => {
+                if cli.dry_run {
+                    let status = recorder::read_record_service_status();
+                    emit_record_service_action(
+                        cli,
+                        "record service disable",
+                        true,
+                        status,
+                        format!(
+                            "would run `systemctl --user disable --now {}`",
+                            recorder::USER_RECORD_SERVICE_NAME
+                        ),
+                    );
+                    return Ok(CliOutcome::Success);
+                }
+                let status = recorder::set_record_service_enabled(false)?;
+                emit_record_service_action(
+                    cli,
+                    "record service disable",
+                    false,
+                    status,
+                    format!(
+                        "disabled and stopped {}",
+                        recorder::USER_RECORD_SERVICE_NAME
+                    ),
+                );
+                Ok(CliOutcome::Success)
+            }
+        },
+        Some(RecordAction::ExportPts {
+            input,
+            output,
+            pts_name,
+            title,
+            identifier,
+        }) => {
+            if output.is_some() && pts_name.is_some() {
+                return Err(Error::InvalidInput(
+                    "cannot combine --output and --pts-name".into(),
+                ));
+            }
+            let output_path = if let Some(name) = pts_name {
+                recorder::pts_result_path(name)
+            } else if let Some(path) = output {
+                path.clone()
+            } else {
+                let stem = input
+                    .file_stem()
+                    .and_then(|s| s.to_str())
+                    .filter(|s| !s.is_empty())
+                    .unwrap_or("telemetry");
+                input.with_file_name(format!("{stem}-pts.xml"))
+            };
+
+            let samples = recorder::convert_jsonl_or_csv_to_pts(
+                input,
+                &output_path,
+                title.as_deref(),
+                identifier.as_deref(),
+            )?;
+
+            let resolved_pts = pts_name
+                .as_deref()
+                .map(|name| resolved_pts_result_name(&output_path, name));
+            let out = RecordExportPtsOutput {
+                input: input.display().to_string(),
+                output: output_path.display().to_string(),
+                samples,
+                pts_name: resolved_pts,
+            };
+            if cli.json {
+                print_json(&out);
+            } else if !cli.quiet {
+                print_record_export_pts(&out);
+            }
+            Ok(CliOutcome::Success)
+        }
+        None => cmd_record_live(cli, transport, rec),
+    }
+}
+
+fn cmd_record_live(
+    cli: &Cli,
+    transport: &dyn SmuTransport,
+    rec: &RecordCommand,
+) -> Result<CliOutcome> {
+    if rec.pts_name.is_some() && rec.output.is_some() {
+        return Err(Error::InvalidInput(
+            "cannot combine --output and --pts-name".into(),
+        ));
+    }
+    if rec.pts_name.is_some() && rec.format.is_some_and(|f| f != RecordFormatArg::Pts) {
+        return Err(Error::InvalidInput(
+            "--pts-name can only be used with --format pts".into(),
+        ));
+    }
+
+    let interval_ms = bounds::parse_duration_ms(&rec.interval)?.max(100);
+    let duration_ms = rec
+        .duration
+        .as_deref()
+        .map(bounds::parse_duration_ms)
+        .transpose()?;
+
+    if rec.samples == Some(0) {
+        return Err(Error::InvalidInput(
+            "--samples must be greater than zero".into(),
+        ));
+    }
+
+    let max_file_bytes =
+        match rec.max_size {
+            Some(0) => {
+                return Err(Error::InvalidInput(
+                    "--max-size must be greater than zero (in MiB)".into(),
+                ));
+            }
+            Some(mb) => Some(mb.checked_mul(1024 * 1024).ok_or_else(|| {
+                Error::InvalidInput("--max-size value overflows byte count".into())
+            })?),
+            None => None,
+        };
+
+    let hw = probe_hw(cli, transport)?;
+
+    let (path, format, resolved_pts_name) = if let Some(ref pts_name) = rec.pts_name {
+        let p = recorder::pts_result_path(pts_name);
+        let resolved = resolved_pts_result_name(&p, pts_name);
+        (p, RecordFormat::Pts, Some(resolved))
+    } else if let Some(ref out_path) = rec.output {
+        let fmt = rec
+            .format
+            .map(Into::into)
+            .unwrap_or_else(|| RecordFormat::from_path(out_path));
+        (out_path.clone(), fmt, None)
+    } else if rec.append {
+        let fmt = rec.format.map(Into::into).unwrap_or(RecordFormat::Csv);
+        let default_daemon = recorder::default_daemon_recording_path();
+        let p = if fmt == RecordFormat::Csv {
+            default_daemon
+        } else {
+            default_daemon.with_extension(fmt.extension())
+        };
+        (p, fmt, None)
+    } else {
+        let fmt = rec.format.map(Into::into).unwrap_or(RecordFormat::Csv);
+        (
+            recorder::default_recording_path(hw.codename, fmt),
+            fmt,
+            None,
+        )
+    };
+
+    let config = RecordConfig {
+        path,
+        format,
+        append: rec.append,
+        max_file_bytes,
+        max_rotated_files: rec.rotate,
+        flush_every: 1,
+        tag: rec.tag.clone(),
+    };
+
+    let mut recorder = TelemetryRecorder::open(config)?;
+    install_stop_signal_handlers();
+
+    if !cli.json && !cli.quiet {
+        let mut details = vec![
+            format!("format={}", recorder.format().as_str()),
+            format!("interval={interval_ms}ms"),
+        ];
+        if let Some(mb) = rec.max_size {
+            details.push(format!("max-size={mb}MiB"));
+            details.push(format!("rotate={}", rec.rotate));
+        }
+        if let Some(ref dur) = rec.duration {
+            details.push(format!("duration={dur}"));
+        }
+        if let Some(n) = rec.samples {
+            details.push(format!("samples={n}"));
+        }
+        if let Some(ref tag) = rec.tag {
+            details.push(format!("tag={tag}"));
+        }
+        println!(
+            "Recording {} telemetry to {} ({}) — press Ctrl-C to stop...",
+            hw.codename.display_name(),
+            recorder.path().display(),
+            details.join(", ")
+        );
+        let _ = io::stdout().flush();
+    }
+
+    let started = Instant::now();
+    let deadline = duration_ms.map(|ms| started + Duration::from_millis(ms));
+    let interval = Duration::from_millis(interval_ms);
+
+    while !INTERRUPTED.load(Ordering::SeqCst) {
+        let snap = pm_table::read_telemetry(transport, &hw)?;
+        recorder.write_snapshot(&snap)?;
+
+        if let Some(max_samples) = rec.samples {
+            if recorder.stats().samples_written >= max_samples {
+                break;
+            }
+        }
+        if let Some(dl) = deadline {
+            if Instant::now() >= dl {
+                break;
+            }
+        }
+
+        let next_tick = Instant::now() + interval;
+        let sleep_until = match deadline {
+            Some(dl) => next_tick.min(dl),
+            None => next_tick,
+        };
+        while Instant::now() < sleep_until && !INTERRUPTED.load(Ordering::SeqCst) {
+            let rem = sleep_until.saturating_duration_since(Instant::now());
+            thread::sleep(rem.min(Duration::from_millis(50)));
+        }
+        if let Some(dl) = deadline {
+            if Instant::now() >= dl {
+                break;
+            }
+        }
+    }
+
+    recorder.flush()?;
+    let stats = recorder.stats();
+
+    if cli.json {
+        print_json(&stats);
+    } else if !cli.quiet {
+        print_record_stats(&stats, resolved_pts_name.as_deref());
+    }
+
     Ok(CliOutcome::Success)
 }
 

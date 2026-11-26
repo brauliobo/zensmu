@@ -56,6 +56,16 @@ impl SmuStatus {
     }
 }
 
+/// Single limit field that the SMU accepted but motherboard/BIOS firmware clamped below the requested value.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct ClampedLimit {
+    pub field: String,
+    pub requested: String,
+    pub actual: String,
+    pub actual_value: u32,
+    pub unit: String,
+}
+
 #[derive(Debug, Error)]
 pub enum Error {
     #[error("ryzen_smu sysfs not found at {path} (is the ryzen_smu kernel module loaded? try: sudo modprobe ryzen_smu)")]
@@ -108,6 +118,12 @@ pub enum Error {
         actual: String,
     },
 
+    #[error("motherboard/BIOS firmware clamped {summary} (SMU accepted the command but capped the limit at the board VRM/BIOS ceiling; check BIOS PBO Limits)")]
+    HardwareClamped {
+        summary: String,
+        clamped: Vec<ClampedLimit>,
+    },
+
     #[error("value out of safe bounds for {field}: {value} (allowed: {bounds})")]
     OutOfBounds {
         field: String,
@@ -150,6 +166,42 @@ pub enum Error {
 
     #[error("serialization error: {0}")]
     Serde(String),
+}
+
+impl Error {
+    /// Returns true when this error indicates an untested CPU, unrecognized PM table
+    /// version, CPUID mismatch, or unexpected SMU/verification error where a
+    /// privacy-safe GitHub diagnostic report helps add hardware support or fix a bug.
+    pub fn suggests_report(&self) -> bool {
+        matches!(
+            self,
+            Self::UnsupportedCpu { .. }
+                | Self::UnsupportedPmTable { .. }
+                | Self::IdentityMismatch { .. }
+                | Self::SmuRejected { .. }
+                | Self::MailboxUnhealthy { .. }
+                | Self::VerificationFailed { .. }
+        )
+    }
+
+    /// Optional actionable CLI hint suggesting `zensmu report` on hardware-support or
+    /// unexpected SMU errors.
+    pub fn report_hint(&self) -> Option<&'static str> {
+        match self {
+            Self::UnsupportedCpu { .. } | Self::IdentityMismatch { .. } => Some(
+                "Help add support for this CPU by filing a privacy-safe report: zensmu report --open (or sudo zensmu report --create)",
+            ),
+            Self::UnsupportedPmTable { .. } => Some(
+                "Help add support for this PM table layout by running: zensmu report --raw-pm-table --open",
+            ),
+            Self::SmuRejected { .. }
+            | Self::MailboxUnhealthy { .. }
+            | Self::VerificationFailed { .. } => Some(
+                "Unexpected SMU behavior? Share diagnostics with: sudo zensmu report --open",
+            ),
+            _ => None,
+        }
+    }
 }
 
 pub type Result<T> = std::result::Result<T, Error>;

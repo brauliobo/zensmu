@@ -3,6 +3,7 @@
 use clap::{ArgAction, Args, Parser, Subcommand, ValueEnum};
 use clap_complete::Shell;
 use std::path::PathBuf;
+use zensmu_core::recorder::RecordFormat;
 use zensmu_core::types::ApuPowerMode;
 
 /// Safety-first CLI and live TUI for AMD Ryzen SMU control and telemetry.
@@ -70,6 +71,34 @@ pub enum Command {
     /// Run safety diagnostics on ryzen_smu, permissions, CPUID, PM table, boot guard, and mailboxes
     Doctor,
 
+    /// Generate a privacy-safe diagnostic report for GitHub issues or CPU support requests (unprivileged)
+    #[command(visible_alias = "bug-report")]
+    Report {
+        /// Optional description of the issue or CPU support request
+        #[arg(long, value_name = "TEXT")]
+        note: Option<String>,
+
+        /// Always include non-zero PM table float entries (auto-included when CPU or PM table is unsupported)
+        #[arg(long)]
+        raw_pm_table: bool,
+
+        /// Skip privileged SMU mailbox probes even if running as root
+        #[arg(long)]
+        no_mailbox: bool,
+
+        /// Write Markdown report to a file
+        #[arg(short = 'o', long, value_name = "PATH")]
+        output: Option<PathBuf>,
+
+        /// Open the prefilled GitHub new-issue URL in the browser via xdg-open
+        #[arg(long)]
+        open: bool,
+
+        /// Create a GitHub issue directly via `gh issue create`
+        #[arg(long, alias = "gh")]
+        create: bool,
+    },
+
     /// Show unified snapshot of all readable SMU state (telemetry unprivileged; mailboxes require root)
     Status,
 
@@ -102,6 +131,9 @@ pub enum Command {
         #[command(subcommand)]
         action: Option<TelemetryAction>,
     },
+
+    /// Record unprivileged live PM table telemetry (CSV, JSONL, or Phoronix Test Suite XML)
+    Record(RecordCommand),
 
     /// Launch btop-style live terminal telemetry dashboard (unprivileged)
     Top {
@@ -299,6 +331,114 @@ pub enum TelemetryAction {
         #[arg(value_name = "OUT_PATH")]
         out_path: PathBuf,
     },
+}
+
+#[derive(ValueEnum, Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RecordFormatArg {
+    Csv,
+    Jsonl,
+    Pts,
+}
+
+impl From<RecordFormatArg> for RecordFormat {
+    fn from(value: RecordFormatArg) -> Self {
+        match value {
+            RecordFormatArg::Csv => RecordFormat::Csv,
+            RecordFormatArg::Jsonl => RecordFormat::Jsonl,
+            RecordFormatArg::Pts => RecordFormat::Pts,
+        }
+    }
+}
+
+#[derive(Debug, Args)]
+pub struct RecordCommand {
+    /// Output file path (defaults to ~/.local/share/zensmu/recordings/zensmu-<cpu>-<ts>.<ext>,
+    /// or ~/.local/share/zensmu/telemetry.csv when --append is set without -o)
+    #[arg(short = 'o', long, value_name = "PATH")]
+    pub output: Option<PathBuf>,
+
+    /// Shortcut: set --format pts and write directly to ~/.phoronix-test-suite/test-results/<NAME>/composite.xml
+    #[arg(long, value_name = "NAME")]
+    pub pts_name: Option<String>,
+
+    /// Output format (inferred from --output extension if omitted, else csv)
+    #[arg(short = 'f', long, value_enum)]
+    pub format: Option<RecordFormatArg>,
+
+    /// Sampling interval (e.g. 500ms, 1s, 2s; minimum 100ms)
+    #[arg(short = 'i', long, default_value = "1s", value_name = "DURATION")]
+    pub interval: String,
+
+    /// Optional recording duration before stopping cleanly (e.g. 60s, 10m, 1h)
+    #[arg(short = 'd', long, alias = "period", value_name = "DURATION")]
+    pub duration: Option<String>,
+
+    /// Optional maximum number of samples to record before exiting
+    #[arg(short = 'n', long, value_name = "N")]
+    pub samples: Option<u64>,
+
+    /// Optional maximum file size in MiB before size-based log rotation (CSV/JSONL)
+    #[arg(long, value_name = "MB")]
+    pub max_size: Option<u64>,
+
+    /// Number of rotated backup files to retain when --max-size is set
+    #[arg(long, default_value_t = 5, value_name = "N")]
+    pub rotate: usize,
+
+    /// Append to an existing file without duplicating the CSV header
+    #[arg(long)]
+    pub append: bool,
+
+    /// Optional workload tag recorded with each sample (e.g. "prime95", "co-20")
+    #[arg(long, value_name = "LABEL")]
+    pub tag: Option<String>,
+
+    #[command(subcommand)]
+    pub action: Option<RecordAction>,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum RecordAction {
+    /// Inspect, enable, or disable the unprivileged user systemd recording daemon (zensmu-record.service)
+    Service {
+        #[command(subcommand)]
+        action: RecordServiceAction,
+    },
+
+    /// Convert an existing CSV or JSONL recording to a Phoronix Test Suite composite.xml
+    ExportPts {
+        /// Input CSV or JSONL recording path
+        #[arg(value_name = "INPUT")]
+        input: PathBuf,
+
+        /// Destination XML path (defaults to <input_stem>-pts.xml unless --pts-name is set)
+        #[arg(short = 'o', long, value_name = "PATH")]
+        output: Option<PathBuf>,
+
+        /// Write directly into ~/.phoronix-test-suite/test-results/<NAME>/composite.xml
+        #[arg(long, value_name = "NAME")]
+        pts_name: Option<String>,
+
+        /// Custom PTS result title
+        #[arg(long, value_name = "TITLE")]
+        title: Option<String>,
+
+        /// Custom PTS system/run identifier
+        #[arg(long, value_name = "ID")]
+        identifier: Option<String>,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+pub enum RecordServiceAction {
+    /// Inspect status of the unprivileged user zensmu-record.service daemon
+    Status,
+
+    /// Enable and start zensmu-record.service via `systemctl --user enable --now`
+    Enable,
+
+    /// Disable and stop zensmu-record.service via `systemctl --user disable --now`
+    Disable,
 }
 
 #[derive(Debug, Subcommand)]
@@ -866,6 +1006,267 @@ mod tests {
             Command::Persist(PersistCommand {
                 action: PersistAction::Disable { remove_profile },
             }) => assert!(remove_profile),
+            other => panic!("unexpected command: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_report_subcommand_and_aliases() {
+        let cli = Cli::try_parse_from([
+            "zensmu",
+            "report",
+            "--note",
+            "Ryzen 9950X3D PM table unknown",
+            "--raw-pm-table",
+            "--no-mailbox",
+            "--output",
+            "/tmp/zensmu-report.md",
+            "--open",
+            "--create",
+            "--json",
+        ])
+        .unwrap();
+
+        assert!(cli.json);
+        match cli.command {
+            Command::Report {
+                note,
+                raw_pm_table,
+                no_mailbox,
+                output,
+                open,
+                create,
+            } => {
+                assert_eq!(note.as_deref(), Some("Ryzen 9950X3D PM table unknown"));
+                assert!(raw_pm_table);
+                assert!(no_mailbox);
+                assert_eq!(output, Some(PathBuf::from("/tmp/zensmu-report.md")));
+                assert!(open);
+                assert!(create);
+            }
+            other => panic!("unexpected command: {other:?}"),
+        }
+
+        // Test `bug-report` visible alias, `-o` short flag, and `--gh` alias for `--create`
+        let alias_cli = Cli::try_parse_from([
+            "zensmu",
+            "bug-report",
+            "-o",
+            "/tmp/out.md",
+            "--gh",
+            "--dry-run",
+            "--yes",
+        ])
+        .unwrap();
+        assert!(alias_cli.dry_run);
+        assert!(alias_cli.yes);
+        match alias_cli.command {
+            Command::Report {
+                note,
+                raw_pm_table,
+                no_mailbox,
+                output,
+                open,
+                create,
+            } => {
+                assert_eq!(note, None);
+                assert!(!raw_pm_table);
+                assert!(!no_mailbox);
+                assert_eq!(output, Some(PathBuf::from("/tmp/out.md")));
+                assert!(!open);
+                assert!(create);
+            }
+            other => panic!("unexpected command: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_record_direct_and_pts_flags() {
+        let default_rec = Cli::try_parse_from(["zensmu", "record"]).unwrap();
+        match default_rec.command {
+            Command::Record(rec) => {
+                assert_eq!(rec.output, None);
+                assert_eq!(rec.pts_name, None);
+                assert_eq!(rec.format, None);
+                assert_eq!(rec.interval, "1s");
+                assert_eq!(rec.duration, None);
+                assert_eq!(rec.samples, None);
+                assert_eq!(rec.max_size, None);
+                assert_eq!(rec.rotate, 5);
+                assert!(!rec.append);
+                assert_eq!(rec.tag, None);
+                assert!(rec.action.is_none());
+            }
+            other => panic!("unexpected command: {other:?}"),
+        }
+
+        let daemon_rec = Cli::try_parse_from([
+            "zensmu",
+            "record",
+            "--interval",
+            "2s",
+            "--max-size",
+            "50",
+            "--rotate",
+            "5",
+            "--append",
+            "--tag",
+            "co-20",
+            "-n",
+            "100",
+            "-d",
+            "60s",
+            "-o",
+            "/tmp/out.jsonl",
+            "-f",
+            "jsonl",
+        ])
+        .unwrap();
+        match daemon_rec.command {
+            Command::Record(rec) => {
+                assert_eq!(rec.output, Some(PathBuf::from("/tmp/out.jsonl")));
+                assert_eq!(rec.format, Some(RecordFormatArg::Jsonl));
+                assert_eq!(rec.interval, "2s");
+                assert_eq!(rec.duration.as_deref(), Some("60s"));
+                assert_eq!(rec.samples, Some(100));
+                assert_eq!(rec.max_size, Some(50));
+                assert_eq!(rec.rotate, 5);
+                assert!(rec.append);
+                assert_eq!(rec.tag.as_deref(), Some("co-20"));
+                assert!(rec.action.is_none());
+            }
+            other => panic!("unexpected command: {other:?}"),
+        }
+
+        // `--period` alias for `--duration`
+        let period_rec = Cli::try_parse_from(["zensmu", "record", "--period", "5s"]).unwrap();
+        match period_rec.command {
+            Command::Record(rec) => {
+                assert_eq!(rec.duration.as_deref(), Some("5s"));
+                assert!(rec.action.is_none());
+            }
+            other => panic!("unexpected command: {other:?}"),
+        }
+
+        // `--pts-name` shortcut
+        let pts_rec = Cli::try_parse_from([
+            "zensmu",
+            "record",
+            "--pts-name",
+            "ryzen-9700x-co20",
+            "-i",
+            "500ms",
+        ])
+        .unwrap();
+        match pts_rec.command {
+            Command::Record(rec) => {
+                assert_eq!(rec.pts_name.as_deref(), Some("ryzen-9700x-co20"));
+                assert_eq!(rec.interval, "500ms");
+                assert!(rec.action.is_none());
+            }
+            other => panic!("unexpected command: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_record_service_and_export_pts_subcommands() {
+        let st = Cli::try_parse_from(["zensmu", "record", "service", "status", "--json"]).unwrap();
+        assert!(st.json);
+        assert!(matches!(
+            st.command,
+            Command::Record(RecordCommand {
+                action: Some(RecordAction::Service {
+                    action: RecordServiceAction::Status
+                }),
+                ..
+            })
+        ));
+
+        let en = Cli::try_parse_from(["zensmu", "record", "service", "enable"]).unwrap();
+        assert!(matches!(
+            en.command,
+            Command::Record(RecordCommand {
+                action: Some(RecordAction::Service {
+                    action: RecordServiceAction::Enable
+                }),
+                ..
+            })
+        ));
+
+        let dis = Cli::try_parse_from(["zensmu", "record", "service", "disable"]).unwrap();
+        assert!(matches!(
+            dis.command,
+            Command::Record(RecordCommand {
+                action: Some(RecordAction::Service {
+                    action: RecordServiceAction::Disable
+                }),
+                ..
+            })
+        ));
+
+        let exp_pts = Cli::try_parse_from([
+            "zensmu",
+            "record",
+            "export-pts",
+            "/tmp/telemetry.csv",
+            "--pts-name",
+            "prime95-run",
+            "--title",
+            "Prime95 Small FFT",
+            "--identifier",
+            "co-20",
+        ])
+        .unwrap();
+        match exp_pts.command {
+            Command::Record(RecordCommand {
+                action:
+                    Some(RecordAction::ExportPts {
+                        input,
+                        output,
+                        pts_name,
+                        title,
+                        identifier,
+                    }),
+                ..
+            }) => {
+                assert_eq!(input, PathBuf::from("/tmp/telemetry.csv"));
+                assert_eq!(output, None);
+                assert_eq!(pts_name.as_deref(), Some("prime95-run"));
+                assert_eq!(title.as_deref(), Some("Prime95 Small FFT"));
+                assert_eq!(identifier.as_deref(), Some("co-20"));
+            }
+            other => panic!("unexpected command: {other:?}"),
+        }
+
+        let exp_out = Cli::try_parse_from([
+            "zensmu",
+            "record",
+            "export-pts",
+            "/tmp/telemetry.jsonl",
+            "-o",
+            "/tmp/composite.xml",
+            "--json",
+        ])
+        .unwrap();
+        assert!(exp_out.json);
+        match exp_out.command {
+            Command::Record(RecordCommand {
+                action:
+                    Some(RecordAction::ExportPts {
+                        input,
+                        output,
+                        pts_name,
+                        title,
+                        identifier,
+                    }),
+                ..
+            }) => {
+                assert_eq!(input, PathBuf::from("/tmp/telemetry.jsonl"));
+                assert_eq!(output, Some(PathBuf::from("/tmp/composite.xml")));
+                assert_eq!(pts_name, None);
+                assert_eq!(title, None);
+                assert_eq!(identifier, None);
+            }
             other => panic!("unexpected command: {other:?}"),
         }
     }

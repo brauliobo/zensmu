@@ -2,6 +2,7 @@
 
 use crate::doctor::{CheckStatus, DoctorReport};
 use serde::Serialize;
+use std::sync::OnceLock;
 use zensmu_core::config::profile::ProfileDiffEntry;
 use zensmu_core::error::Error;
 use zensmu_core::hw::identity::{driver_has_false_ok_bug, CpuidInfo, HardwareContext};
@@ -10,6 +11,8 @@ use zensmu_core::hw::topology::CpuTopology;
 use zensmu_core::ops::co::{CoSnapshot, CoreCoMargin};
 use zensmu_core::ops::pbo::PboStatus;
 use zensmu_core::ops::pm_table::TelemetrySnapshot;
+use zensmu_core::recorder::{RecordServiceStatus, RecordStats};
+use zensmu_core::report::{DebugReport, SystemBoardInfo, GITHUB_REPO};
 use zensmu_core::safety::persist::{
     PersistStatus, DEFAULT_MODULES_LOAD_PATH, DEFAULT_RESUME_HOOK_PATH,
 };
@@ -130,6 +133,24 @@ pub struct TelemetryDumpOutput {
 }
 
 #[derive(Debug, Serialize)]
+pub struct RecordServiceActionOutput {
+    pub action: String,
+    pub dry_run: bool,
+    pub status: RecordServiceStatus,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub note: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct RecordExportPtsOutput {
+    pub input: String,
+    pub output: String,
+    pub samples: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pts_name: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
 pub struct MutationOutput {
     pub action: String,
     pub dry_run: bool,
@@ -201,10 +222,21 @@ pub struct PersistActionOutput {
 }
 
 #[derive(Debug, Serialize)]
+pub struct ReportOutput {
+    pub report: DebugReport,
+    pub issue_title: String,
+    pub issue_labels: Vec<String>,
+    pub issue_url: String,
+    pub markdown: String,
+}
+
+#[derive(Debug, Serialize)]
 pub struct ErrorOutput {
     pub ok: bool,
     pub kind: &'static str,
     pub error: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub hint: Option<String>,
 }
 
 // ============================================================================
@@ -236,6 +268,7 @@ pub fn error_kind(err: &Error) -> &'static str {
         Error::SmuRejected { .. } => "smu_rejected",
         Error::MailboxUnhealthy { .. } => "mailbox_unhealthy",
         Error::VerificationFailed { .. } => "verification_failed",
+        Error::HardwareClamped { .. } => "hardware_clamped",
         Error::OutOfBounds { .. } => "out_of_bounds",
         Error::ExtremeValueBlocked { .. } => "extreme_value_blocked",
         Error::UnsupportedPmTable { .. } => "unsupported_pm_table",
@@ -254,6 +287,7 @@ pub fn print_error(err: &Error, json: bool) {
             ok: false,
             kind: error_kind(err),
             error: err.to_string(),
+            hint: err.report_hint().map(str::to_string),
         };
         if let Ok(s) = serde_json::to_string(&payload) {
             eprintln!("{s}");
@@ -262,6 +296,9 @@ pub fn print_error(err: &Error, json: bool) {
         }
     } else {
         eprintln!("error: {err}");
+        if let Some(hint) = err.report_hint() {
+            eprintln!("hint: {hint}");
+        }
     }
 }
 
@@ -451,32 +488,108 @@ pub fn print_shaper_matrix(shaper: &CurveShaperState, codename: Codename) {
     }
 }
 
-pub fn print_pbo_status(out: &PboGetOutput) {
-    println!(
+pub(crate) fn detected_board_info() -> &'static SystemBoardInfo {
+    static BOARD_INFO: OnceLock<SystemBoardInfo> = OnceLock::new();
+    BOARD_INFO.get_or_init(SystemBoardInfo::detect_linux)
+}
+
+pub(crate) fn format_board_vrm_note(info: &SystemBoardInfo) -> String {
+    let mut name_parts = Vec::new();
+    if let Some(vendor) = info
+        .board_vendor
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        name_parts.push(vendor);
+    }
+    if let Some(board) = info
+        .board_name
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        let dup_vendor = name_parts.first().is_some_and(|v| {
+            board
+                .to_ascii_lowercase()
+                .starts_with(&v.to_ascii_lowercase())
+        });
+        if dup_vendor {
+            name_parts.clear();
+        }
+        name_parts.push(board);
+    }
+    let bios = info
+        .bios_version
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
+
+    let mut label = name_parts.join(" ");
+    if let Some(ver) = bios {
+        if label.is_empty() {
+            label = format!("BIOS {ver}");
+        } else {
+            label.push_str(&format!(" (BIOS {ver})"));
+        }
+    }
+
+    if label.is_empty() {
+        "Board: BIOS PBO Limits / VRM firmware may cap PPT/TDC/EDC.".to_string()
+    } else {
+        format!("Board: {label} — BIOS PBO Limits / VRM firmware may cap PPT/TDC/EDC.")
+    }
+}
+
+pub fn format_pbo_status(out: &PboGetOutput) -> String {
+    format_pbo_status_with_board(out, detected_board_info())
+}
+
+fn format_pbo_status_with_board(out: &PboGetOutput, board: &SystemBoardInfo) -> String {
+    use std::fmt::Write as _;
+
+    let mut s = String::new();
+    let _ = writeln!(
+        s,
         "Precision Boost Overdrive ({})",
         out.codename.display_name()
     );
-    println!("==========================================");
+    let _ = writeln!(s, "==========================================");
 
-    println!("Active Limits (PM Table):");
-    println!("  PPT   : {}", fmt_opt_f32(out.active_limits.ppt_w, 1, "W"));
-    println!("  TDC   : {}", fmt_opt_f32(out.active_limits.tdc_a, 1, "A"));
-    println!("  EDC   : {}", fmt_opt_f32(out.active_limits.edc_a, 1, "A"));
-    println!(
+    let _ = writeln!(s, "Active Limits (PM Table):");
+    let _ = writeln!(
+        s,
+        "  PPT   : {}",
+        fmt_opt_f32(out.active_limits.ppt_w, 1, "W")
+    );
+    let _ = writeln!(
+        s,
+        "  TDC   : {}",
+        fmt_opt_f32(out.active_limits.tdc_a, 1, "A")
+    );
+    let _ = writeln!(
+        s,
+        "  EDC   : {}",
+        fmt_opt_f32(out.active_limits.edc_a, 1, "A")
+    );
+    let _ = writeln!(
+        s,
         "  Tctl  : {}",
         fmt_opt_f32(out.active_limits.tctl_c, 1, "°C")
     );
 
-    println!();
-    println!("Boost & Scalar:");
-    println!(
+    let _ = writeln!(s);
+    let _ = writeln!(s, "Boost & Scalar:");
+    let _ = writeln!(
+        s,
         "  PBO Scalar : {}",
         out.status
             .scalar
-            .map(|s| format!("{s:.2}x"))
+            .map(|sc| format!("{sc:.2}x"))
             .unwrap_or_else(|| "n/a".into())
     );
-    println!(
+    let _ = writeln!(
+        s,
         "  Fmax Limit : {}",
         out.status
             .fmax_mhz
@@ -484,46 +597,79 @@ pub fn print_pbo_status(out: &PboGetOutput) {
             .unwrap_or_else(|| "n/a".into())
     );
 
-    println!();
-    println!("Fused Factory Limits:");
+    let _ = writeln!(s);
+    let _ = writeln!(s, "Fused Factory Limits:");
     let f = &out.status.fused;
-    println!("  Fused PPT      : {}", fmt_opt_u32(f.ppt_w, "W"));
-    println!("  Fused VDD TDC  : {}", fmt_opt_u32(f.vdd_tdc_a, "A"));
-    println!("  Fused EDC      : {}", fmt_opt_u32(f.edc_a, "A"));
+    let _ = writeln!(s, "  Fused PPT      : {}", fmt_opt_u32(f.ppt_w, "W"));
+    let _ = writeln!(s, "  Fused VDD TDC  : {}", fmt_opt_u32(f.vdd_tdc_a, "A"));
+    let _ = writeln!(s, "  Fused EDC      : {}", fmt_opt_u32(f.edc_a, "A"));
+    if f.tdp_w.is_some() {
+        let _ = writeln!(s, "  Fused TDP      : {}", fmt_opt_u32(f.tdp_w, "W"));
+    }
+    if f.tjmax_c.is_some() {
+        let _ = writeln!(s, "  Fused TjMax    : {}", fmt_opt_u32(f.tjmax_c, "°C"));
+    }
     if f.soc_tdc_a.is_some() {
-        println!("  Fused SoC TDC  : {}", fmt_opt_u32(f.soc_tdc_a, "A"));
+        let _ = writeln!(s, "  Fused SoC TDC  : {}", fmt_opt_u32(f.soc_tdc_a, "A"));
     }
     if f.slow_w.is_some() || f.fast_w.is_some() || f.apu_slow_w.is_some() {
-        println!("  Fused Slow     : {}", fmt_opt_u32(f.slow_w, "W"));
-        println!("  Fused Fast     : {}", fmt_opt_u32(f.fast_w, "W"));
-        println!("  Fused APU Slow : {}", fmt_opt_u32(f.apu_slow_w, "W"));
+        let _ = writeln!(s, "  Fused Slow     : {}", fmt_opt_u32(f.slow_w, "W"));
+        let _ = writeln!(s, "  Fused Fast     : {}", fmt_opt_u32(f.fast_w, "W"));
+        let _ = writeln!(s, "  Fused APU Slow : {}", fmt_opt_u32(f.apu_slow_w, "W"));
     }
+    let _ = writeln!(s, "  {}", format_board_vrm_note(board));
 
-    println!();
-    println!("Platform Flags:");
-    println!(
+    let _ = writeln!(s);
+    let _ = writeln!(s, "Platform Flags:");
+    let _ = writeln!(
+        s,
         "  Overclockable  : {}",
         fmt_opt_bool(out.status.flags.overclockable)
     );
-    println!(
+    let _ = writeln!(
+        s,
         "  EXPO Active    : {}",
         fmt_opt_bool(out.status.flags.expo_active)
     );
-    println!(
+    let _ = writeln!(
+        s,
         "  LN2 Mode       : {}",
         fmt_opt_bool(out.status.flags.ln2_mode)
     );
 
     if !out.status.core_perf_scores.is_empty() {
-        println!();
-        println!("CPPC Core Performance Ranking:");
+        let _ = writeln!(s);
+        let _ = writeln!(s, "CPPC Core Performance Ranking:");
         let mut ranked = out.status.core_perf_scores.clone();
         ranked.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
-        println!("  {:<6} {:<8} {:>8}", "RANK", "CORE", "SCORE");
+        let _ = writeln!(s, "  {:<6} {:<8} {:>8}", "RANK", "CORE", "SCORE");
         for (rank, (core_idx, score)) in ranked.iter().enumerate() {
-            println!("  {:<6} {:<8} {:>8}", rank + 1, core_idx, score);
+            let _ = writeln!(s, "  {:<6} {:<8} {:>8}", rank + 1, core_idx, score);
         }
     }
+    s
+}
+
+pub fn print_pbo_status(out: &PboGetOutput) {
+    print!("{}", format_pbo_status(out));
+}
+
+pub fn print_report_footer(out: &ReportOutput, saved_path: Option<&std::path::Path>) {
+    println!();
+    println!("GitHub Issue Submission ({GITHUB_REPO})");
+    println!("========================================");
+    if let Some(path) = saved_path {
+        println!("Saved Report     : {}", path.display());
+    }
+    println!("Suggested Title  : {}", out.issue_title);
+    if !out.issue_labels.is_empty() {
+        println!("Suggested Labels : {}", out.issue_labels.join(", "));
+    }
+    println!("Prefilled URL    : {}", out.issue_url);
+    println!();
+    println!("Next steps:");
+    println!("  - Open in browser    : zensmu report --open");
+    println!("  - File via GitHub CLI: zensmu report --create");
 }
 
 /// Returns `true` when any mobile APU DPTC telemetry field is populated.
@@ -848,6 +994,62 @@ pub fn print_persist_action(out: &PersistActionOutput) {
     print_persist_status(&out.status);
 }
 
+pub fn print_record_service_status(status: &RecordServiceStatus) {
+    println!("Telemetry Recording Service (user)");
+    println!("==================================");
+    println!("Service              : {}", status.service_name);
+    println!(
+        "Installed            : {}",
+        if status.installed { "yes" } else { "no" }
+    );
+    println!(
+        "Enabled              : {}",
+        if status.enabled { "yes" } else { "no" }
+    );
+    println!(
+        "Active               : {}",
+        if status.active { "yes" } else { "no" }
+    );
+    println!("State                : {}", status.state);
+    println!("Default Output       : {}", status.default_output_path);
+}
+
+pub fn print_record_service_action(out: &RecordServiceActionOutput) {
+    let tag = if out.dry_run { "[DRY-RUN]" } else { "[OK]" };
+    println!("{tag} {}", out.action);
+    if let Some(ref note) = out.note {
+        println!("Note                 : {note}");
+    }
+    println!();
+    print_record_service_status(&out.status);
+}
+
+pub fn print_record_export_pts(out: &RecordExportPtsOutput) {
+    println!(
+        "Exported {} telemetry sample(s) to Phoronix Test Suite XML:",
+        out.samples
+    );
+    println!("  Input  : {}", out.input);
+    println!("  Output : {}", out.output);
+    if let Some(ref pts_name) = out.pts_name {
+        println!("  View   : phoronix-test-suite show-result {pts_name}");
+    }
+}
+
+pub fn print_record_stats(stats: &RecordStats, pts_name: Option<&str>) {
+    println!(
+        "Recorded {} sample(s) ({} bytes, {} rotation(s), format: {}) -> {}",
+        stats.samples_written,
+        stats.bytes_written,
+        stats.rotations,
+        stats.format.as_str(),
+        stats.path.display()
+    );
+    if let Some(name) = pts_name {
+        println!("View in Phoronix Test Suite: phoronix-test-suite show-result {name}");
+    }
+}
+
 fn fmt_opt_f32(v: Option<f32>, prec: usize, unit: &str) -> String {
     match v {
         Some(x) => format!("{x:.prec$} {unit}"),
@@ -997,5 +1199,128 @@ mod tests {
                 "APU output missing {expected:?}:\n{out}"
             );
         }
+    }
+
+    #[test]
+    fn error_kind_maps_hardware_clamped() {
+        let err = Error::HardwareClamped {
+            summary: "pbo.edc_a (req 220 A -> cap 120 A)".into(),
+            clamped: vec![],
+        };
+        assert_eq!(error_kind(&err), "hardware_clamped");
+        let payload = ErrorOutput {
+            ok: false,
+            kind: error_kind(&err),
+            error: err.to_string(),
+            hint: err.report_hint().map(str::to_string),
+        };
+        let v = serde_json::to_value(&payload).unwrap();
+        assert!(v.get("hint").is_none());
+
+        let pm_err = Error::UnsupportedPmTable {
+            codename: "Granite Ridge".into(),
+            version: 0x0062_9999,
+            size: 0x724,
+        };
+        let pm_payload = ErrorOutput {
+            ok: false,
+            kind: error_kind(&pm_err),
+            error: pm_err.to_string(),
+            hint: pm_err.report_hint().map(str::to_string),
+        };
+        let pm_v = serde_json::to_value(&pm_payload).unwrap();
+        assert!(pm_v
+            .get("hint")
+            .and_then(|h| h.as_str())
+            .is_some_and(|h| h.contains("zensmu report --raw-pm-table --open")));
+    }
+
+    #[test]
+    fn pbo_format_renders_fused_tdp_and_tjmax_when_present() {
+        let mut status = PboStatus::default();
+        status.fused.ppt_w = Some(142);
+        status.fused.vdd_tdc_a = Some(95);
+        status.fused.edc_a = Some(140);
+        status.fused.tdp_w = Some(105);
+        status.fused.tjmax_c = Some(90);
+
+        let board = SystemBoardInfo {
+            board_vendor: Some("Gigabyte Technology Co., Ltd.".into()),
+            board_name: Some("B450M DS3H V2".into()),
+            bios_version: Some("F66".into()),
+            ..Default::default()
+        };
+        let out = format_pbo_status_with_board(
+            &PboGetOutput {
+                codename: Codename::Vermeer,
+                active_limits: ActivePboLimits::default(),
+                status,
+            },
+            &board,
+        );
+        assert!(out.contains("  Fused TDP      : 105 W"), "{out}");
+        assert!(out.contains("  Fused TjMax    : 90 °C"), "{out}");
+        assert!(
+            out.contains(
+                "Board: Gigabyte Technology Co., Ltd. B450M DS3H V2 (BIOS F66) — BIOS PBO Limits / VRM firmware may cap PPT/TDC/EDC."
+            ),
+            "{out}"
+        );
+
+        // When None, omit Fused TDP and Fused TjMax lines cleanly
+        let out_none = format_pbo_status_with_board(
+            &PboGetOutput {
+                codename: Codename::GraniteRidge,
+                active_limits: ActivePboLimits::default(),
+                status: PboStatus::default(),
+            },
+            &SystemBoardInfo::default(),
+        );
+        assert!(!out_none.contains("Fused TDP"), "{out_none}");
+        assert!(!out_none.contains("Fused TjMax"), "{out_none}");
+        assert!(
+            out_none.contains("Board: BIOS PBO Limits / VRM firmware may cap PPT/TDC/EDC."),
+            "{out_none}"
+        );
+    }
+
+    #[test]
+    fn report_output_serializes_expected_json_contract() {
+        use zensmu_core::report::{collect_debug_report, ReportOptions};
+        use zensmu_core::transport::mock::MockTransport;
+
+        let transport = MockTransport::granite_ridge_9700x();
+        let report = collect_debug_report(
+            &transport,
+            &ReportOptions {
+                include_raw_pm_table: false,
+                include_mailbox_probes: false,
+                user_note: Some("test note".into()),
+                no_cpuid_check: true,
+            },
+        );
+        let payload = ReportOutput {
+            issue_title: report.suggested_issue_title(),
+            issue_labels: report
+                .suggested_labels()
+                .into_iter()
+                .map(str::to_string)
+                .collect(),
+            issue_url: report.github_issue_url(),
+            markdown: report.to_markdown(),
+            report,
+        };
+        let val = serde_json::to_value(&payload).unwrap();
+        assert!(val.get("report").is_some());
+        assert!(val.get("issue_title").and_then(|v| v.as_str()).is_some());
+        assert!(val.get("issue_labels").and_then(|v| v.as_array()).is_some());
+        assert!(val
+            .get("issue_url")
+            .and_then(|v| v.as_str())
+            .is_some_and(|u| u.starts_with("https://github.com/brauliobo/zensmu/issues/new")));
+        assert!(val
+            .get("markdown")
+            .and_then(|v| v.as_str())
+            .is_some_and(|m| m.contains("test note")));
     }
 }

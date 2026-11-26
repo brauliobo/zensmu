@@ -1,0 +1,111 @@
+name: zensmu
+arch: amd64
+platform: linux
+version: "${VERSION}"
+release: "1"
+section: utils
+priority: optional
+maintainer: "Braulio Oliveira <brauliobo@gmail.com>"
+description: |
+  Safety-first Rust CLI, live TUI (zensmu top), and unprivileged GUI (zensmu-gui)
+  for AMD Ryzen SMU control, Curve Optimizer, PBO/APU limits, and live telemetry.
+vendor: zensmu
+homepage: https://github.com/brauliobo/zensmu
+license: MIT
+
+overrides:
+  deb:
+    depends:
+      - libc6
+      - libgcc-s1
+      - polkitd | policykit-1
+    recommends:
+      - libgl1
+      - libxkbcommon0
+      - libwayland-client0
+      - libxcb1
+  rpm:
+    depends:
+      - glibc
+      - libgcc
+      - polkit
+    recommends:
+      - libglvnd-glx
+      - libxkbcommon
+      - libwayland-client
+      - libxcb
+  archlinux:
+    depends:
+      - polkit
+      - gcc-libs
+      - glibc
+    recommends:
+      - ryzen_smu-dkms-git
+      - libglvnd
+      - libxkbcommon
+      - wayland
+      - libxcb
+
+contents:
+  - src: target/release/zensmu
+    dst: /usr/bin/zensmu
+    file_info:
+      mode: 0755
+
+  - src: target/release/zensmu-gui
+    dst: /usr/bin/zensmu-gui
+    file_info:
+      mode: 0755
+
+  - src: packaging/systemd/zensmu-apply.service
+    dst: /usr/lib/systemd/system/zensmu-apply.service
+    file_info:
+      mode: 0644
+
+  - src: packaging/systemd/zensmu-record.service
+    dst: /usr/lib/systemd/user/zensmu-record.service
+    file_info:
+      mode: 0644
+
+  - src: packaging/systemd/zensmu-resume
+    dst: /usr/lib/systemd/system-sleep/zensmu-resume
+    file_info:
+      mode: 0755
+
+  - src: packaging/polkit/org.zensmu.policy
+    dst: /usr/share/polkit-1/actions/org.zensmu.policy
+    file_info:
+      mode: 0644
+
+  - dst: /etc/zensmu
+    type: dir
+    file_info:
+      mode: 0755
+
+  - src: dist/completions/zensmu.bash
+    dst: /usr/share/bash-completion/completions/zensmu
+    file_info:
+      mode: 0644
+
+  - src: dist/completions/_zensmu
+    dst: /usr/share/zsh/site-functions/_zensmu
+    file_info:
+      mode: 0644
+
+  - src: dist/completions/zensmu.fish
+    dst: /usr/share/fish/vendor_completions.d/zensmu.fish
+    file_info:
+      mode: 0644
+
+  - src: README.md
+    dst: /usr/share/doc/zensmu/README.md
+    file_info:
+      mode: 0644
+
+  - src: LICENSE
+    dst: /usr/share/licenses/zensmu/LICENSE
+    file_info:
+      mode: 0644
+
+scripts:
+  postinstall: packaging/nfpm/postinstall.sh

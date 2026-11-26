@@ -4,9 +4,16 @@
 
 Runs directly on the stock [`ryzen_smu`](https://gitlab.com/leogx9r/ryzen_smu) kernel module (`/sys/kernel/ryzen_smu_drv`) — no custom kernel fork required.
 
+### Live TUI (`zensmu top`)
+
 <p align="center">
-  <img src="docs/assets/zensmu-top.gif" alt="zensmu top live TUI monitoring and interactive tuning" width="49%" />
-  <img src="docs/assets/zensmu-gui.gif" alt="zensmu-gui WCAG-validated desktop cockpit" width="49%" />
+  <img src="docs/assets/zensmu-top.gif" alt="zensmu top live TUI monitoring and interactive tuning" width="820" />
+</p>
+
+### Desktop GUI (`zensmu-gui`)
+
+<p align="center">
+  <img src="docs/assets/zensmu-gui.gif" alt="zensmu-gui WCAG-validated desktop cockpit" width="820" />
 </p>
 
 ---
@@ -37,12 +44,18 @@ paru -S ryzen_smu-dkms-git
 
 ### 2. Install `zensmu`
 
-```bash
-# Prebuilt binary (Arch / CachyOS AUR)
-paru -S zensmu-bin
+Prebuilt packages for **Debian/Ubuntu (`.deb`)**, **Fedora/RHEL/openSUSE (`.rpm`)**, **Arch/CachyOS (`.pkg.tar.zst`)**, and generic Linux (`.tar.gz`) are published automatically on every [GitHub Release](https://github.com/brauliobo/zensmu/releases):
 
-# Or build from git (AUR)
-paru -S zensmu-git
+```bash
+# Arch Linux / CachyOS (AUR)
+paru -S zensmu-bin     # prebuilt binary
+paru -S zensmu-git     # build from main
+
+# Debian / Ubuntu (download .deb from Releases)
+sudo apt install ./zensmu_*_amd64.deb
+
+# Fedora / RHEL / openSUSE (download .rpm from Releases)
+sudo dnf install ./zensmu-*.x86_64.rpm
 ```
 
 Or build from source (Rust 1.78+):
@@ -52,7 +65,7 @@ git clone https://github.com/brauliobo/zensmu.git && cd zensmu
 cargo build --release --workspace
 ```
 
-Both AUR packages install `zensmu`, `zensmu-gui`, `zensmu-apply.service`, the `systemd-sleep` resume hook, the PolicyKit rule (`org.zensmu.policy`), and `bash`/`zsh`/`fish` completions.
+All packages install `zensmu`, `zensmu-gui`, `zensmu-apply.service`, `zensmu-record.service` (unprivileged user daemon), the `systemd-sleep` resume hook, the PolicyKit rule (`org.zensmu.policy`), and `bash`/`zsh`/`fish` completions.
 
 ---
 
@@ -66,7 +79,7 @@ sudo zensmu top           # Full live monitor + interactive [4:Tune] & [P] boot 
 zensmu-gui                # Unprivileged desktop GUI (elevates via pkexec only on demand)
 ```
 
-In `zensmu top`: `1`–`4` switch tabs (`Overview`, `Clocks & Volts`, `CO & Shaper`, `Tune`), `←/→` or `h/l` adjust limits, `a`/`Enter` opens the dry-run preview modal, `P` persists live settings + enables boot/resume service, `R` rolls back, `?` shows all keys.
+In `zensmu top`: `1`–`4` switch tabs (`Overview`, `Clocks & Volts`, `CO & Shaper`, `Tune`), `←/→` or `h/l` adjust limits, `a`/`Enter` opens the dry-run preview modal, `w`/`W` starts/stops live telemetry recording and cycles format (`CSV`/`JSONL`/`PTS`), `P` persists live settings + enables boot/resume service, `R` rolls back, `?` shows all keys.
 
 ### CLI Essentials
 
@@ -89,12 +102,28 @@ sudo zensmu shaper set --freq high --temp med=-15  # Zen 5 5x3 Curve Shaper
 sudo zensmu pbo set --ppt 105W --tdc 80A --edc 150A --tctl 85C --scalar 1 --fmax 5550
 sudo zensmu apu set --stapm 25W --fast 35W --slow 28W --tdc-soc 15A --apu-skin 70C --mode max-performance
 
+# Record telemetry over time (unprivileged — CSV, JSONL, or Phoronix Test Suite composite.xml)
+zensmu record --interval 1s --duration 10m --tag co-20 -o run.csv
+zensmu record --interval 1s --pts-name ryzen-co20  # Writes ~/.phoronix-test-suite/test-results/ryzen-co20/composite.xml
+zensmu record export-pts run.csv --pts-name ryzen-co20
+zensmu record service enable                       # Enable background user daemon (zensmu-record.service, rotating CSV)
+
 # Rollback, reset & boot/resume persistence
 sudo zensmu rollback                               # Restore last pre-change snapshot
 sudo zensmu reset                                  # Zero CO / Curve Shaper back to defaults
 sudo zensmu persist save --enable                  # Save live state to /etc/zensmu/active.toml + enable boot/resume service
 sudo zensmu persist status                         # Inspect active profile, module autoload, service, and boot guard
 sudo zensmu profile clear-guard                    # Clear boot-loop crash guard after relaxing an unstable profile
+
+# Record telemetry over time (unprivileged — CSV, JSONL, or Phoronix Test Suite composite.xml)
+zensmu record --period 60s --interval 500ms --tag prime95 -o run.csv
+zensmu record --period 5m --pts-name my-ryzen-run  # writes ~/.phoronix-test-suite/test-results/my-ryzen-run/composite.xml
+zensmu record export-pts run.csv --pts-name run-pts
+zensmu record service enable                       # enable unprivileged background user daemon (zensmu-record.service)
+
+# Report untested CPUs / PM tables or bugs (privacy-safe — no hostnames, usernames, or serials)
+zensmu report --open                               # Open prefilled GitHub issue in browser
+sudo zensmu report --raw-pm-table --create         # Collect full probes + PM floats and open via gh CLI
 ```
 
 > **Soft vs. hard safety bounds:** Conservative soft floors/ceilings (e.g., CO `-35` on Zen 4/5, `-25` on Zen 3; PPT `230 W`) require `--allow-extreme` interactively. Hardware ceilings (such as the `95 °C` Tctl cap) cannot be bypassed.

@@ -1,0 +1,14 @@
+[Unit]
+Description=zensmu background AMD Ryzen SMU telemetry recorder (unprivileged)
+Documentation=https://github.com/brauliobo/zensmu
+ConditionPathExists=/sys/kernel/ryzen_smu_drv/pm_table
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/zensmu record --interval 2s --max-size 50 --rotate 5 --append
+Restart=on-failure
+RestartSec=10
+Nice=10
+
+[Install]
+WantedBy=default.target

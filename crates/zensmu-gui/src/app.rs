@@ -1,11 +1,14 @@
 //! Application state, telemetry polling thread, and dark cockpit theme for `zensmu-gui`.
 
-use crate::elevate::{is_running_as_root, CliAction, CommandRunner, ElevatedResult, StatusPayload};
+use crate::elevate::{
+    is_running_as_root, CliAction, CommandRunner, ElevatedResult, ReportPayload, StatusPayload,
+};
 use crate::views;
 use eframe::egui;
-use std::collections::VecDeque;
+use std::collections::{BTreeMap, VecDeque};
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use std::process::Command;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver};
 use std::sync::Arc;
@@ -27,11 +30,17 @@ use zensmu_core::ops::pbo::{
     TCTL_MIN_C, TDC_MAX_A, TDC_MIN_A, TDC_SOFT_MAX_A,
 };
 use zensmu_core::ops::pm_table::{self, TelemetrySnapshot};
+use zensmu_core::recorder::{
+    default_daemon_recording_path, default_recording_path, default_recordings_dir, pts_result_path,
+    read_record_service_status, set_record_service_enabled, RecordConfig, RecordFormat,
+    RecordServiceStatus, TelemetryRecorder, USER_RECORD_SERVICE_NAME,
+};
+use zensmu_core::report::{collect_debug_report, ReportOptions, SystemBoardInfo};
 use zensmu_core::safety::guard::{BootLoopGuard, SentinelInfo};
 use zensmu_core::safety::persist::{read_persist_status, PersistPaths, PersistStatus};
 use zensmu_core::safety::snapshot::{SmuStateSnapshot, SnapshotStore};
 use zensmu_core::transport::sysfs::SysfsTransport;
-use zensmu_core::types::{ApuPowerMode, CurveShaperState, PlannedOp};
+use zensmu_core::types::{ApuPowerMode, Codename, CurveShaperState, PlannedOp};
 
 /// Ring buffer depth for live Dashboard plots (180 samples = 90s at 500ms).
 pub const TELEMETRY_RING_CAPACITY: usize = 180;
@@ -65,7 +74,11 @@ pub struct TelemetrySample {
 /// Message sent from the unprivileged telemetry poller thread to the UI.
 enum TelemetryMsg {
     Sample(Box<TelemetrySample>),
-    Error(String),
+    Error {
+        message: String,
+        suggests_report: bool,
+        hint: Option<&'static str>,
+    },
 }
 
 /// Toast severity for the bottom status bar.
@@ -573,11 +586,168 @@ impl Default for ProfileEditorState {
     }
 }
 
+/// State for the privacy-safe GitHub CPU Support / Bug Report modal.
+#[derive(Debug, Clone)]
+pub struct ReportModalState {
+    pub open: bool,
+    pub note: String,
+    pub include_raw_pm_table: bool,
+    pub include_privileged_probes: bool,
+    pub save_path: String,
+    pub payload: Option<ReportPayload>,
+    pub status_note: Option<(String, bool)>,
+}
+
+impl Default for ReportModalState {
+    fn default() -> Self {
+        Self {
+            open: false,
+            note: String::new(),
+            include_raw_pm_table: false,
+            include_privileged_probes: false,
+            save_path: "/tmp/zensmu-report.md".into(),
+            payload: None,
+            status_note: None,
+        }
+    }
+}
+
+/// Unprivileged telemetry recording & user-daemon UI state.
+pub struct RecorderUiState {
+    pub active: Option<TelemetryRecorder>,
+    pub started_at: Option<Instant>,
+    pub format: RecordFormat,
+    pub tag: String,
+    pub pts_result_name: String,
+    pub last_saved_path: Option<PathBuf>,
+    pub last_saved_samples: u64,
+    pub daemon_status: RecordServiceStatus,
+}
+
+impl Default for RecorderUiState {
+    fn default() -> Self {
+        Self {
+            active: None,
+            started_at: None,
+            format: RecordFormat::Csv,
+            tag: String::new(),
+            pts_result_name: String::new(),
+            last_saved_path: None,
+            last_saved_samples: 0,
+            daemon_status: RecordServiceStatus {
+                service_name: USER_RECORD_SERVICE_NAME.to_string(),
+                installed: false,
+                enabled: false,
+                active: false,
+                state: "unknown".to_string(),
+                default_output_path: default_daemon_recording_path().display().to_string(),
+            },
+        }
+    }
+}
+
+impl RecorderUiState {
+    /// Create initial recorder UI state with live `systemctl --user` daemon status.
+    pub fn with_detected_daemon_status() -> Self {
+        Self {
+            daemon_status: read_record_service_status(),
+            ..Self::default()
+        }
+    }
+
+    pub fn is_recording(&self) -> bool {
+        self.active.is_some()
+    }
+
+    pub fn live_samples(&self) -> u64 {
+        self.active
+            .as_ref()
+            .map(|r| r.stats().samples_written)
+            .unwrap_or(0)
+    }
+
+    pub fn live_bytes(&self) -> u64 {
+        self.active
+            .as_ref()
+            .map(|r| r.stats().bytes_written)
+            .unwrap_or(0)
+    }
+
+    pub fn elapsed_secs(&self) -> u64 {
+        self.started_at
+            .map(|started| started.elapsed().as_secs())
+            .unwrap_or(0)
+    }
+
+    pub fn active_path(&self) -> Option<&Path> {
+        self.active.as_ref().map(|r| r.path())
+    }
+
+    /// Resolve the output destination path based on current format, optional PTS result name, and codename.
+    pub fn resolve_output_path(&self, codename: Codename) -> PathBuf {
+        let pts_name = self.pts_result_name.trim();
+        if self.format == RecordFormat::Pts && !pts_name.is_empty() {
+            pts_result_path(pts_name)
+        } else {
+            default_recording_path(codename, self.format)
+        }
+    }
+
+    /// Open a new `TelemetryRecorder` writing to `path` using the configured format and tag.
+    pub fn start_with_path(&mut self, path: PathBuf) -> zensmu_core::error::Result<PathBuf> {
+        let trimmed_tag = self.tag.trim();
+        let tag = (!trimmed_tag.is_empty()).then(|| trimmed_tag.to_string());
+        let config = RecordConfig {
+            path,
+            format: self.format,
+            append: false,
+            max_file_bytes: None,
+            max_rotated_files: 0,
+            flush_every: 1,
+            tag,
+        };
+        let recorder = TelemetryRecorder::open(config)?;
+        let out_path = recorder.path().to_path_buf();
+        self.active = Some(recorder);
+        self.started_at = Some(Instant::now());
+        Ok(out_path)
+    }
+
+    /// Write a live telemetry snapshot to the active recorder, if one is open.
+    pub fn write_snapshot(&mut self, snap: &TelemetrySnapshot) -> zensmu_core::error::Result<()> {
+        if let Some(ref mut rec) = self.active {
+            rec.write_snapshot(snap)?;
+        }
+        Ok(())
+    }
+
+    /// Flush, persist last-saved metadata, and drop the active recorder.
+    pub fn stop(&mut self) -> zensmu_core::error::Result<Option<(PathBuf, u64)>> {
+        self.started_at = None;
+        let Some(mut rec) = self.active.take() else {
+            return Ok(None);
+        };
+        let flush_res = rec.flush();
+        let stats = rec.stats();
+        self.last_saved_path = Some(stats.path.clone());
+        self.last_saved_samples = stats.samples_written;
+        drop(rec);
+        flush_res?;
+        Ok(Some((stats.path, stats.samples_written)))
+    }
+}
+
 /// Top-level `eframe` application state.
 pub struct ZensmuApp {
     pub is_root: bool,
     pub hw: Option<HardwareContext>,
     pub hw_error: Option<String>,
+    pub hw_error_suggests_report: bool,
+    pub hw_error_hint: Option<&'static str>,
+    pub board_info: SystemBoardInfo,
+    pub board_caps: BTreeMap<String, u32>,
+    pub clamp_warning: Option<String>,
+    suppress_next_status_toast: bool,
     pub active_tab: Tab,
     pub ui_zoom: f32,
 
@@ -585,6 +755,8 @@ pub struct ZensmuApp {
     pub samples: VecDeque<TelemetrySample>,
     pub latest_telemetry: Option<TelemetrySnapshot>,
     pub telemetry_error: Option<String>,
+    pub telemetry_error_suggests_report: bool,
+    pub telemetry_error_hint: Option<&'static str>,
     pub poll_interval_ms: u64,
     pub telemetry_paused: bool,
     telemetry_rx: Option<Receiver<TelemetryMsg>>,
@@ -605,14 +777,18 @@ pub struct ZensmuApp {
     pub apu_editor: ApuEditorState,
     pub profile_editor: ProfileEditorState,
 
+    // Unprivileged telemetry recording & user-level background daemon
+    pub recorder: RecorderUiState,
+
     // Unprivileged boot/resume persistence status & confirmation modal
     pub persist_status: PersistStatus,
     pub persist_confirm: Option<PersistConfirmModal>,
     staging_persist_path: Option<PathBuf>,
     staging_profile_path: Option<PathBuf>,
 
-    // Dry-run confirmation modal & async pkexec runner
+    // Dry-run confirmation modal, report modal & async pkexec runner
     pub pending_modal: Option<DryRunModal>,
+    pub report_modal: ReportModalState,
     pub runner: CommandRunner,
     pub toast: Option<StatusToast>,
 }
@@ -628,11 +804,19 @@ impl ZensmuApp {
             is_root,
             hw: None,
             hw_error: None,
+            hw_error_suggests_report: false,
+            hw_error_hint: None,
+            board_info: SystemBoardInfo::detect_linux(),
+            board_caps: BTreeMap::new(),
+            clamp_warning: None,
+            suppress_next_status_toast: false,
             active_tab: Tab::Dashboard,
             ui_zoom: UI_ZOOM_DEFAULT,
             samples: VecDeque::with_capacity(TELEMETRY_RING_CAPACITY),
             latest_telemetry: None,
             telemetry_error: None,
+            telemetry_error_suggests_report: false,
+            telemetry_error_hint: None,
             poll_interval_ms: 500,
             telemetry_paused: false,
             telemetry_rx: None,
@@ -648,11 +832,13 @@ impl ZensmuApp {
             pbo_editor: PboEditorState::default(),
             apu_editor: ApuEditorState::default(),
             profile_editor: ProfileEditorState::default(),
+            recorder: RecorderUiState::with_detected_daemon_status(),
             persist_status: read_persist_status(&PersistPaths::default(), None, None),
             persist_confirm: None,
             staging_persist_path: None,
             staging_profile_path: None,
             pending_modal: None,
+            report_modal: ReportModalState::default(),
             runner,
             toast: None,
         };
@@ -710,6 +896,8 @@ impl ZensmuApp {
     /// Probe `/sys/kernel/ryzen_smu_drv/` read-only attributes without root.
     pub fn probe_hardware(&mut self, ctx: &egui::Context) {
         self.stop_telemetry_thread();
+        self.board_caps.clear();
+        self.clamp_warning = None;
 
         let transport = SysfsTransport::default();
         match detect_hardware(&transport, true) {
@@ -722,7 +910,11 @@ impl ZensmuApp {
                     self.profile_editor.toml_text = default_profile_template(&hw);
                 }
                 self.hw_error = None;
+                self.hw_error_suggests_report = false;
+                self.hw_error_hint = None;
                 self.telemetry_error = None;
+                self.telemetry_error_suggests_report = false;
+                self.telemetry_error_hint = None;
                 self.start_telemetry_thread(hw.clone(), ctx.clone());
                 self.hw = Some(hw);
                 self.set_toast(
@@ -732,6 +924,8 @@ impl ZensmuApp {
             }
             Err(err) => {
                 self.hw = None;
+                self.hw_error_suggests_report = err.suggests_report();
+                self.hw_error_hint = err.report_hint();
                 self.hw_error = Some(err.to_string());
                 self.set_toast(
                     ToastLevel::Warning,
@@ -762,6 +956,115 @@ impl ZensmuApp {
         self.profile_editor.has_last_state = store.last_state_path().exists();
     }
 
+    /// Start unprivileged live telemetry recording to the configured format and path.
+    pub fn start_recording(&mut self) {
+        if self.recorder.is_recording() {
+            return;
+        }
+        let codename = self
+            .hw
+            .as_ref()
+            .map(|h| h.codename)
+            .unwrap_or(Codename::Undefined);
+        let path = self.recorder.resolve_output_path(codename);
+        let fmt_label = self.recorder.format.as_str().to_ascii_uppercase();
+        match self.recorder.start_with_path(path) {
+            Ok(out_path) => {
+                self.set_toast(
+                    ToastLevel::Success,
+                    format!("Recording {fmt_label} telemetry to {}", out_path.display()),
+                );
+            }
+            Err(err) => {
+                self.set_toast(
+                    ToastLevel::Error,
+                    format!("Failed to start telemetry recording: {err}"),
+                );
+            }
+        }
+    }
+
+    /// Flush and stop the active telemetry recording, saving last-file summary metadata.
+    pub fn stop_recording(&mut self) {
+        match self.recorder.stop() {
+            Ok(Some((path, samples))) => {
+                self.set_toast(
+                    ToastLevel::Success,
+                    format!("Saved {samples} samples to {}", path.display()),
+                );
+            }
+            Ok(None) => {}
+            Err(err) => {
+                self.set_toast(
+                    ToastLevel::Error,
+                    format!("Recording stopped with flush error: {err}"),
+                );
+            }
+        }
+    }
+
+    /// Toggle live telemetry recording on or off.
+    pub fn toggle_recording(&mut self) {
+        if self.recorder.is_recording() {
+            self.stop_recording();
+        } else {
+            self.start_recording();
+        }
+    }
+
+    /// Enable or disable the unprivileged user-level `zensmu-record.service` daemon (no `pkexec`).
+    pub fn toggle_record_daemon(&mut self) {
+        let target_enable = !self.recorder.daemon_status.enabled;
+        match set_record_service_enabled(target_enable) {
+            Ok(status) => {
+                self.recorder.daemon_status = status;
+                let msg = if target_enable {
+                    format!("Enabled background telemetry daemon ({USER_RECORD_SERVICE_NAME}).")
+                } else {
+                    format!("Disabled background telemetry daemon ({USER_RECORD_SERVICE_NAME}).")
+                };
+                self.set_toast(ToastLevel::Info, msg);
+            }
+            Err(err) => {
+                self.recorder.daemon_status = read_record_service_status();
+                self.set_toast(
+                    ToastLevel::Error,
+                    format!("Background recorder toggle failed: {err}"),
+                );
+            }
+        }
+    }
+
+    /// Refresh unprivileged `zensmu-record.service` status via `systemctl --user`.
+    pub fn refresh_record_daemon_status(&mut self) {
+        self.recorder.daemon_status = read_record_service_status();
+    }
+
+    /// Ensure the default telemetry recordings folder exists and open it via `xdg-open` (no shell).
+    pub fn open_recordings_folder(&self) -> Result<PathBuf, String> {
+        let dir = default_recordings_dir();
+        fs::create_dir_all(&dir).map_err(|e| {
+            format!(
+                "Failed to create recordings directory '{}': {e}",
+                dir.display()
+            )
+        })?;
+        Command::new("xdg-open")
+            .arg(&dir)
+            .spawn()
+            .map(|_| dir.clone())
+            .map_err(|e| {
+                if e.kind() == std::io::ErrorKind::NotFound {
+                    format!(
+                        "Could not find `xdg-open`. Recordings are stored in '{}'.",
+                        dir.display()
+                    )
+                } else {
+                    format!("Failed to open '{}': {e}", dir.display())
+                }
+            })
+    }
+
     fn stop_telemetry_thread(&mut self) {
         self.telemetry_stop.store(true, Ordering::Relaxed);
         self.telemetry_rx = None;
@@ -788,7 +1091,11 @@ impl ZensmuApp {
                             elapsed_s: start_time.elapsed().as_secs_f64(),
                             snapshot,
                         })),
-                        Err(e) => TelemetryMsg::Error(e.to_string()),
+                        Err(e) => TelemetryMsg::Error {
+                            suggests_report: e.suggests_report(),
+                            hint: e.report_hint(),
+                            message: e.to_string(),
+                        },
                     };
                     if tx.send(msg).is_err() {
                         break;
@@ -1070,6 +1377,97 @@ impl ZensmuApp {
         self.dispatch_cli(action, ctx);
     }
 
+    /// Open the GitHub CPU Support / Bug Report modal and immediately pre-generate
+    /// an unprivileged diagnostic report so the Markdown preview is never empty.
+    pub fn open_report_modal(&mut self) {
+        self.report_modal.open = true;
+        self.report_modal.status_note = None;
+        self.generate_unprivileged_report();
+    }
+
+    /// Open the report modal pre-configured with raw PM table float dumps enabled
+    /// (ideal for unsupported CPUs or unrecognized PM table versions).
+    pub fn open_report_modal_for_unsupported(&mut self) {
+        self.report_modal.include_raw_pm_table = true;
+        self.open_report_modal();
+    }
+
+    /// Synchronously collect an unprivileged, strictly read-only diagnostic report.
+    pub fn generate_unprivileged_report(&mut self) {
+        let note = self.report_modal.note.trim();
+        let opts = ReportOptions {
+            include_raw_pm_table: self.report_modal.include_raw_pm_table,
+            include_mailbox_probes: false,
+            user_note: (!note.is_empty()).then(|| note.to_string()),
+            no_cpuid_check: false,
+        };
+        let report = collect_debug_report(&SysfsTransport::default(), &opts);
+        self.report_modal.payload = Some(ReportPayload::from_report(report));
+    }
+
+    /// Refresh diagnostics in the report modal — either synchronously (unprivileged)
+    /// or asynchronously via `pkexec zensmu report --json` when privileged probes are enabled.
+    pub fn refresh_report(&mut self, ctx: &egui::Context) {
+        if self.report_modal.include_privileged_probes {
+            if self.runner.is_busy() {
+                self.report_modal.status_note = Some((
+                    "Another SMU command is already running — please wait.".into(),
+                    false,
+                ));
+                return;
+            }
+            let note = self.report_modal.note.trim();
+            let action = CliAction::Report {
+                raw_pm_table: self.report_modal.include_raw_pm_table,
+                note: (!note.is_empty()).then(|| note.to_string()),
+            };
+            self.report_modal.status_note = Some((
+                if self.is_root {
+                    "Collecting privileged SMU diagnostics…".into()
+                } else {
+                    "Collecting privileged SMU diagnostics via pkexec…".into()
+                },
+                true,
+            ));
+            self.dispatch_cli(action, ctx);
+        } else {
+            self.generate_unprivileged_report();
+            self.report_modal.status_note =
+                Some(("Refreshed unprivileged hardware diagnostics.".into(), true));
+        }
+    }
+
+    /// Save the currently generated Markdown report to `report_modal.save_path`.
+    pub fn save_report_to_disk(&mut self) {
+        let Some(markdown) = self
+            .report_modal
+            .payload
+            .as_ref()
+            .map(|p| p.markdown.clone())
+        else {
+            self.report_modal.status_note = Some((
+                "No report generated yet — click Refresh Diagnostics.".into(),
+                false,
+            ));
+            return;
+        };
+        let path = self.report_modal.save_path.trim().to_string();
+        if path.is_empty() {
+            self.report_modal.status_note =
+                Some(("Please enter a destination file path.".into(), false));
+            return;
+        }
+        match fs::write(&path, markdown) {
+            Ok(()) => {
+                self.report_modal.status_note = Some((format!("Saved to {path}"), true));
+            }
+            Err(e) => {
+                self.report_modal.status_note =
+                    Some((format!("Failed to save '{path}': {e}"), false));
+            }
+        }
+    }
+
     /// Export current live hardware state via `zensmu profile export` to a temp file and display it.
     pub fn export_current_profile(&mut self, ctx: &egui::Context) {
         let tmp_path =
@@ -1089,17 +1487,32 @@ impl ZensmuApp {
             match msg {
                 TelemetryMsg::Sample(sample) => {
                     let sample = *sample;
+                    if let Err(err) = self.recorder.write_snapshot(&sample.snapshot) {
+                        let _ = self.recorder.stop();
+                        self.set_toast(
+                            ToastLevel::Error,
+                            format!("Telemetry recording stopped due to write error: {err}"),
+                        );
+                    }
                     self.pbo_editor.sync_from_telemetry(&sample.snapshot);
                     self.apu_editor.sync_from_telemetry(&sample.snapshot);
                     self.latest_telemetry = Some(sample.snapshot.clone());
                     self.telemetry_error = None;
+                    self.telemetry_error_suggests_report = false;
+                    self.telemetry_error_hint = None;
                     if self.samples.len() >= TELEMETRY_RING_CAPACITY {
                         self.samples.pop_front();
                     }
                     self.samples.push_back(sample);
                 }
-                TelemetryMsg::Error(err) => {
-                    self.telemetry_error = Some(err);
+                TelemetryMsg::Error {
+                    message,
+                    suggests_report,
+                    hint,
+                } => {
+                    self.telemetry_error = Some(message);
+                    self.telemetry_error_suggests_report = suggests_report;
+                    self.telemetry_error_hint = hint;
                 }
             }
         }
@@ -1112,7 +1525,11 @@ impl ZensmuApp {
                     self.apply_status_payload(*payload);
                     self.refresh_safety_files();
                     self.refresh_persist_status();
-                    self.set_toast(ToastLevel::Success, "Refreshed live SMU state.");
+                    if self.suppress_next_status_toast {
+                        self.suppress_next_status_toast = false;
+                    } else {
+                        self.set_toast(ToastLevel::Success, "Refreshed live SMU state.");
+                    }
                 }
                 ElevatedResult::Co(snap) => {
                     self.sync_co_from_snapshot(snap);
@@ -1130,6 +1547,17 @@ impl ZensmuApp {
                         "Read current PBO status & fused limits.",
                     );
                 }
+                ElevatedResult::Report(payload) => {
+                    self.report_modal.payload = Some(*payload);
+                    self.report_modal.status_note = Some((
+                        "Refreshed diagnostics with privileged SMU probes.".into(),
+                        true,
+                    ));
+                    self.set_toast(
+                        ToastLevel::Success,
+                        "Collected privileged hardware diagnostic report.",
+                    );
+                }
                 ElevatedResult::DryRunPlan {
                     title,
                     live_action,
@@ -1143,6 +1571,7 @@ impl ZensmuApp {
                 }
                 ElevatedResult::Applied { title, ops } => {
                     self.cleanup_staging_profile();
+                    self.clamp_warning = None;
                     self.pbo_editor.clear_dirty();
                     self.apu_editor.clear_dirty();
                     self.refresh_safety_files();
@@ -1200,9 +1629,30 @@ impl ZensmuApp {
                         );
                     }
                 }
+                ElevatedResult::HardwareClamped { message, caps } => {
+                    self.cleanup_staging_persist();
+                    self.cleanup_staging_profile();
+                    self.pbo_editor.clear_dirty();
+                    self.apu_editor.clear_dirty();
+                    for (field, cap) in caps {
+                        self.board_caps.insert(field, cap);
+                    }
+                    self.clamp_warning = Some(message.clone());
+                    self.set_toast(
+                        ToastLevel::Warning,
+                        format!("Board/BIOS clamped limit — check BIOS PBO Limits: {message}"),
+                    );
+                    // Immediately resync sliders to the actual clamped hardware values.
+                    self.suppress_next_status_toast = true;
+                    self.dispatch_cli(CliAction::Status, ctx);
+                }
                 ElevatedResult::Error { title, message } => {
                     self.cleanup_staging_persist();
                     self.cleanup_staging_profile();
+                    if self.report_modal.open && title == "Collect Hardware Report" {
+                        self.report_modal.status_note =
+                            Some((format!("Privileged report failed: {message}"), false));
+                    }
                     self.set_toast(ToastLevel::Error, format!("{title}: {message}"));
                 }
             }
@@ -1259,6 +1709,7 @@ impl ZensmuApp {
 
 impl Drop for ZensmuApp {
     fn drop(&mut self) {
+        let _ = self.recorder.stop();
         self.telemetry_stop.store(true, Ordering::Relaxed);
         self.cleanup_staging_persist();
         self.cleanup_staging_profile();
@@ -1270,6 +1721,10 @@ impl eframe::App for ZensmuApp {
         self.handle_zoom_shortcuts(ctx);
         self.drain_telemetry();
         self.drain_cli_results(ctx);
+
+        if self.recorder.is_recording() {
+            ctx.request_repaint_after(Duration::from_millis(500));
+        }
 
         views::render_top_bar(self, ctx);
         views::render_bottom_bar(self, ctx);
@@ -1297,6 +1752,79 @@ impl eframe::App for ZensmuApp {
 
         views::render_dry_run_modal(self, ctx);
         views::render_persist_confirm_modal(self, ctx);
+        views::render_report_modal(self, ctx);
+    }
+}
+
+/// Returns true when a CLI/telemetry error string indicates an unexpected SMU rejection,
+/// verification failure, unsupported CPU/PM table, or identity mismatch where filing a
+/// diagnostic GitHub report is helpful.
+pub fn error_message_suggests_report(msg: &str) -> bool {
+    let lower = msg.to_ascii_lowercase();
+    lower.contains("smu rejected")
+        || lower.contains("verification failed")
+        || lower.contains("unsupported")
+        || lower.contains("mismatch")
+        || lower.contains("mailbox health check failed")
+}
+
+/// Launch an `http://` or `https://` URL in the user's desktop browser via `xdg-open`
+/// without any shell interpolation.
+pub fn open_url_in_browser(url: &str) -> Result<(), String> {
+    let trimmed = url.trim();
+    if !(trimmed.starts_with("https://") || trimmed.starts_with("http://")) {
+        return Err("Refused to open URL: only http:// and https:// URLs are supported.".into());
+    }
+    Command::new("xdg-open")
+        .arg(trimmed)
+        .spawn()
+        .map(|_| ())
+        .map_err(|e| {
+            if e.kind() == std::io::ErrorKind::NotFound {
+                "Could not find `xdg-open`. Copy the Markdown report and open GitHub manually."
+                    .into()
+            } else {
+                format!("Failed to launch browser via `xdg-open`: {e}")
+            }
+        })
+}
+
+/// Format a compact motherboard & BIOS summary string from non-identifying DMI fields.
+pub fn format_board_summary(info: &SystemBoardInfo) -> Option<String> {
+    let vendor = info
+        .board_vendor
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
+    let name = info
+        .board_name
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
+    let bios = info
+        .bios_version
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
+
+    let board_part = match (vendor, name) {
+        (Some(v), Some(n)) => {
+            if n.to_ascii_lowercase().starts_with(&v.to_ascii_lowercase()) {
+                Some(n.to_string())
+            } else {
+                Some(format!("{v} {n}"))
+            }
+        }
+        (Some(v), None) => Some(v.to_string()),
+        (None, Some(n)) => Some(n.to_string()),
+        (None, None) => None,
+    };
+
+    match (board_part, bios) {
+        (Some(b), Some(v)) => Some(format!("{b} · BIOS {v}")),
+        (Some(b), None) => Some(b),
+        (None, Some(v)) => Some(format!("BIOS {v}")),
+        (None, None) => None,
     }
 }
 
@@ -2055,5 +2583,206 @@ mod tests {
             views::compact_cpu_label("AMD Ryzen 7 5700G with Radeon Graphics"),
             "Ryzen 7 5700G"
         );
+    }
+
+    #[test]
+    fn format_board_summary_formats_vendor_model_and_bios_cleanly() {
+        let full = SystemBoardInfo {
+            board_vendor: Some("Gigabyte Technology Co., Ltd.".into()),
+            board_name: Some("B450M DS3H V2".into()),
+            bios_version: Some("F65b".into()),
+            ..SystemBoardInfo::default()
+        };
+        assert_eq!(
+            format_board_summary(&full).as_deref(),
+            Some("Gigabyte Technology Co., Ltd. B450M DS3H V2 · BIOS F65b")
+        );
+
+        let no_vendor = SystemBoardInfo {
+            board_name: Some("ROG STRIX X670E-E".into()),
+            bios_version: Some("2401".into()),
+            ..SystemBoardInfo::default()
+        };
+        assert_eq!(
+            format_board_summary(&no_vendor).as_deref(),
+            Some("ROG STRIX X670E-E · BIOS 2401")
+        );
+
+        assert_eq!(format_board_summary(&SystemBoardInfo::default()), None);
+    }
+
+    #[test]
+    fn open_url_in_browser_rejects_non_http_schemes() {
+        let err = open_url_in_browser("file:///etc/passwd").unwrap_err();
+        assert!(err.contains("http://"));
+        assert!(open_url_in_browser("javascript:alert(1)").is_err());
+    }
+
+    #[test]
+    fn error_message_suggests_report_matches_smu_and_unsupported_errors() {
+        assert!(error_message_suggests_report("SMU rejected command 0x07"));
+        assert!(error_message_suggests_report(
+            "read-after-write verification failed for pbo.ppt_w"
+        ));
+        assert!(error_message_suggests_report(
+            "unsupported PM table version 0xDEADBEEF"
+        ));
+        assert!(error_message_suggests_report(
+            "CPU identity mismatch: ryzen_smu reports Vermeer"
+        ));
+        assert!(!error_message_suggests_report(
+            "PolicyKit authentication was dismissed or cancelled."
+        ));
+    }
+
+    #[test]
+    fn report_modal_state_defaults_match_expected_path_and_flags() {
+        let state = ReportModalState::default();
+        assert!(!state.open);
+        assert!(!state.include_raw_pm_table);
+        assert!(!state.include_privileged_probes);
+        assert_eq!(state.save_path, "/tmp/zensmu-report.md");
+        assert!(state.payload.is_none());
+        assert!(state.status_note.is_none());
+    }
+
+    #[test]
+    fn recorder_ui_state_records_and_flushes_csv_jsonl_and_pts_cleanly() {
+        use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
+        use zensmu_core::recorder::CSV_HEADER;
+
+        static TEST_SEQ: AtomicU64 = AtomicU64::new(0);
+        let seq = TEST_SEQ.fetch_add(1, AtomicOrdering::Relaxed);
+        let test_dir = std::env::temp_dir().join(format!(
+            "zensmu-gui-recorder-test-{}-{seq}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&test_dir);
+        fs::create_dir_all(&test_dir).unwrap();
+
+        struct CleanupDir(PathBuf);
+        impl Drop for CleanupDir {
+            fn drop(&mut self) {
+                let _ = fs::remove_dir_all(&self.0);
+            }
+        }
+        let _cleanup = CleanupDir(test_dir.clone());
+
+        let sample_a = TelemetrySnapshot {
+            codename: Codename::GraniteRidge,
+            table_version: 0x0062_0205,
+            table_size: 0x800,
+            ppt_limit_w: Some(142.0),
+            ppt_value_w: Some(88.5),
+            tdc_limit_a: Some(110.0),
+            tdc_value_a: Some(62.0),
+            edc_limit_a: Some(170.0),
+            edc_value_a: Some(95.0),
+            tctl_limit_c: Some(95.0),
+            tctl_value_c: Some(71.25),
+            stapm_limit_w: None,
+            stapm_value_w: None,
+            slow_limit_w: None,
+            slow_value_w: None,
+            apu_slow_limit_w: None,
+            apu_slow_value_w: None,
+            tdc_soc_limit_a: None,
+            tdc_soc_value_a: None,
+            edc_soc_limit_a: None,
+            edc_soc_value_a: None,
+            apu_skin_temp_limit_c: None,
+            apu_skin_temp_value_c: None,
+            dgpu_skin_temp_limit_c: None,
+            dgpu_skin_temp_value_c: None,
+            fclk_mhz: Some(2000.0),
+            uclk_mhz: Some(3000.0),
+            mclk_mhz: Some(3000.0),
+            vddcr_soc_v: Some(1.24),
+            vddcr_misc_v: Some(1.10),
+            cldo_vddp_v: Some(0.95),
+            cldo_vddg_iod_v: Some(0.95),
+            cldo_vddg_ccd_v: Some(0.95),
+        };
+        let mut sample_b = sample_a.clone();
+        sample_b.ppt_value_w = Some(102.0);
+        sample_b.tctl_value_c = Some(76.5);
+
+        let mut ui_state = RecorderUiState::default();
+        assert!(!ui_state.is_recording());
+        assert_eq!(ui_state.format, RecordFormat::Csv);
+
+        // 1. CSV recording
+        ui_state.format = RecordFormat::Csv;
+        ui_state.tag = "co-20".into();
+        let csv_path = test_dir.join("run.csv");
+        let opened = ui_state.start_with_path(csv_path.clone()).unwrap();
+        assert_eq!(opened, csv_path);
+        assert!(ui_state.is_recording());
+        assert!(ui_state.started_at.is_some());
+        ui_state.write_snapshot(&sample_a).unwrap();
+        ui_state.write_snapshot(&sample_b).unwrap();
+        assert_eq!(ui_state.live_samples(), 2);
+
+        let stopped = ui_state.stop().unwrap().unwrap();
+        assert_eq!(stopped, (csv_path.clone(), 2));
+        assert!(!ui_state.is_recording());
+        assert!(ui_state.started_at.is_none());
+        assert_eq!(ui_state.last_saved_path.as_ref(), Some(&csv_path));
+        assert_eq!(ui_state.last_saved_samples, 2);
+
+        let csv_text = fs::read_to_string(&csv_path).unwrap();
+        let csv_lines: Vec<&str> = csv_text.lines().collect();
+        assert_eq!(csv_lines.len(), 3, "expected header + 2 rows");
+        assert_eq!(csv_lines[0], CSV_HEADER);
+        assert!(csv_lines[1].contains("granite-ridge,co-20,88.50,142.00"));
+        assert!(csv_lines[2].contains("granite-ridge,co-20,102.00,142.00"));
+
+        // 2. JSONL recording
+        ui_state.format = RecordFormat::Jsonl;
+        ui_state.tag = "gaming".into();
+        let jsonl_path = test_dir.join("run.jsonl");
+        ui_state.start_with_path(jsonl_path.clone()).unwrap();
+        ui_state.write_snapshot(&sample_a).unwrap();
+        ui_state.write_snapshot(&sample_b).unwrap();
+        let stopped = ui_state.stop().unwrap().unwrap();
+        assert_eq!(stopped, (jsonl_path.clone(), 2));
+        assert_eq!(ui_state.last_saved_path.as_ref(), Some(&jsonl_path));
+        assert_eq!(ui_state.last_saved_samples, 2);
+
+        let jsonl_text = fs::read_to_string(&jsonl_path).unwrap();
+        let jsonl_lines: Vec<&str> = jsonl_text.lines().collect();
+        assert_eq!(jsonl_lines.len(), 2);
+        let parsed0: serde_json::Value = serde_json::from_str(jsonl_lines[0]).unwrap();
+        let parsed1: serde_json::Value = serde_json::from_str(jsonl_lines[1]).unwrap();
+        assert_eq!(parsed0["tag"], "gaming");
+        assert_eq!(parsed0["ppt_value_w"], 88.5);
+        assert_eq!(parsed1["ppt_value_w"], 102.0);
+
+        // 3. PTS composite.xml recording + PTS result path resolution
+        ui_state.format = RecordFormat::Pts;
+        ui_state.tag = "prime95".into();
+        ui_state.pts_result_name = "my-bench-run".into();
+        let resolved_pts = ui_state.resolve_output_path(Codename::GraniteRidge);
+        assert!(
+            resolved_pts.ends_with("test-results/my-bench-run/composite.xml"),
+            "unexpected resolved PTS path: {}",
+            resolved_pts.display()
+        );
+
+        let pts_path = test_dir.join("composite.xml");
+        ui_state.start_with_path(pts_path.clone()).unwrap();
+        ui_state.write_snapshot(&sample_a).unwrap();
+        ui_state.write_snapshot(&sample_b).unwrap();
+        let stopped = ui_state.stop().unwrap().unwrap();
+        assert_eq!(stopped, (pts_path.clone(), 2));
+        assert_eq!(ui_state.last_saved_path.as_ref(), Some(&pts_path));
+        assert_eq!(ui_state.last_saved_samples, 2);
+
+        let xml = fs::read_to_string(&pts_path).unwrap();
+        assert!(xml.contains("<PhoronixTestSuite>"));
+        assert!(xml.contains("<Identifier>zensmu/ppt</Identifier>"));
+        assert!(xml.contains("<Identifier>zensmu/tctl</Identifier>"));
+        assert!(xml.contains("88.50:102.00"));
+        assert!(xml.contains("</PhoronixTestSuite>"));
     }
 }

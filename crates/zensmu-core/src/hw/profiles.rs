@@ -128,6 +128,7 @@ pub struct CpuCapabilities {
     pub get_fused_vdd_tdc: Option<OpcodeSpec>,
     pub get_fused_edc: Option<OpcodeSpec>,
     pub get_fused_soc_tdc: Option<OpcodeSpec>,
+    pub get_sustained_power_thm: Option<OpcodeSpec>,
 
     // APU-specific DPTC controls
     pub set_stapm_limit: Option<DualOpcode>,
@@ -253,6 +254,7 @@ fn zen4_desktop(codename: Codename) -> CpuCapabilities {
         get_fused_vdd_tdc: Some(OpcodeSpec::rsmu(0xDB)),
         get_fused_edc: Some(OpcodeSpec::rsmu(0xDC)),
         get_fused_soc_tdc: None,
+        get_sustained_power_thm: Some(OpcodeSpec::mp1(0x23)),
 
         set_stapm_limit: None,
         set_stapm_time: None,
@@ -324,6 +326,7 @@ fn zen3_desktop(codename: Codename) -> CpuCapabilities {
         get_fused_vdd_tdc: None,
         get_fused_edc: None,
         get_fused_soc_tdc: None,
+        get_sustained_power_thm: Some(OpcodeSpec::mp1(0x23)),
 
         set_stapm_limit: None,
         set_stapm_time: None,
@@ -380,6 +383,7 @@ fn zen2_desktop(codename: Codename) -> CpuCapabilities {
         get_fused_vdd_tdc: None,
         get_fused_edc: None,
         get_fused_soc_tdc: None,
+        get_sustained_power_thm: Some(OpcodeSpec::mp1(0x23)),
 
         set_stapm_limit: None,
         set_stapm_time: None,
@@ -433,6 +437,7 @@ fn zen_empty_f17(codename: Codename, rsmu_rsp: u32, mp1_rsp: u32) -> CpuCapabili
         get_fused_vdd_tdc: None,
         get_fused_edc: None,
         get_fused_soc_tdc: None,
+        get_sustained_power_thm: None,
         set_stapm_limit: None,
         set_stapm_time: None,
         set_slow_limit: None,
@@ -451,6 +456,7 @@ fn zen1_desktop(codename: Codename) -> CpuCapabilities {
     let mut caps = zen_empty_f17(codename, 0x03B1_0568, 0x03B1_0564);
     caps.set_ppt = Some(DualOpcode::rsmu_then_mp1(0x58, 0x31));
     caps.set_edc = Some(DualOpcode::mp1_only(0x2A));
+    caps.get_sustained_power_thm = Some(OpcodeSpec::rsmu(0x5F));
     caps
 }
 
@@ -491,6 +497,7 @@ fn apu0_base(codename: Codename) -> CpuCapabilities {
     caps.set_power_saving = Some(OpcodeSpec::mp1(0x19));
     caps.get_pbo_scalar = Some(OpcodeSpec::rsmu(0x62));
     caps.get_is_overclockable = Some(OpcodeSpec::rsmu(0x4C));
+    caps.get_sustained_power_thm = Some(OpcodeSpec::mp1(0x43));
     caps
 }
 
@@ -582,6 +589,7 @@ fn apu1_base(codename: Codename) -> CpuCapabilities {
         get_fused_vdd_tdc: Some(OpcodeSpec::rsmu(0x15)),
         get_fused_edc: None,
         get_fused_soc_tdc: Some(OpcodeSpec::rsmu(0x16)),
+        get_sustained_power_thm: Some(OpcodeSpec::mp1(0x5B)),
 
         set_stapm_limit: Some(DualOpcode::mp1_then_rsmu(0x14, 0x31)),
         set_stapm_time: Some(DualOpcode::mp1_then_rsmu(0x18, 0x36)),
@@ -611,6 +619,7 @@ fn apu1_vangogh(codename: Codename) -> CpuCapabilities {
     caps.set_apu_slow_limit = Some(DualOpcode::mp1_then_rsmu(0x23, 0x34));
     caps.set_apu_skin_temp = Some(DualOpcode::mp1_then_rsmu(0x33, 0x91));
     caps.set_dgpu_skin_temp = Some(DualOpcode::mp1_then_rsmu(0x34, 0x92));
+    caps.get_sustained_power_thm = Some(OpcodeSpec::mp1(0x54));
     caps
 }
 
@@ -636,6 +645,7 @@ fn apu1_phoenix(codename: Codename) -> CpuCapabilities {
     caps.set_apu_slow_limit = Some(DualOpcode::rsmu_then_mp1(0x34, 0x23));
     caps.set_apu_skin_temp = Some(DualOpcode::rsmu_then_mp1(0x91, 0x33));
     caps.set_dgpu_skin_temp = Some(DualOpcode::rsmu_then_mp1(0x92, 0x34));
+    caps.get_sustained_power_thm = Some(OpcodeSpec::mp1(0x5F));
     caps
 }
 
@@ -731,5 +741,87 @@ mod tests {
         let sr = capabilities_for(Codename::SummitRidge).unwrap();
         assert_eq!(sr.set_ppt, Some(DualOpcode::rsmu_then_mp1(0x58, 0x31)));
         assert_eq!(sr.set_edc, Some(DualOpcode::mp1_only(0x2A)));
+        assert_eq!(sr.get_sustained_power_thm, Some(OpcodeSpec::rsmu(0x5F)));
+    }
+
+    #[test]
+    fn sustained_power_and_thm_opcodes_match_platform_profiles() {
+        assert_eq!(
+            capabilities_for(Codename::SummitRidge)
+                .unwrap()
+                .get_sustained_power_thm,
+            Some(OpcodeSpec::rsmu(0x5F))
+        );
+        assert_eq!(
+            capabilities_for(Codename::ThreadRipper)
+                .unwrap()
+                .get_sustained_power_thm,
+            Some(OpcodeSpec::rsmu(0x5F))
+        );
+        for codename in [
+            Codename::Matisse,
+            Codename::CastlePeak,
+            Codename::Vermeer,
+            Codename::Chagall,
+            Codename::Raphael,
+            Codename::StormPeak,
+            Codename::GraniteRidge,
+        ] {
+            assert_eq!(
+                capabilities_for(codename).unwrap().get_sustained_power_thm,
+                Some(OpcodeSpec::mp1(0x23)),
+                "{codename:?}"
+            );
+        }
+        for codename in [
+            Codename::RavenRidge,
+            Codename::RavenRidge2,
+            Codename::Dali,
+            Codename::Picasso,
+        ] {
+            assert_eq!(
+                capabilities_for(codename).unwrap().get_sustained_power_thm,
+                Some(OpcodeSpec::mp1(0x43)),
+                "{codename:?}"
+            );
+        }
+        for codename in [Codename::Renoir, Codename::Lucienne, Codename::Cezanne] {
+            assert_eq!(
+                capabilities_for(codename).unwrap().get_sustained_power_thm,
+                Some(OpcodeSpec::mp1(0x5B)),
+                "{codename:?}"
+            );
+        }
+        assert_eq!(
+            capabilities_for(Codename::VanGogh)
+                .unwrap()
+                .get_sustained_power_thm,
+            Some(OpcodeSpec::mp1(0x54))
+        );
+        for codename in [
+            Codename::Phoenix,
+            Codename::HawkPoint,
+            Codename::Rembrandt,
+            Codename::StrixPoint,
+            Codename::StrixHalo,
+        ] {
+            assert_eq!(
+                capabilities_for(codename).unwrap().get_sustained_power_thm,
+                Some(OpcodeSpec::mp1(0x5F)),
+                "{codename:?}"
+            );
+        }
+        assert_eq!(
+            capabilities_for(Codename::PinnacleRidge)
+                .unwrap()
+                .get_sustained_power_thm,
+            None
+        );
+        assert_eq!(
+            capabilities_for(Codename::Colfax)
+                .unwrap()
+                .get_sustained_power_thm,
+            None
+        );
     }
 }

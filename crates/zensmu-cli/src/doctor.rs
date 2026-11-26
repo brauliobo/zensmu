@@ -140,7 +140,7 @@ pub fn run_doctor(
                 "capability_profile",
                 "CPU capability profile",
                 format!("unsupported CPU {codename}: {detail}"),
-                Some("zensmu refuses unverified CPUs rather than guessing SMU opcodes"),
+                Some("zensmu refuses unverified CPUs rather than guessing SMU opcodes; help add support with: zensmu report --raw-pm-table --open"),
             ));
             None
         }
@@ -312,7 +312,7 @@ fn check_cpuid_consistency(
             ID,
             NAME,
             format!("unrecognized driver codename id={}", info.codename_id),
-            Some("Update zensmu or check ryzen_smu version"),
+            Some("Update zensmu, check ryzen_smu version, or file a report with: zensmu report --raw-pm-table --open"),
         );
     };
 
@@ -354,7 +354,7 @@ fn check_cpuid_consistency(
             ID,
             NAME,
             err.to_string(),
-            Some("Do not write SMU commands when driver codename disagrees with host CPUID (pass --no-cpuid-check only for mock sysfs tests)"),
+            Some("Do not write SMU commands when driver codename disagrees with host CPUID; file a report with: zensmu report --raw-pm-table --open"),
         ),
     }
 }
@@ -417,7 +417,7 @@ fn check_pm_table(transport: &dyn SmuTransport, hw_opt: Option<&HardwareContext>
             format!(
                 "PM table version 0x{version:08X} (size 0x{size:X}) is not in zensmu's verified allowlist for {codename}"
             ),
-            Some("Run `zensmu telemetry dump pm_table.bin` to inspect or report this layout"),
+            Some("Help add support for this PM table layout: run `zensmu report --raw-pm-table --open`"),
         ),
         Err(err) => DoctorCheck::fail(
             ID,

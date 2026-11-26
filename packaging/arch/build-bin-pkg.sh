@@ -4,7 +4,7 @@
 set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
-PKGVER="${PKGVER:-0.1.1}"
+PKGVER="${PKGVER:-0.2.0}"
 PKGREL="${PKGREL:-1}"
 TARGET_TRIPLE="x86_64-unknown-linux-gnu"
 STAGE_NAME="zensmu-v${PKGVER}-${TARGET_TRIPLE}"
@@ -25,6 +25,7 @@ mkdir -p "${STAGE}/packaging/systemd" "${STAGE}/packaging/polkit"
 cp "target/release/zensmu" "${STAGE}/zensmu"
 cp "target/release/zensmu-gui" "${STAGE}/zensmu-gui"
 cp "packaging/systemd/zensmu-apply.service" "${STAGE}/packaging/systemd/"
+cp "packaging/systemd/zensmu-record.service" "${STAGE}/packaging/systemd/"
 cp "packaging/systemd/zensmu-resume" "${STAGE}/packaging/systemd/"
 cp "packaging/polkit/org.zensmu.policy" "${STAGE}/packaging/polkit/"
 cp "README.md" "LICENSE" "${STAGE}/"

@@ -5,7 +5,7 @@ use crate::error::{Error, Result};
 use crate::hw::identity::HardwareContext;
 use crate::hw::profiles::{DualOpcode, OpcodeSpec};
 use crate::ops::co::{check_mailbox_health, send_verified};
-use crate::ops::{execute_ops, pm_table, ExecOp};
+use crate::ops::{execute_ops, pm_table, verify_pm_limits, ExecOp};
 use crate::safety::bounds;
 use crate::transport::SmuTransport;
 use crate::types::{Mailbox, PlannedOp, SmuArgs};
@@ -46,6 +46,10 @@ pub struct FusedLimits {
     #[serde(default)]
     pub edc_a: Option<u32>,
     pub soc_tdc_a: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tdp_w: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tjmax_c: Option<u32>,
 }
 
 /// Read-only platform capability/mode flags reported by the SMU.
@@ -132,6 +136,12 @@ pub fn get_pbo_status(transport: &dyn SmuTransport, hw: &HardwareContext) -> Res
         }
     };
 
+    let sustained = query_optional(transport, hw, caps.get_sustained_power_thm, [0; 6])?;
+    let tdp_w = sustained.map(|o| (o[0] >> 16) & 0xFF).filter(|&w| w > 0);
+    let tjmax_c = sustained
+        .map(|o| o[0] & 0xFF)
+        .filter(|c| (40..=115).contains(c));
+
     let fused = FusedLimits {
         ppt_w: query_optional(transport, hw, caps.get_fused_ppt, [0; 6])?.map(|o| norm_milli(o[0])),
         slow_w: query_optional(transport, hw, caps.get_fused_slow, [0; 6])?
@@ -145,6 +155,8 @@ pub fn get_pbo_status(transport: &dyn SmuTransport, hw: &HardwareContext) -> Res
         edc_a: query_optional(transport, hw, caps.get_fused_edc, [0; 6])?.map(|o| norm_milli(o[0])),
         soc_tdc_a: query_optional(transport, hw, caps.get_fused_soc_tdc, [0; 6])?
             .map(|o| norm_milli(o[0])),
+        tdp_w,
+        tjmax_c,
     };
 
     let flags = PlatformFlags {
@@ -391,32 +403,16 @@ pub fn set_pbo(
         req.ppt_w.is_some() || req.tdc_a.is_some() || req.edc_a.is_some() || req.tctl_c.is_some();
     if need_pm_verify && hw.driver.has_pm_table {
         if let Ok(telem) = pm_table::read_telemetry(transport, hw) {
-            verify_pm_limit("pbo.ppt_w", req.ppt_w, telem.ppt_limit_w, "W")?;
-            verify_pm_limit("pbo.tdc_a", req.tdc_a, telem.tdc_limit_a, "A")?;
-            verify_pm_limit("pbo.edc_a", req.edc_a, telem.edc_limit_a, "A")?;
-            verify_pm_limit("pbo.tctl_c", req.tctl_c, telem.tctl_limit_c, "C")?;
+            verify_pm_limits(&[
+                ("pbo.ppt_w", req.ppt_w, telem.ppt_limit_w, "W"),
+                ("pbo.tdc_a", req.tdc_a, telem.tdc_limit_a, "A"),
+                ("pbo.edc_a", req.edc_a, telem.edc_limit_a, "A"),
+                ("pbo.tctl_c", req.tctl_c, telem.tctl_limit_c, "C"),
+            ])?;
         }
     }
 
     Ok(planned)
-}
-
-fn verify_pm_limit(
-    field: &str,
-    requested: Option<u32>,
-    observed: Option<f32>,
-    unit: &str,
-) -> Result<()> {
-    if let (Some(exp), Some(act)) = (requested, observed) {
-        if !act.is_finite() || (act - exp as f32).abs() > 1.0 {
-            return Err(Error::VerificationFailed {
-                field: field.into(),
-                expected: format!("{exp} {unit}"),
-                actual: format!("{act:.1} {unit}"),
-            });
-        }
-    }
-    Ok(())
 }
 
 #[cfg(test)]
@@ -552,5 +548,58 @@ mod tests {
         };
         let err = set_pbo(&transport, &hw, &req, false, false).unwrap_err();
         assert!(matches!(err, Error::SmuRejected { .. }));
+    }
+
+    #[test]
+    fn get_pbo_status_decodes_sustained_power_and_thm_limit() {
+        let (transport, hw) = mock_9700x_ctx();
+        // Verified live on Vermeer 5900XT: MP1 0x23 -> 0x0069005A -> 105 W TDP, 90 C TjMax
+        transport.set_sustained_power_thm_raw(0x0069_005A);
+        let status = get_pbo_status(&transport, &hw).unwrap();
+        assert_eq!(status.fused.tdp_w, Some(105));
+        assert_eq!(status.fused.tjmax_c, Some(90));
+
+        // Zero TDP and out-of-range TjMax are filtered to None
+        transport.set_sustained_power_thm_raw(0x0000_0010);
+        let status2 = get_pbo_status(&transport, &hw).unwrap();
+        assert_eq!(status2.fused.tdp_w, None);
+        assert_eq!(status2.fused.tjmax_c, None);
+    }
+
+    #[test]
+    fn set_pbo_reports_all_clamped_vrm_limits() {
+        let (transport, hw) = mock_9700x_ctx();
+        transport.set_clamp_tdc_a(Some(100));
+        transport.set_clamp_edc_a(Some(120));
+
+        let req = PboSetRequest {
+            ppt_w: Some(142),
+            tdc_a: Some(140),
+            edc_a: Some(220),
+            ..Default::default()
+        };
+        let err = set_pbo(&transport, &hw, &req, false, false).unwrap_err();
+        match err {
+            Error::HardwareClamped { summary, clamped } => {
+                assert_eq!(clamped.len(), 2);
+                assert_eq!(clamped[0].field, "pbo.tdc_a");
+                assert_eq!(clamped[0].requested, "140 A");
+                assert_eq!(clamped[0].actual, "100 A");
+                assert_eq!(clamped[0].actual_value, 100);
+                assert_eq!(clamped[0].unit, "A");
+
+                assert_eq!(clamped[1].field, "pbo.edc_a");
+                assert_eq!(clamped[1].requested, "220 A");
+                assert_eq!(clamped[1].actual, "120 A");
+                assert_eq!(clamped[1].actual_value, 120);
+                assert_eq!(clamped[1].unit, "A");
+
+                assert_eq!(
+                    summary,
+                    "pbo.tdc_a (req 140 A -> cap 100 A), pbo.edc_a (req 220 A -> cap 120 A)"
+                );
+            }
+            other => panic!("expected Error::HardwareClamped, got {other:?}"),
+        }
     }
 }

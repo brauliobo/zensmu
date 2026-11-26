@@ -1,9 +1,9 @@
 //! Dark cockpit UI panels, plots, tuning controls, and dry-run confirmation modal.
 
 use crate::app::{
-    PersistConfirmModal, PersistConfirmTarget, Tab, ToastLevel, ZensmuApp,
-    POLL_INTERVAL_OPTIONS_MS, TELEMETRY_RING_CAPACITY, UI_ZOOM_DEFAULT, UI_ZOOM_MAX, UI_ZOOM_MIN,
-    UI_ZOOM_STEP,
+    error_message_suggests_report, format_board_summary, open_url_in_browser, PersistConfirmModal,
+    PersistConfirmTarget, Tab, ToastLevel, ZensmuApp, POLL_INTERVAL_OPTIONS_MS,
+    TELEMETRY_RING_CAPACITY, UI_ZOOM_DEFAULT, UI_ZOOM_MAX, UI_ZOOM_MIN, UI_ZOOM_STEP,
 };
 use crate::elevate::CliAction;
 use eframe::egui::{self, Color32, RichText, Stroke, Ui};
@@ -23,6 +23,10 @@ use zensmu_core::ops::pbo::{
     TDC_MAX_A, TDC_MIN_A, TDC_SOFT_MAX_A,
 };
 use zensmu_core::ops::shaper::{SHAPER_MAX, SHAPER_MIN, SHAPER_SOFT_MIN};
+use zensmu_core::recorder::{
+    default_daemon_recording_path, pts_result_path, RecordFormat, USER_RECORD_SERVICE_NAME,
+};
+use zensmu_core::report::GITHUB_REPO;
 use zensmu_core::safety::persist::{
     DEFAULT_ACTIVE_PROFILE_PATH, DEFAULT_MODULES_LOAD_PATH, DEFAULT_RESUME_HOOK_PATH,
     DEFAULT_SERVICE_NAME,
@@ -322,6 +326,7 @@ struct LimitSliderRow<'a> {
     live_is_muted: bool,
     note: String,
     note_color: Color32,
+    board_cap: Option<u32>,
 }
 
 fn render_limit_slider_row(ui: &mut Ui, row: LimitSliderRow<'_>) {
@@ -349,8 +354,53 @@ fn render_limit_slider_row(ui: &mut Ui, row: LimitSliderRow<'_>) {
     }
     ui.label(live_text);
 
-    ui.label(RichText::new(row.note).small().color(row.note_color));
+    if let Some(cap) = row.board_cap {
+        let unit = row.suffix.trim();
+        ui.horizontal_wrapped(|ui| {
+            ui.spacing_mut().item_spacing.x = 4.0;
+            ui.label(RichText::new(row.note).small().color(row.note_color));
+            ui.label(
+                RichText::new(format!("· Board cap ≤{cap} {unit}"))
+                    .small()
+                    .strong()
+                    .color(ACCENT_AMBER),
+            )
+            .on_hover_text(
+                "Motherboard/BIOS firmware clamped this limit on a previous apply — check BIOS PBO Limits.",
+            );
+        });
+    } else {
+        ui.label(RichText::new(row.note).small().color(row.note_color));
+    }
     ui.end_row();
+}
+
+fn format_board_caps_summary(caps: &BTreeMap<String, u32>) -> String {
+    caps.iter()
+        .map(|(field, val)| {
+            let (label, unit) = match field.as_str() {
+                "pbo.ppt_w" => ("PPT", "W"),
+                "pbo.tdc_a" => ("TDC", "A"),
+                "pbo.edc_a" => ("EDC", "A"),
+                "pbo.tctl_c" => ("Tctl", "°C"),
+                "apu.stapm_w" => ("STAPM", "W"),
+                "apu.fast_w" => ("Fast PPT", "W"),
+                "apu.slow_w" => ("Slow PPT", "W"),
+                "apu.apu_slow_w" => ("APU Slow", "W"),
+                "apu.tdc_soc_a" => ("SoC TDC", "A"),
+                "apu.edc_soc_a" => ("SoC EDC", "A"),
+                "apu.apu_skin_temp_c" => ("APU Skin", "°C"),
+                "apu.dgpu_skin_temp_c" => ("dGPU Skin", "°C"),
+                other => (other, ""),
+            };
+            if unit.is_empty() {
+                format!("{label} ≤{val}")
+            } else {
+                format!("{label} ≤{val} {unit}")
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 /// Top command bar with brand, compact CPU identity, global actions, and a clean non-overlapping status strip.
@@ -553,6 +603,7 @@ pub fn render_top_bar(app: &mut ZensmuApp, ctx: &egui::Context) {
                     app.active_tab = Tab::ProfilesSafety;
                     app.refresh_safety_files();
                     app.refresh_persist_status();
+                    app.refresh_record_daemon_status();
                 }
 
                 let (guard_text, guard_fg, guard_bg, guard_stroke, guard_hover) =
@@ -588,6 +639,7 @@ pub fn render_top_bar(app: &mut ZensmuApp, ctx: &egui::Context) {
                     app.active_tab = Tab::ProfilesSafety;
                     app.refresh_safety_files();
                     app.refresh_persist_status();
+                    app.refresh_record_daemon_status();
                 }
 
                 if let Some(hw) = &app.hw {
@@ -601,6 +653,81 @@ pub fn render_top_bar(app: &mut ZensmuApp, ctx: &egui::Context) {
                         ),
                     );
                 }
+
+                if app.recorder.is_recording() {
+                    let elapsed = format_duration_mmss(app.recorder.elapsed_secs());
+                    let sample_count = app.recorder.live_samples();
+                    let label = format!("■ Stop REC {elapsed} ({sample_count})");
+                    let hover = app
+                        .recorder
+                        .active_path()
+                        .map(|p| {
+                            format!(
+                                "Recording {} telemetry ({sample_count} samples) to {}\nClick to flush and stop.",
+                                format_record_format_short(app.recorder.format),
+                                p.display()
+                            )
+                        })
+                        .unwrap_or_else(|| "Stop active telemetry recording and flush to disk.".into());
+                    if ui
+                        .add(
+                            cta_button(label, CTA_CRIMSON)
+                                .small()
+                                .corner_radius(egui::CornerRadius::same(12)),
+                        )
+                        .on_hover_text(hover)
+                        .clicked()
+                    {
+                        app.toggle_recording();
+                    }
+                } else {
+                    let hover = if has_hw {
+                        format!(
+                            "Start unprivileged {} telemetry recording (configure format, tag & daemon in Profiles & Safety)",
+                            format_record_format_short(app.recorder.format)
+                        )
+                    } else {
+                        "Detect ryzen_smu hardware to start live telemetry recording".into()
+                    };
+                    if ui
+                        .add_enabled(
+                            has_hw,
+                            egui::Button::new(
+                                RichText::new("● Record")
+                                    .small()
+                                    .strong()
+                                    .color(ACCENT_CRIMSON),
+                            )
+                            .fill(tinted_bg(ACCENT_CRIMSON, PILL_ALPHA_CRIMSON))
+                            .stroke(Stroke::new(1.0_f32, ACCENT_CRIMSON.linear_multiply(0.55)))
+                            .corner_radius(egui::CornerRadius::same(12)),
+                        )
+                        .on_hover_text(hover)
+                        .clicked()
+                    {
+                        app.toggle_recording();
+                    }
+                }
+
+                if ui
+                    .add(
+                        egui::Button::new(
+                            RichText::new("Report CPU / Issue")
+                                .small()
+                                .strong()
+                                .color(ACCENT_CYAN),
+                        )
+                        .fill(tinted_bg(ACCENT_CYAN, PILL_ALPHA_CYAN))
+                        .stroke(Stroke::new(1.0_f32, ACCENT_CYAN.linear_multiply(0.55)))
+                        .corner_radius(egui::CornerRadius::same(12)),
+                    )
+                    .on_hover_text(
+                        "Collect privacy-safe hardware diagnostics & open a GitHub issue",
+                    )
+                    .clicked()
+                {
+                    app.open_report_modal();
+                }
             });
         });
 }
@@ -610,6 +737,57 @@ fn format_interval_label(ms: u64) -> String {
         format!("{}s", ms / 1000)
     } else {
         format!("{ms}ms")
+    }
+}
+
+fn format_duration_mmss(total_secs: u64) -> String {
+    let hours = total_secs / 3600;
+    let mins = (total_secs % 3600) / 60;
+    let secs = total_secs % 60;
+    if hours > 0 {
+        format!("{hours}:{mins:02}:{secs:02}")
+    } else {
+        format!("{mins:02}:{secs:02}")
+    }
+}
+
+fn format_record_format_short(fmt: RecordFormat) -> &'static str {
+    match fmt {
+        RecordFormat::Csv => "CSV",
+        RecordFormat::Jsonl => "JSONL",
+        RecordFormat::Pts => "PTS",
+    }
+}
+
+fn format_record_format_label(fmt: RecordFormat) -> &'static str {
+    match fmt {
+        RecordFormat::Csv => "CSV",
+        RecordFormat::Jsonl => "JSONL",
+        RecordFormat::Pts => "PTS (Phoronix)",
+    }
+}
+
+fn format_bytes_compact(bytes: u64) -> String {
+    if bytes >= 1024 * 1024 {
+        format!("{:.2} MiB", (bytes as f64) / (1024.0 * 1024.0))
+    } else if bytes >= 1024 {
+        format!("{:.1} KiB", (bytes as f64) / 1024.0)
+    } else {
+        format!("{bytes} B")
+    }
+}
+
+fn handle_open_recordings_folder(app: &mut ZensmuApp) {
+    match app.open_recordings_folder() {
+        Ok(dir) => {
+            app.set_toast(
+                ToastLevel::Info,
+                format!("Opened recordings folder {}", dir.display()),
+            );
+        }
+        Err(err) => {
+            app.set_toast(ToastLevel::Error, err);
+        }
     }
 }
 
@@ -636,6 +814,9 @@ pub fn render_bottom_bar(app: &mut ZensmuApp, ctx: &egui::Context) {
                 )
             };
 
+            let mut open_report_from_toast: Option<bool> = None;
+            let mut dismiss_toast = false;
+
             split_or_wrap_row(
                 ui,
                 "bottom_bar_row",
@@ -659,6 +840,40 @@ pub fn render_bottom_bar(app: &mut ZensmuApp, ctx: &egui::Context) {
                                     .color(TEXT_MUTED),
                             );
                         }
+                        if toast.level == ToastLevel::Error
+                            && error_message_suggests_report(&toast.message)
+                        {
+                            let raw_pm = toast
+                                .message
+                                .to_ascii_lowercase()
+                                .contains("pm table");
+                            if ui
+                                .add(
+                                    egui::Button::new(
+                                        RichText::new("Report on GitHub")
+                                            .small()
+                                            .strong()
+                                            .color(ACCENT_CYAN),
+                                    )
+                                    .fill(tinted_bg(ACCENT_CYAN, PILL_ALPHA_CYAN))
+                                    .stroke(Stroke::new(1.0_f32, ACCENT_CYAN.linear_multiply(0.55)))
+                                    .corner_radius(egui::CornerRadius::same(10)),
+                                )
+                                .on_hover_text(
+                                    "Collect privacy-safe hardware diagnostics & open a GitHub issue",
+                                )
+                                .clicked()
+                            {
+                                open_report_from_toast = Some(raw_pm);
+                            }
+                        }
+                        if ui
+                            .add(egui::Button::new(RichText::new("×").small()).small())
+                            .on_hover_text("Dismiss status message")
+                            .clicked()
+                        {
+                            dismiss_toast = true;
+                        }
                     } else {
                         ui.label(
                             RichText::new("Ready — telemetry reads sysfs without root.")
@@ -675,6 +890,17 @@ pub fn render_bottom_bar(app: &mut ZensmuApp, ctx: &egui::Context) {
                     );
                 },
             );
+
+            if let Some(raw_pm) = open_report_from_toast {
+                if raw_pm {
+                    app.open_report_modal_for_unsupported();
+                } else {
+                    app.open_report_modal();
+                }
+            }
+            if dismiss_toast {
+                app.toast = None;
+            }
         });
 }
 
@@ -754,6 +980,7 @@ pub fn render_sidebar(app: &mut ZensmuApp, ctx: &egui::Context) {
                     if tab == Tab::ProfilesSafety {
                         app.refresh_safety_files();
                         app.refresh_persist_status();
+                        app.refresh_record_daemon_status();
                     }
                 }
                 ui.add_space(4.0);
@@ -838,6 +1065,16 @@ pub fn render_banners(app: &mut ZensmuApp, ui: &mut Ui, ctx: &egui::Context) {
     }
 
     if let Some(err) = app.hw_error.clone() {
+        let lower = err.to_ascii_lowercase();
+        let is_unsupported_or_mismatch = app.hw_error_suggests_report
+            || lower.contains("unsupported")
+            || lower.contains("mismatch");
+        let banner_title = if is_unsupported_or_mismatch {
+            "Unsupported CPU or ryzen_smu identity mismatch"
+        } else {
+            "ryzen_smu kernel module is not available"
+        };
+        let hw_hint = app.hw_error_hint;
         egui::Frame::NONE
             .fill(tinted_bg(ACCENT_AMBER, BANNER_ALPHA_AMBER))
             .stroke(Stroke::new(1.0_f32, ACCENT_AMBER))
@@ -845,12 +1082,11 @@ pub fn render_banners(app: &mut ZensmuApp, ui: &mut Ui, ctx: &egui::Context) {
             .inner_margin(egui::Margin::same(12))
             .show(ui, |ui| {
                 ui.set_width(ui.available_width());
-                ui.label(
-                    RichText::new("ryzen_smu kernel module is not available")
-                        .strong()
-                        .color(ACCENT_AMBER),
-                );
+                ui.label(RichText::new(banner_title).strong().color(ACCENT_AMBER));
                 ui.label(RichText::new(&err).small().color(TEXT_PRIMARY));
+                if let Some(hint) = hw_hint {
+                    ui.label(RichText::new(hint).small().color(TEXT_MUTED));
+                }
                 ui.add_space(6.0);
                 split_or_wrap_row(
                     ui,
@@ -863,8 +1099,53 @@ pub fn render_banners(app: &mut ZensmuApp, ui: &mut Ui, ctx: &egui::Context) {
                         if ui.button("Retry Hardware Probe").clicked() {
                             app.probe_hardware(ctx);
                         }
+                        let cta_label = if is_unsupported_or_mismatch {
+                            "Report on GitHub"
+                        } else {
+                            "Report Unsupported CPU on GitHub"
+                        };
+                        if ui
+                            .add(cta_button(cta_label, CTA_EMERALD))
+                            .on_hover_text(
+                                "Collect privacy-safe CPU/PM-table diagnostics and pre-fill a GitHub issue",
+                            )
+                            .clicked()
+                        {
+                            app.open_report_modal_for_unsupported();
+                        }
                     },
                 );
+            });
+        ui.add_space(10.0);
+    }
+
+    if let Some(clamp_msg) = app.clamp_warning.clone() {
+        egui::Frame::NONE
+            .fill(tinted_bg(ACCENT_AMBER, BANNER_ALPHA_AMBER))
+            .stroke(Stroke::new(1.0_f32, ACCENT_AMBER))
+            .corner_radius(egui::CornerRadius::same(8))
+            .inner_margin(egui::Margin::same(12))
+            .show(ui, |ui| {
+                ui.set_width(ui.available_width());
+                split_or_wrap_row(
+                    ui,
+                    "clamp_warning_banner_header",
+                    |ui| {
+                        ui.label(
+                            RichText::new(
+                                "Board/BIOS firmware clamped limit — check BIOS PBO Limits",
+                            )
+                            .strong()
+                            .color(ACCENT_AMBER),
+                        );
+                    },
+                    |ui| {
+                        if ui.button("Dismiss").clicked() {
+                            app.clamp_warning = None;
+                        }
+                    },
+                );
+                ui.label(RichText::new(&clamp_msg).small().color(TEXT_PRIMARY));
             });
         ui.add_space(10.0);
     }
@@ -878,7 +1159,12 @@ pub fn render_dashboard(app: &mut ZensmuApp, ui: &mut Ui) {
         "Unprivileged 0444 PM table polling from /sys/kernel/ryzen_smu_drv/pm_table",
     );
 
-    if let Some(err) = &app.telemetry_error {
+    if let Some(err) = app.telemetry_error.clone() {
+        let lower = err.to_ascii_lowercase();
+        let is_unsupported_pm = app.telemetry_error_suggests_report
+            || lower.contains("unsupported pm table")
+            || lower.contains("unsupported");
+        let hint = app.telemetry_error_hint;
         card_frame().show(ui, |ui| {
             ui.set_width(ui.available_width());
             ui.label(
@@ -886,14 +1172,30 @@ pub fn render_dashboard(app: &mut ZensmuApp, ui: &mut Ui) {
                     .strong()
                     .color(ACCENT_AMBER),
             );
-            ui.label(err);
+            ui.label(&err);
             ui.label(
                 RichText::new(
-                    "zensmu strictly refuses to guess unverified PM table layouts or read tables exceeding 4096 bytes.",
+                    hint.unwrap_or(
+                        "zensmu strictly refuses to guess unverified PM table layouts or read tables exceeding 4096 bytes.",
+                    ),
                 )
                 .small()
                 .color(TEXT_MUTED),
             );
+            ui.add_space(6.0);
+            if ui
+                .add(cta_button("Report on GitHub", CTA_EMERALD))
+                .on_hover_text(
+                    "Collect privacy-safe CPU & non-zero PM table diagnostics to add support",
+                )
+                .clicked()
+            {
+                if is_unsupported_pm {
+                    app.open_report_modal_for_unsupported();
+                } else {
+                    app.open_report_modal();
+                }
+            }
         });
         ui.add_space(12.0);
     }
@@ -1178,6 +1480,150 @@ pub fn render_dashboard(app: &mut ZensmuApp, ui: &mut Ui) {
                 });
         });
     });
+
+    ui.add_space(12.0);
+    render_dashboard_recorder_strip(app, ui);
+}
+
+fn render_dashboard_recorder_strip(app: &mut ZensmuApp, ui: &mut Ui) {
+    let has_hw = app.hw.is_some();
+    let is_recording = app.recorder.is_recording();
+    let current_format = app.recorder.format;
+    let daemon_active = app.recorder.daemon_status.active;
+    let daemon_enabled = app.recorder.daemon_status.enabled;
+    let elapsed = format_duration_mmss(app.recorder.elapsed_secs());
+    let live_samples = app.recorder.live_samples();
+    let active_path = app.recorder.active_path().map(|p| p.display().to_string());
+    let last_saved_path = app
+        .recorder
+        .last_saved_path
+        .as_ref()
+        .map(|p| p.display().to_string());
+    let last_saved_samples = app.recorder.last_saved_samples;
+
+    let mut toggle_clicked = false;
+    let mut open_folder_clicked = false;
+    let mut configure_clicked = false;
+    let mut copy_path: Option<String> = None;
+
+    card_frame().show(ui, |ui| {
+        ui.set_width(ui.available_width());
+        split_or_wrap_row(
+            ui,
+            "dashboard_recorder_strip",
+            |ui| {
+                ui.label(RichText::new("Telemetry Recording").strong());
+                if is_recording {
+                    tinted_pill(
+                        ui,
+                        &format!(
+                            "REC · {elapsed} · {live_samples} samples · {}",
+                            format_record_format_short(current_format)
+                        ),
+                        ACCENT_CRIMSON,
+                        PILL_ALPHA_CRIMSON,
+                    );
+                } else if daemon_active {
+                    tinted_pill(ui, "Daemon: ACTIVE", ACCENT_EMERALD, PILL_ALPHA_EMERALD);
+                } else if daemon_enabled {
+                    tinted_pill(ui, "Daemon: ENABLED", ACCENT_CYAN, PILL_ALPHA_CYAN);
+                } else if last_saved_path.is_some() {
+                    tinted_pill(
+                        ui,
+                        &format!("Last: {last_saved_samples} samples"),
+                        ACCENT_CYAN,
+                        PILL_ALPHA_CYAN,
+                    );
+                } else {
+                    muted_pill(ui, "Idle · unprivileged");
+                }
+            },
+            |ui| {
+                ui.add_enabled_ui(!is_recording, |ui| {
+                    egui::ComboBox::from_id_salt("dashboard_recorder_format_combo")
+                        .width(126.0)
+                        .selected_text(format_record_format_label(app.recorder.format))
+                        .show_ui(ui, |ui| {
+                            for fmt in [RecordFormat::Csv, RecordFormat::Jsonl, RecordFormat::Pts] {
+                                ui.selectable_value(
+                                    &mut app.recorder.format,
+                                    fmt,
+                                    format_record_format_label(fmt),
+                                );
+                            }
+                        });
+                });
+
+                if is_recording {
+                    if ui
+                        .add(cta_button("■ Stop Recording", CTA_CRIMSON))
+                        .on_hover_text("Flush and stop active telemetry recording")
+                        .clicked()
+                    {
+                        toggle_clicked = true;
+                    }
+                } else if ui
+                    .add_enabled(has_hw, cta_button("● Start Recording", CTA_EMERALD))
+                    .on_hover_text("Start recording live PM table telemetry without root")
+                    .clicked()
+                {
+                    toggle_clicked = true;
+                }
+
+                if ui
+                    .button("Configure…")
+                    .on_hover_text(
+                        "Set workload tag, PTS result name, or toggle the background daemon",
+                    )
+                    .clicked()
+                {
+                    configure_clicked = true;
+                }
+            },
+        );
+
+        let display_path = active_path.or(last_saved_path);
+        if let Some(path_str) = display_path {
+            ui.add_space(6.0);
+            ui.horizontal_wrapped(|ui| {
+                let prefix = if is_recording {
+                    "Writing:"
+                } else {
+                    "Last saved:"
+                };
+                ui.label(RichText::new(prefix).small().color(TEXT_MUTED));
+                ui.label(
+                    RichText::new(&path_str)
+                        .small()
+                        .monospace()
+                        .color(TEXT_PRIMARY),
+                );
+                if ui.add(egui::Button::new("Copy Path").small()).clicked() {
+                    copy_path = Some(path_str);
+                }
+                if ui.add(egui::Button::new("Open Folder").small()).clicked() {
+                    open_folder_clicked = true;
+                }
+            });
+        }
+    });
+
+    if toggle_clicked {
+        app.toggle_recording();
+    }
+    if let Some(path_str) = copy_path {
+        ui.ctx().copy_text(path_str);
+        app.set_toast(ToastLevel::Info, "Copied recording path to clipboard.");
+    }
+    if open_folder_clicked {
+        handle_open_recordings_folder(app);
+    }
+    if configure_clicked {
+        app.active_tab = Tab::ProfilesSafety;
+        app.refresh_safety_files();
+        app.refresh_persist_status();
+        app.refresh_record_daemon_status();
+    }
 }
 
 struct RollingPlotSpec<'a> {
@@ -1454,7 +1900,7 @@ pub fn render_curve_optimizer(app: &mut ZensmuApp, ui: &mut Ui, ctx: &egui::Cont
     );
 
     let Some(hw) = app.hw.clone() else {
-        render_no_hardware_placeholder(ui);
+        render_no_hardware_placeholder(app, ui);
         return;
     };
 
@@ -1757,7 +2203,7 @@ pub fn render_curve_shaper(app: &mut ZensmuApp, ui: &mut Ui, ctx: &egui::Context
     );
 
     let Some(hw) = app.hw.clone() else {
-        render_no_hardware_placeholder(ui);
+        render_no_hardware_placeholder(app, ui);
         return;
     };
 
@@ -1941,7 +2387,7 @@ pub fn render_pbo_limits(app: &mut ZensmuApp, ui: &mut Ui, ctx: &egui::Context) 
     );
 
     let Some(hw) = app.hw.clone() else {
-        render_no_hardware_placeholder(ui);
+        render_no_hardware_placeholder(app, ui);
         return;
     };
 
@@ -1949,6 +2395,16 @@ pub fn render_pbo_limits(app: &mut ZensmuApp, ui: &mut Ui, ctx: &egui::Context) 
     let fused = app.pbo_status.as_ref().map(|s| s.fused.clone());
     let telem = app.latest_telemetry.clone();
     let caps = &hw.capabilities;
+    let board_summary = format_board_summary(&app.board_info);
+    let ppt_cap = app.board_caps.get("pbo.ppt_w").copied();
+    let tdc_cap = app.board_caps.get("pbo.tdc_a").copied();
+    let edc_cap = app.board_caps.get("pbo.edc_a").copied();
+    let tctl_cap = app.board_caps.get("pbo.tctl_c").copied();
+    let learned_caps_summary = if app.board_caps.is_empty() {
+        None
+    } else {
+        Some(format_board_caps_summary(&app.board_caps))
+    };
 
     card_frame().show(ui, |ui| {
         ui.set_width(ui.available_width());
@@ -1981,7 +2437,27 @@ pub fn render_pbo_limits(app: &mut ZensmuApp, ui: &mut Ui, ctx: &egui::Context) 
             },
         );
 
-        ui.add_space(10.0);
+        ui.add_space(6.0);
+        let board_notice = match &board_summary {
+            Some(summary) => format!(
+                "Board: {summary} — Motherboard BIOS/VRM firmware may cap PPT/TDC/EDC unless BIOS PBO Limits are set to Manual/Motherboard."
+            ),
+            None => "Motherboard BIOS/VRM firmware may cap PPT/TDC/EDC unless BIOS PBO Limits are set to Manual/Motherboard.".into(),
+        };
+        ui.label(RichText::new(board_notice).small().color(TEXT_MUTED));
+        if let Some(ref learned) = learned_caps_summary {
+            ui.add_space(4.0);
+            ui.label(
+                RichText::new(format!(
+                    "Detected board/BIOS ceiling(s): {learned} — set BIOS PBO Limits to Manual/Motherboard to raise VRM caps."
+                ))
+                .small()
+                .strong()
+                .color(ACCENT_AMBER),
+            );
+        }
+
+        ui.add_space(8.0);
 
         egui::Grid::new("pbo_controls_grid")
             .num_columns(4)
@@ -2025,6 +2501,7 @@ pub fn render_pbo_limits(app: &mut ZensmuApp, ui: &mut Ui, ctx: &egui::Context) 
                             capability_disabled_hint(ppt_live.is_some()).into()
                         },
                         note_color: TEXT_MUTED,
+                        board_cap: ppt_cap,
                     },
                 );
 
@@ -2055,6 +2532,7 @@ pub fn render_pbo_limits(app: &mut ZensmuApp, ui: &mut Ui, ctx: &egui::Context) 
                             capability_disabled_hint(tdc_live.is_some()).into()
                         },
                         note_color: TEXT_MUTED,
+                        board_cap: tdc_cap,
                     },
                 );
 
@@ -2085,6 +2563,7 @@ pub fn render_pbo_limits(app: &mut ZensmuApp, ui: &mut Ui, ctx: &egui::Context) 
                             capability_disabled_hint(edc_live.is_some()).into()
                         },
                         note_color: TEXT_MUTED,
+                        board_cap: edc_cap,
                     },
                 );
 
@@ -2114,6 +2593,7 @@ pub fn render_pbo_limits(app: &mut ZensmuApp, ui: &mut Ui, ctx: &egui::Context) 
                         } else {
                             TEXT_MUTED
                         },
+                        board_cap: tctl_cap,
                     },
                 );
 
@@ -2144,6 +2624,7 @@ pub fn render_pbo_limits(app: &mut ZensmuApp, ui: &mut Ui, ctx: &egui::Context) 
                             capability_disabled_hint(caps.get_pbo_scalar.is_some()).into()
                         },
                         note_color: TEXT_MUTED,
+                        board_cap: None,
                     },
                 );
 
@@ -2174,6 +2655,7 @@ pub fn render_pbo_limits(app: &mut ZensmuApp, ui: &mut Ui, ctx: &egui::Context) 
                             capability_disabled_hint(caps.get_fmax.is_some()).into()
                         },
                         note_color: TEXT_MUTED,
+                        board_cap: None,
                     },
                 );
             });
@@ -2236,6 +2718,8 @@ pub fn render_pbo_limits(app: &mut ZensmuApp, ui: &mut Ui, ctx: &egui::Context) 
                 flag_pill(ui, "Overclockable", status.flags.overclockable);
                 flag_pill(ui, "EXPO Active", status.flags.expo_active);
                 flag_pill(ui, "LN2 Mode", status.flags.ln2_mode);
+                optional_fused_pill(ui, "Fused TDP", status.fused.tdp_w, "W");
+                optional_fused_pill(ui, "Fused TjMax", status.fused.tjmax_c, "°C");
                 optional_fused_pill(ui, "Fused PPT", status.fused.ppt_w, "W");
                 optional_fused_pill(ui, "Fused Fast", status.fused.fast_w, "W");
                 optional_fused_pill(ui, "Fused Slow", status.fused.slow_w, "W");
@@ -2255,6 +2739,15 @@ fn render_apu_dptc_card(
     busy: bool,
 ) {
     let caps = &hw.capabilities;
+    let stapm_cap = app.board_caps.get("apu.stapm_w").copied();
+    let fast_cap = app.board_caps.get("apu.fast_w").copied();
+    let slow_cap = app.board_caps.get("apu.slow_w").copied();
+    let apu_slow_cap = app.board_caps.get("apu.apu_slow_w").copied();
+    let tdc_soc_cap = app.board_caps.get("apu.tdc_soc_a").copied();
+    let edc_soc_cap = app.board_caps.get("apu.edc_soc_a").copied();
+    let apu_skin_cap = app.board_caps.get("apu.apu_skin_temp_c").copied();
+    let dgpu_skin_cap = app.board_caps.get("apu.dgpu_skin_temp_c").copied();
+
     card_frame().show(ui, |ui| {
         ui.set_width(ui.available_width());
         split_or_wrap_row(
@@ -2316,6 +2809,7 @@ fn render_apu_dptc_card(
                             capability_disabled_hint(app.apu_editor.live_stapm_w.is_some()).into()
                         },
                         note_color: TEXT_MUTED,
+                        board_cap: stapm_cap,
                     },
                 );
 
@@ -2345,6 +2839,7 @@ fn render_apu_dptc_card(
                             capability_disabled_hint(app.apu_editor.live_fast_w.is_some()).into()
                         },
                         note_color: TEXT_MUTED,
+                        board_cap: fast_cap,
                     },
                 );
 
@@ -2374,6 +2869,7 @@ fn render_apu_dptc_card(
                             capability_disabled_hint(app.apu_editor.live_slow_w.is_some()).into()
                         },
                         note_color: TEXT_MUTED,
+                        board_cap: slow_cap,
                     },
                 );
 
@@ -2404,6 +2900,7 @@ fn render_apu_dptc_card(
                                 .into()
                         },
                         note_color: TEXT_MUTED,
+                        board_cap: apu_slow_cap,
                     },
                 );
 
@@ -2428,6 +2925,7 @@ fn render_apu_dptc_card(
                             capability_disabled_hint(false).into()
                         },
                         note_color: TEXT_MUTED,
+                        board_cap: None,
                     },
                 );
 
@@ -2452,6 +2950,7 @@ fn render_apu_dptc_card(
                             capability_disabled_hint(false).into()
                         },
                         note_color: TEXT_MUTED,
+                        board_cap: None,
                     },
                 );
 
@@ -2481,6 +2980,7 @@ fn render_apu_dptc_card(
                             capability_disabled_hint(app.apu_editor.live_tdc_soc_a.is_some()).into()
                         },
                         note_color: TEXT_MUTED,
+                        board_cap: tdc_soc_cap,
                     },
                 );
 
@@ -2505,6 +3005,7 @@ fn render_apu_dptc_card(
                             capability_disabled_hint(app.apu_editor.live_edc_soc_a.is_some()).into()
                         },
                         note_color: TEXT_MUTED,
+                        board_cap: edc_soc_cap,
                     },
                 );
 
@@ -2530,6 +3031,7 @@ fn render_apu_dptc_card(
                                 .into()
                         },
                         note_color: TEXT_MUTED,
+                        board_cap: apu_skin_cap,
                     },
                 );
 
@@ -2557,6 +3059,7 @@ fn render_apu_dptc_card(
                             .into()
                         },
                         note_color: TEXT_MUTED,
+                        board_cap: dgpu_skin_cap,
                     },
                 );
 
@@ -2680,6 +3183,10 @@ pub fn render_profiles_and_safety(app: &mut ZensmuApp, ui: &mut Ui, ctx: &egui::
 
     // Boot & Resume Persistence (systemd) Card
     render_persistence_card(app, ui, ctx, has_hw, busy);
+    ui.add_space(12.0);
+
+    // Telemetry Recording & Background Daemon (unprivileged) Card
+    render_recorder_card(app, ui, ctx, has_hw);
     ui.add_space(12.0);
 
     // TOML Profile Card
@@ -3281,6 +3788,324 @@ fn render_persistence_card(
     });
 }
 
+fn render_recorder_card(app: &mut ZensmuApp, ui: &mut Ui, ctx: &egui::Context, has_hw: bool) {
+    let is_recording = app.recorder.is_recording();
+    let current_format = app.recorder.format;
+    let elapsed = format_duration_mmss(app.recorder.elapsed_secs());
+    let live_samples = app.recorder.live_samples();
+    let live_bytes = app.recorder.live_bytes();
+    let active_path = app.recorder.active_path().map(|p| p.display().to_string());
+    let last_saved_path = app
+        .recorder
+        .last_saved_path
+        .as_ref()
+        .map(|p| p.display().to_string());
+    let last_saved_samples = app.recorder.last_saved_samples;
+    let daemon = app.recorder.daemon_status.clone();
+    let daemon_service = if daemon.service_name.is_empty() {
+        USER_RECORD_SERVICE_NAME
+    } else {
+        daemon.service_name.as_str()
+    };
+    let daemon_output_path = if daemon.default_output_path.is_empty() {
+        default_daemon_recording_path().display().to_string()
+    } else {
+        daemon.default_output_path.clone()
+    };
+
+    let mut refresh_daemon = false;
+    let mut toggle_recording = false;
+    let mut open_folder = false;
+    let mut toggle_daemon = false;
+    let mut copy_path: Option<(String, &'static str)> = None;
+
+    card_frame().show(ui, |ui| {
+        ui.set_width(ui.available_width());
+        split_or_wrap_row(
+            ui,
+            "recorder_card_header",
+            |ui| {
+                ui.label(RichText::new("Telemetry Recording & Background Daemon").strong());
+                if is_recording {
+                    tinted_pill(
+                        ui,
+                        &format!(
+                            "REC · {elapsed} · {live_samples} samples · {}",
+                            format_record_format_short(current_format)
+                        ),
+                        ACCENT_CRIMSON,
+                        PILL_ALPHA_CRIMSON,
+                    );
+                } else {
+                    tinted_pill(
+                        ui,
+                        "Unprivileged · no pkexec",
+                        ACCENT_EMERALD,
+                        PILL_ALPHA_EMERALD,
+                    );
+                }
+            },
+            |ui| {
+                if ui
+                    .button("Refresh Status")
+                    .on_hover_text("Re-check user systemd daemon status (unprivileged)")
+                    .clicked()
+                {
+                    refresh_daemon = true;
+                }
+            },
+        );
+
+        ui.add_space(8.0);
+        ui.horizontal_wrapped(|ui| {
+            ui.label(RichText::new("Format:").small().color(TEXT_MUTED));
+            ui.add_enabled_ui(!is_recording, |ui| {
+                egui::ComboBox::from_id_salt("recorder_card_format_combo")
+                    .width(150.0)
+                    .selected_text(format_record_format_label(app.recorder.format))
+                    .show_ui(ui, |ui| {
+                        for fmt in [RecordFormat::Csv, RecordFormat::Jsonl, RecordFormat::Pts] {
+                            ui.selectable_value(
+                                &mut app.recorder.format,
+                                fmt,
+                                format_record_format_label(fmt),
+                            );
+                        }
+                    });
+            });
+
+            ui.label(RichText::new("Workload Tag:").small().color(TEXT_MUTED));
+            ui.add_enabled(
+                !is_recording,
+                egui::TextEdit::singleline(&mut app.recorder.tag)
+                    .desired_width(170.0)
+                    .hint_text("e.g. prime95, co-20"),
+            );
+        });
+
+        if app.recorder.format == RecordFormat::Pts {
+            ui.add_space(6.0);
+            ui.horizontal_wrapped(|ui| {
+                ui.label(RichText::new("PTS Result Name:").small().color(TEXT_MUTED));
+                ui.add_enabled(
+                    !is_recording,
+                    egui::TextEdit::singleline(&mut app.recorder.pts_result_name)
+                        .desired_width(210.0)
+                        .hint_text("optional (e.g. co-20-run1)"),
+                );
+                let preview = {
+                    let trimmed = app.recorder.pts_result_name.trim();
+                    if trimmed.is_empty() {
+                        "~/.phoronix-test-suite/test-results/<name>/composite.xml".to_string()
+                    } else {
+                        pts_result_path(trimmed).display().to_string()
+                    }
+                };
+                ui.label(
+                    RichText::new(preview)
+                        .small()
+                        .monospace()
+                        .color(TEXT_MUTED),
+                );
+            });
+        }
+
+        ui.add_space(8.0);
+        ui.horizontal_wrapped(|ui| {
+            if is_recording {
+                if ui
+                    .add(cta_button(
+                        format!("■ Stop Recording ({elapsed} · {live_samples} samples)"),
+                        CTA_CRIMSON,
+                    ))
+                    .on_hover_text("Flush active recording to disk and stop")
+                    .clicked()
+                {
+                    toggle_recording = true;
+                }
+            } else {
+                let hover = if has_hw {
+                    "Start live telemetry recording to disk (unprivileged)"
+                } else {
+                    "Detect ryzen_smu hardware to start live telemetry recording"
+                };
+                if ui
+                    .add_enabled(has_hw, cta_button("● Start Recording", CTA_EMERALD))
+                    .on_hover_text(hover)
+                    .clicked()
+                {
+                    toggle_recording = true;
+                }
+            }
+
+            if ui
+                .button("Open Folder")
+                .on_hover_text("Ensure default recordings directory exists and open via xdg-open")
+                .clicked()
+            {
+                open_folder = true;
+            }
+        });
+
+        if let Some(path_str) = active_path {
+            ui.add_space(6.0);
+            ui.horizontal_wrapped(|ui| {
+                ui.label(
+                    RichText::new(format!(
+                        "Active ({live_samples} samples · {}):",
+                        format_bytes_compact(live_bytes)
+                    ))
+                    .small()
+                    .strong()
+                    .color(ACCENT_CRIMSON),
+                );
+                ui.label(
+                    RichText::new(&path_str)
+                        .small()
+                        .monospace()
+                        .color(TEXT_PRIMARY),
+                );
+                if ui.add(egui::Button::new("Copy Path").small()).clicked() {
+                    copy_path = Some((path_str, "Copied active recording path to clipboard."));
+                }
+            });
+        } else if let Some(path_str) = last_saved_path {
+            ui.add_space(6.0);
+            ui.horizontal_wrapped(|ui| {
+                ui.label(
+                    RichText::new(format!("Last saved ({last_saved_samples} samples):"))
+                        .small()
+                        .strong()
+                        .color(ACCENT_EMERALD),
+                );
+                ui.label(
+                    RichText::new(&path_str)
+                        .small()
+                        .monospace()
+                        .color(TEXT_PRIMARY),
+                );
+                if ui.add(egui::Button::new("Copy Path").small()).clicked() {
+                    copy_path = Some((path_str, "Copied saved recording path to clipboard."));
+                }
+            });
+        }
+
+        ui.add_space(10.0);
+        ui.separator();
+        ui.add_space(8.0);
+
+        split_or_wrap_row(
+            ui,
+            "recorder_daemon_header",
+            |ui| {
+                ui.label(
+                    RichText::new(format!("Background Daemon ({daemon_service})")).strong(),
+                );
+                if daemon.active {
+                    tinted_pill(ui, "Daemon: ACTIVE", ACCENT_EMERALD, PILL_ALPHA_EMERALD);
+                } else if daemon.enabled {
+                    tinted_pill(ui, "Daemon: ENABLED", ACCENT_CYAN, PILL_ALPHA_CYAN);
+                } else if !daemon.installed {
+                    tinted_pill(ui, "Daemon: NOT INSTALLED", ACCENT_AMBER, PILL_ALPHA_AMBER);
+                } else {
+                    muted_pill(ui, "Daemon: OFF");
+                }
+            },
+            |ui| {
+                let hover = if !daemon.installed {
+                    "zensmu-record.service is not installed in /usr/lib/systemd/user/ or ~/.config/systemd/user/"
+                } else if daemon.enabled {
+                    "Run `systemctl --user disable --now zensmu-record.service` (unprivileged)"
+                } else {
+                    "Run `systemctl --user enable --now zensmu-record.service` (unprivileged)"
+                };
+                if daemon.enabled {
+                    if ui
+                        .add_enabled(
+                            daemon.installed,
+                            egui::Button::new("Disable Background Recorder"),
+                        )
+                        .on_hover_text(hover)
+                        .clicked()
+                    {
+                        toggle_daemon = true;
+                    }
+                } else if ui
+                    .add_enabled(
+                        daemon.installed,
+                        cta_button("Enable Background Recorder", CTA_EMERALD),
+                    )
+                    .on_hover_text(hover)
+                    .clicked()
+                {
+                    toggle_daemon = true;
+                }
+            },
+        );
+
+        ui.add_space(6.0);
+        egui::Grid::new("recorder_daemon_grid")
+            .num_columns(2)
+            .striped(true)
+            .spacing([16.0, 6.0])
+            .show(ui, |ui| {
+                ui.label(RichText::new("User service state").small().color(TEXT_MUTED));
+                let state_color = if daemon.active {
+                    ACCENT_EMERALD
+                } else if daemon.enabled {
+                    ACCENT_CYAN
+                } else if !daemon.installed || daemon.state == "failed" {
+                    ACCENT_AMBER
+                } else {
+                    TEXT_MUTED
+                };
+                ui.label(
+                    RichText::new(&daemon.state)
+                        .small()
+                        .monospace()
+                        .strong()
+                        .color(state_color),
+                );
+                ui.end_row();
+
+                ui.label(RichText::new("Default daemon log").small().color(TEXT_MUTED));
+                ui.horizontal_wrapped(|ui| {
+                    ui.label(
+                        RichText::new(&daemon_output_path)
+                            .small()
+                            .monospace()
+                            .color(TEXT_PRIMARY),
+                    );
+                    if ui.add(egui::Button::new("Copy Path").small()).clicked() {
+                        copy_path = Some((
+                            daemon_output_path.clone(),
+                            "Copied daemon recording path to clipboard.",
+                        ));
+                    }
+                });
+                ui.end_row();
+            });
+    });
+
+    if refresh_daemon {
+        app.refresh_record_daemon_status();
+        app.set_toast(ToastLevel::Info, "Refreshed background recorder status.");
+    }
+    if toggle_recording {
+        app.toggle_recording();
+    }
+    if open_folder {
+        handle_open_recordings_folder(app);
+    }
+    if toggle_daemon {
+        app.toggle_record_daemon();
+    }
+    if let Some((path_str, toast_msg)) = copy_path {
+        ctx.copy_text(path_str);
+        app.set_toast(ToastLevel::Info, toast_msg);
+    }
+}
+
 /// Modal confirming boot persistence & systemd changes before invoking `pkexec`.
 pub fn render_persist_confirm_modal(app: &mut ZensmuApp, ctx: &egui::Context) {
     let Some(modal) = app.persist_confirm.clone() else {
@@ -3514,7 +4339,250 @@ pub fn render_dry_run_modal(app: &mut ZensmuApp, ctx: &egui::Context) {
     }
 }
 
-fn render_no_hardware_placeholder(ui: &mut Ui) {
+/// Modal for collecting privacy-safe hardware diagnostics and opening a pre-filled GitHub issue.
+pub fn render_report_modal(app: &mut ZensmuApp, ctx: &egui::Context) {
+    if !app.report_modal.open {
+        return;
+    }
+
+    let mut close_clicked = false;
+    let mut refresh_clicked = false;
+    let mut copy_clicked = false;
+    let mut open_github_clicked = false;
+    let mut save_clicked = false;
+    let busy = app.runner.is_busy();
+
+    egui::Window::new("CPU Support / GitHub Issue Report")
+        .collapsible(false)
+        .resizable(true)
+        .default_width(760.0)
+        .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+        .frame(
+            egui::Frame::window(&ctx.style())
+                .fill(BG_CARD)
+                .stroke(Stroke::new(1.0_f32, BORDER_SUBTLE)),
+        )
+        .show(ctx, |ui| {
+            // Privacy notice
+            egui::Frame::NONE
+                .fill(BG_PANEL)
+                .stroke(Stroke::new(1.0_f32, BORDER_SUBTLE))
+                .corner_radius(egui::CornerRadius::same(6))
+                .inner_margin(egui::Margin::same(10))
+                .show(ui, |ui| {
+                    ui.set_width(ui.available_width());
+                    ui.label(
+                        RichText::new(
+                            "No hostnames, usernames, IPs, or serial numbers are collected.",
+                        )
+                        .strong()
+                        .color(ACCENT_EMERALD),
+                    );
+                    ui.label(
+                        RichText::new(format!(
+                            "All diagnostic probes are strictly read-only and formatted for {GITHUB_REPO}."
+                        ))
+                        .small()
+                        .color(TEXT_MUTED),
+                    );
+                });
+
+            ui.add_space(8.0);
+
+            // Optional user note
+            ui.label(
+                RichText::new("Optional note (included at top of Markdown report):")
+                    .small()
+                    .color(TEXT_MUTED),
+            );
+            ui.add(
+                egui::TextEdit::singleline(&mut app.report_modal.note)
+                    .desired_width(f32::INFINITY)
+                    .hint_text("Describe your CPU, motherboard, or issue (optional)…"),
+            );
+
+            ui.add_space(6.0);
+
+            // Options + Refresh
+            let can_refresh = !app.report_modal.include_privileged_probes || !busy;
+            split_or_wrap_row(
+                ui,
+                "report_modal_options",
+                |ui| {
+                    ui.checkbox(
+                        &mut app.report_modal.include_raw_pm_table,
+                        "Include non-zero PM table floats",
+                    );
+                    ui.checkbox(
+                        &mut app.report_modal.include_privileged_probes,
+                        "Include privileged SMU probes via pkexec",
+                    );
+                },
+                |ui| {
+                    if ui
+                        .add_enabled(can_refresh, egui::Button::new("Refresh Diagnostics"))
+                        .on_hover_text(
+                            "Re-collect diagnostics with the selected options and note",
+                        )
+                        .clicked()
+                    {
+                        refresh_clicked = true;
+                    }
+                },
+            );
+
+            ui.add_space(8.0);
+
+            // Suggested issue title & scrollable Markdown preview
+            if let Some(payload) = &app.report_modal.payload {
+                egui::Frame::NONE
+                    .fill(BG_PANEL)
+                    .stroke(Stroke::new(1.0_f32, BORDER_SUBTLE))
+                    .corner_radius(egui::CornerRadius::same(6))
+                    .inner_margin(egui::Margin::symmetric(10, 6))
+                    .show(ui, |ui| {
+                        ui.set_width(ui.available_width());
+                        ui.horizontal_wrapped(|ui| {
+                            ui.label(
+                                RichText::new("Suggested Title:")
+                                    .small()
+                                    .strong()
+                                    .color(TEXT_MUTED),
+                            );
+                            ui.label(
+                                RichText::new(&payload.issue_title)
+                                    .small()
+                                    .monospace()
+                                    .color(TEXT_PRIMARY),
+                            );
+                        });
+                    });
+
+                ui.add_space(6.0);
+
+                egui::Frame::NONE
+                    .fill(BG_EXTREME)
+                    .stroke(Stroke::new(1.0_f32, BORDER_SUBTLE))
+                    .corner_radius(egui::CornerRadius::same(6))
+                    .inner_margin(egui::Margin::same(8))
+                    .show(ui, |ui| {
+                        ui.set_width(ui.available_width());
+                        egui::ScrollArea::vertical()
+                            .id_salt("report_modal_markdown_scroll")
+                            .max_height(260.0)
+                            .show(ui, |ui| {
+                                let mut preview = payload.markdown.as_str();
+                                ui.add(
+                                    egui::TextEdit::multiline(&mut preview)
+                                        .code_editor()
+                                        .desired_width(f32::INFINITY)
+                                        .desired_rows(14),
+                                );
+                            });
+                    });
+            } else {
+                ui.label(
+                    RichText::new("Click 'Refresh Diagnostics' to generate a hardware report.")
+                        .color(TEXT_MUTED),
+                );
+            }
+
+            ui.add_space(8.0);
+
+            // Save path row
+            ui.horizontal(|ui| {
+                ui.label(RichText::new("Save path:").small().color(TEXT_MUTED));
+                ui.add(
+                    egui::TextEdit::singleline(&mut app.report_modal.save_path)
+                        .desired_width(ui.available_width().max(200.0))
+                        .hint_text("/tmp/zensmu-report.md"),
+                );
+            });
+
+            // Status note
+            if let Some((msg, is_ok)) = &app.report_modal.status_note {
+                ui.add_space(4.0);
+                let color = if *is_ok { ACCENT_EMERALD } else { ACCENT_AMBER };
+                ui.label(RichText::new(msg).small().color(color));
+            }
+
+            ui.add_space(10.0);
+            ui.separator();
+            ui.add_space(6.0);
+
+            let has_payload = app.report_modal.payload.is_some();
+            split_or_wrap_row(
+                ui,
+                "report_modal_footer",
+                |ui| {
+                    if ui.button("Close").clicked() {
+                        close_clicked = true;
+                    }
+                },
+                |ui| {
+                    if ui
+                        .add_enabled(has_payload, egui::Button::new("Copy Markdown"))
+                        .clicked()
+                    {
+                        copy_clicked = true;
+                    }
+                    if ui
+                        .add_enabled(has_payload, egui::Button::new("Save .md"))
+                        .clicked()
+                    {
+                        save_clicked = true;
+                    }
+                    if ui
+                        .add_enabled(
+                            has_payload,
+                            cta_button("Open GitHub Issue", CTA_EMERALD),
+                        )
+                        .on_hover_text(
+                            "Open a pre-filled GitHub issue in your browser via xdg-open",
+                        )
+                        .clicked()
+                    {
+                        open_github_clicked = true;
+                    }
+                },
+            );
+        });
+
+    if refresh_clicked {
+        app.refresh_report(ctx);
+    }
+    if copy_clicked {
+        if let Some(payload) = &app.report_modal.payload {
+            ctx.copy_text(payload.markdown.clone());
+            app.report_modal.status_note = Some(("Copied Markdown to clipboard.".into(), true));
+        }
+    }
+    if save_clicked {
+        app.save_report_to_disk();
+    }
+    if open_github_clicked {
+        if let Some(url) = app
+            .report_modal
+            .payload
+            .as_ref()
+            .map(|p| p.issue_url.clone())
+        {
+            match open_url_in_browser(&url) {
+                Ok(()) => {
+                    app.report_modal.status_note = Some(("Opened GitHub in browser.".into(), true));
+                }
+                Err(err) => {
+                    app.report_modal.status_note = Some((err, false));
+                }
+            }
+        }
+    }
+    if close_clicked {
+        app.report_modal.open = false;
+    }
+}
+
+fn render_no_hardware_placeholder(app: &mut ZensmuApp, ui: &mut Ui) {
     card_frame().show(ui, |ui| {
         ui.set_width(ui.available_width());
         ui.label(
@@ -3523,5 +4591,15 @@ fn render_no_hardware_placeholder(ui: &mut Ui) {
                 .color(ACCENT_AMBER),
         );
         ui.label("Load the driver (`sudo modprobe ryzen_smu`) and click 'Retry Hardware Probe' in the banner above.");
+        ui.add_space(8.0);
+        if ui
+            .add(cta_button("Report Unsupported CPU on GitHub", CTA_EMERALD))
+            .on_hover_text(
+                "Collect privacy-safe CPU & PM table diagnostics to request hardware support",
+            )
+            .clicked()
+        {
+            app.open_report_modal_for_unsupported();
+        }
     });
 }

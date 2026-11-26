@@ -18,6 +18,7 @@ use zensmu_core::ops::apu::ApuSetRequest;
 use zensmu_core::ops::co::{CoSnapshot, CoreCoMargin};
 use zensmu_core::ops::pbo::{PboSetRequest, PboStatus};
 use zensmu_core::ops::pm_table::TelemetrySnapshot;
+use zensmu_core::report::DebugReport;
 use zensmu_core::safety::persist::PersistStatus;
 use zensmu_core::safety::snapshot::SmuStateSnapshot;
 use zensmu_core::types::{ApuPowerMode, CurveShaperState, FreqTier, PlannedOp, ShaperTierMargins};
@@ -167,6 +168,11 @@ pub enum CliAction {
     },
     /// `zensmu profile clear-guard --json`
     ClearBootGuard,
+    /// `zensmu report --json [--raw-pm-table] [--note <text>]`
+    Report {
+        raw_pm_table: bool,
+        note: Option<String>,
+    },
 }
 
 impl CliAction {
@@ -297,6 +303,7 @@ impl CliAction {
                 (false, false) => "Disable Boot Service".into(),
             },
             Self::ClearBootGuard => "Clear Boot-Loop Crash Guard".into(),
+            Self::Report { .. } => "Collect Hardware Report".into(),
         }
     }
 
@@ -419,7 +426,8 @@ impl CliAction {
             | Self::PboReset { .. }
             | Self::PersistSave { .. }
             | Self::PersistSetService { .. }
-            | Self::ClearBootGuard => true,
+            | Self::ClearBootGuard
+            | Self::Report { .. } => true,
             action => !action.is_dry_run(),
         }
     }
@@ -675,6 +683,17 @@ impl CliAction {
                 "clear-guard".into(),
                 "--json".into(),
             ]],
+            Self::Report { raw_pm_table, note } => {
+                let mut args = vec!["report".into(), "--json".into()];
+                if *raw_pm_table {
+                    args.push("--raw-pm-table".into());
+                }
+                if let Some(text) = note.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+                    args.push("--note".into());
+                    args.push(text.to_string());
+                }
+                vec![args]
+            }
         }
     }
 }
@@ -769,6 +788,53 @@ pub struct PersistActionOutput {
     pub note: Option<String>,
 }
 
+/// Diagnostic hardware & SMU report payload parsed from `zensmu report --json`
+/// or constructed directly from [`DebugReport`].
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ReportPayload {
+    pub report: DebugReport,
+    pub issue_title: String,
+    pub issue_url: String,
+    pub markdown: String,
+}
+
+impl ReportPayload {
+    /// Construct a [`ReportPayload`] directly from an in-process [`DebugReport`].
+    pub fn from_report(report: DebugReport) -> Self {
+        let issue_title = report.suggested_issue_title();
+        let issue_url = report.github_issue_url();
+        let markdown = report.to_markdown();
+        Self {
+            report,
+            issue_title,
+            issue_url,
+            markdown,
+        }
+    }
+}
+
+/// Structured error decoded from a failed `zensmu` CLI invocation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CliError {
+    /// Motherboard/BIOS firmware clamped one or more requested power/current/thermal limits.
+    HardwareClamped {
+        message: String,
+        caps: Vec<(String, u32)>,
+    },
+    /// Any other CLI, PolicyKit, or transport error.
+    Generic(String),
+}
+
+impl CliError {
+    /// Return the human-readable error message.
+    #[cfg(test)]
+    pub fn into_message(self) -> String {
+        match self {
+            Self::HardwareClamped { message, .. } | Self::Generic(message) => message,
+        }
+    }
+}
+
 /// Result delivered asynchronously from the background CLI worker thread back to the GUI.
 #[derive(Debug, Clone)]
 pub enum ElevatedResult {
@@ -776,6 +842,7 @@ pub enum ElevatedResult {
     Co(CoSnapshot),
     Shaper(CurveShaperState),
     Pbo(PboStatus),
+    Report(Box<ReportPayload>),
     DryRunPlan {
         title: String,
         live_action: CliAction,
@@ -796,6 +863,10 @@ pub enum ElevatedResult {
     },
     GuardCleared {
         cleared: bool,
+    },
+    HardwareClamped {
+        message: String,
+        caps: Vec<(String, u32)>,
     },
     Error {
         title: String,
@@ -874,7 +945,10 @@ fn execute_action(zensmu_bin: &Path, is_root: bool, action: CliAction) -> Elevat
     for batch in &batches {
         match run_cli_with_fallback(zensmu_bin, batch, elevate, is_root) {
             Ok(out) => stdouts.push(out),
-            Err(message) => return ElevatedResult::Error { title, message },
+            Err(CliError::HardwareClamped { message, caps }) => {
+                return ElevatedResult::HardwareClamped { message, caps };
+            }
+            Err(CliError::Generic(message)) => return ElevatedResult::Error { title, message },
         }
     }
 
@@ -894,6 +968,10 @@ fn execute_action(zensmu_bin: &Path, is_root: bool, action: CliAction) -> Elevat
         },
         CliAction::PboGet => match parse_pbo_status(first) {
             Ok(status) => ElevatedResult::Pbo(status),
+            Err(message) => ElevatedResult::Error { title, message },
+        },
+        CliAction::Report { .. } => match parse_report_payload(first) {
+            Ok(payload) => ElevatedResult::Report(Box::new(payload)),
             Err(message) => ElevatedResult::Error { title, message },
         },
         CliAction::ProfileExport { path } => match fs::read_to_string(&path) {
@@ -949,11 +1027,13 @@ fn run_cli_with_fallback(
     cli_args: &[String],
     elevate: bool,
     is_root: bool,
-) -> Result<String, String> {
+) -> Result<String, CliError> {
     let spec = build_command_spec(zensmu_bin, cli_args, elevate, is_root);
     match run_command_spec(&spec) {
         Ok(stdout) => Ok(stdout),
-        Err(err) if !elevate && !is_root && looks_like_permission_error(&err) => {
+        Err(CliError::Generic(err))
+            if !elevate && !is_root && looks_like_permission_error(&err) =>
+        {
             let elevated = build_command_spec(zensmu_bin, cli_args, true, false);
             run_command_spec(&elevated)
         }
@@ -961,19 +1041,20 @@ fn run_cli_with_fallback(
     }
 }
 
-fn run_command_spec(spec: &CommandSpec) -> Result<String, String> {
+fn run_command_spec(spec: &CommandSpec) -> Result<String, CliError> {
     let output = Command::new(&spec.program)
         .args(&spec.args)
         .output()
         .map_err(|e| {
-            if e.kind() == std::io::ErrorKind::NotFound {
+            let msg = if e.kind() == std::io::ErrorKind::NotFound {
                 format!(
                     "Could not find executable '{}'. Ensure `zensmu` and `polkit` (`pkexec`) are installed.",
                     spec.program.display()
                 )
             } else {
                 format!("Failed to launch '{}': {e}", spec.program.display())
-            }
+            };
+            CliError::Generic(msg)
         })?;
 
     let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
@@ -1001,18 +1082,21 @@ fn looks_like_permission_error(msg: &str) -> bool {
         || lower.contains("pkexec")
 }
 
-/// Extract a clean user-facing error message from CLI stdout/stderr and exit status.
+/// Decode a failed CLI invocation into a structured [`CliError`], distinguishing
+/// motherboard/BIOS firmware clamps (`kind: "hardware_clamped"`) from generic errors.
 pub fn parse_cli_error(
     stdout: &str,
     stderr: &str,
     exit_code: Option<i32>,
     uses_pkexec: bool,
-) -> String {
+) -> CliError {
     if uses_pkexec && exit_code == Some(126) {
-        return "PolicyKit authentication was dismissed or cancelled.".into();
+        return CliError::Generic("PolicyKit authentication was dismissed or cancelled.".into());
     }
     if uses_pkexec && exit_code == Some(127) {
-        return "PolicyKit could not execute `zensmu` (not found or not authorized).".into();
+        return CliError::Generic(
+            "PolicyKit could not execute `zensmu` (not found or not authorized).".into(),
+        );
     }
 
     for candidate in [stdout, stderr] {
@@ -1022,12 +1106,26 @@ pub fn parse_cli_error(
                 .and_then(|v| v.as_str())
                 .or_else(|| val.get("message").and_then(|v| v.as_str()))
             {
-                return msg.to_string();
+                let is_clamped_kind = val
+                    .get("kind")
+                    .and_then(|v| v.as_str())
+                    .is_some_and(|k| k.eq_ignore_ascii_case("hardware_clamped"));
+                if is_clamped_kind || looks_like_hardware_clamped(msg) {
+                    let mut caps = extract_clamped_caps_from_json(&val);
+                    if caps.is_empty() {
+                        caps = parse_clamped_caps(msg);
+                    }
+                    return CliError::HardwareClamped {
+                        message: msg.to_string(),
+                        caps,
+                    };
+                }
+                return CliError::Generic(msg.to_string());
             }
         }
     }
 
-    if !stderr.is_empty() {
+    let raw = if !stderr.is_empty() {
         stderr.to_string()
     } else if !stdout.is_empty() {
         stdout.to_string()
@@ -1038,7 +1136,90 @@ pub fn parse_cli_error(
                 .map(|c| c.to_string())
                 .unwrap_or_else(|| "signal".into())
         )
+    };
+
+    if looks_like_hardware_clamped(&raw) {
+        let caps = parse_clamped_caps(&raw);
+        return CliError::HardwareClamped { message: raw, caps };
     }
+
+    CliError::Generic(raw)
+}
+
+fn looks_like_hardware_clamped(msg: &str) -> bool {
+    msg.to_ascii_lowercase()
+        .contains("motherboard/bios firmware clamped")
+}
+
+fn extract_clamped_caps_from_json(val: &serde_json::Value) -> Vec<(String, u32)> {
+    let mut caps = Vec::new();
+    let Some(arr) = val.get("clamped").and_then(|v| v.as_array()) else {
+        return caps;
+    };
+    for item in arr {
+        let field = item.get("field").and_then(|v| v.as_str());
+        let actual = item
+            .get("actual_value")
+            .and_then(|v| v.as_u64())
+            .and_then(|v| u32::try_from(v).ok());
+        if let (Some(f), Some(v)) = (field, actual) {
+            if !f.is_empty() {
+                caps.push((f.to_string(), v));
+            }
+        }
+    }
+    caps
+}
+
+/// Parse `field (req ... -> cap N unit)` pairs from a `HardwareClamped` error summary.
+pub fn parse_clamped_caps(text: &str) -> Vec<(String, u32)> {
+    let mut caps = Vec::new();
+    let needle = " (req ";
+    let mut search_from = 0usize;
+
+    while let Some(rel_pos) = text[search_from..].find(needle) {
+        let open_pos = search_from + rel_pos;
+        let prefix = text[..open_pos].trim_end();
+        let field_start = prefix
+            .rfind(|c: char| !(c.is_ascii_alphanumeric() || c == '.' || c == '_' || c == '-'))
+            .map(|i| i + 1)
+            .unwrap_or(0);
+        let field = &prefix[field_start..];
+
+        let after_req = open_pos + needle.len();
+        let Some(close_rel) = text[after_req..].find(')') else {
+            break;
+        };
+        let inside = &text[after_req..after_req + close_rel];
+
+        let cap_rest = inside
+            .split_once("-> cap ")
+            .or_else(|| inside.split_once("→ cap "))
+            .map(|(_, rest)| rest.trim_start());
+
+        if let Some(rest) = cap_rest {
+            let num_token: String = rest
+                .chars()
+                .take_while(|c| c.is_ascii_digit() || *c == '.')
+                .collect();
+            let parsed = num_token.parse::<u32>().ok().or_else(|| {
+                num_token
+                    .parse::<f32>()
+                    .ok()
+                    .filter(|v| v.is_finite() && *v >= 0.0)
+                    .map(|v| v.round() as u32)
+            });
+            if let Some(val) = parsed {
+                if !field.is_empty() {
+                    caps.push((field.to_string(), val));
+                }
+            }
+        }
+
+        search_from = after_req + close_rel + 1;
+    }
+
+    caps
 }
 
 /// Parse `Vec<PlannedOp>` from `zensmu ... --dry-run --json` or live apply JSON output.
@@ -1251,6 +1432,53 @@ pub fn parse_clear_guard_output(json: &str) -> Result<bool, String> {
     val.get("cleared")
         .and_then(|v| v.as_bool())
         .ok_or_else(|| format!("Unexpected JSON payload from clear-guard: {trimmed}"))
+}
+
+/// Parse `ReportPayload` from `zensmu report --json`.
+///
+/// Accepts the wrapped CLI JSON object `{ report, issue_title, issue_url, markdown, ... }`
+/// or a bare serialized `DebugReport` (filling derived fields from `DebugReport` methods).
+pub fn parse_report_payload(json: &str) -> Result<ReportPayload, String> {
+    let val: serde_json::Value = serde_json::from_str(json.trim())
+        .map_err(|e| format!("Invalid report JSON from zensmu: {e}"))?;
+    if let Some(err) = extract_error_field(&val) {
+        return Err(err);
+    }
+
+    if let Some(report_val) = val.get("report") {
+        let report: DebugReport = serde_json::from_value(report_val.clone())
+            .map_err(|e| format!("Failed to decode report field from zensmu: {e}"))?;
+        let issue_title = val
+            .get("issue_title")
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.is_empty())
+            .map(ToString::to_string)
+            .unwrap_or_else(|| report.suggested_issue_title());
+        let issue_url = val
+            .get("issue_url")
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.is_empty())
+            .map(ToString::to_string)
+            .unwrap_or_else(|| report.github_issue_url());
+        let markdown = val
+            .get("markdown")
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.is_empty())
+            .map(ToString::to_string)
+            .unwrap_or_else(|| report.to_markdown());
+        return Ok(ReportPayload {
+            report,
+            issue_title,
+            issue_url,
+            markdown,
+        });
+    }
+
+    if let Ok(report) = serde_json::from_value::<DebugReport>(val) {
+        return Ok(ReportPayload::from_report(report));
+    }
+
+    Err("Failed to decode diagnostic report from zensmu JSON output".into())
 }
 
 fn extract_error_field(val: &serde_json::Value) -> Option<String> {
@@ -1649,14 +1877,18 @@ mod tests {
 
     #[test]
     fn parse_cli_error_handles_pkexec_cancel_and_json_errors() {
-        assert!(parse_cli_error("", "", Some(126), true).contains("cancelled"));
-        assert!(parse_cli_error("", "", Some(127), true).contains("PolicyKit"));
+        assert!(parse_cli_error("", "", Some(126), true)
+            .into_message()
+            .contains("cancelled"));
+        assert!(parse_cli_error("", "", Some(127), true)
+            .into_message()
+            .contains("PolicyKit"));
         assert_eq!(
-            parse_cli_error(r#"{"error":"SMU rejected 0x07"}"#, "", Some(1), false),
+            parse_cli_error(r#"{"error":"SMU rejected 0x07"}"#, "", Some(1), false).into_message(),
             "SMU rejected 0x07"
         );
         assert_eq!(
-            parse_cli_error("", "plain stderr error", Some(1), false),
+            parse_cli_error("", "plain stderr error", Some(1), false).into_message(),
             "plain stderr error"
         );
     }
@@ -1930,5 +2162,167 @@ mod tests {
                 "--json",
             ]]
         );
+    }
+
+    #[test]
+    fn report_cli_action_builds_expected_args_and_requires_privilege() {
+        let minimal = CliAction::Report {
+            raw_pm_table: false,
+            note: None,
+        };
+        assert!(minimal.requires_privilege());
+        assert!(!minimal.is_dry_run());
+        assert_eq!(minimal.title(), "Collect Hardware Report");
+        assert_eq!(minimal.to_arg_batches(), vec![vec!["report", "--json"]]);
+
+        let blank_note = CliAction::Report {
+            raw_pm_table: true,
+            note: Some("   ".into()),
+        };
+        assert_eq!(
+            blank_note.to_arg_batches(),
+            vec![vec!["report", "--json", "--raw-pm-table"]]
+        );
+
+        let full = CliAction::Report {
+            raw_pm_table: true,
+            note: Some("  B450M DS3H V2 EDC clamped at 120A  ".into()),
+        };
+        assert!(full.requires_privilege());
+        assert!(!full.is_dry_run());
+        assert_eq!(
+            full.to_arg_batches(),
+            vec![vec![
+                "report",
+                "--json",
+                "--raw-pm-table",
+                "--note",
+                "B450M DS3H V2 EDC clamped at 120A",
+            ]]
+        );
+    }
+
+    #[test]
+    fn parse_report_payload_decodes_cli_wrapper_and_bare_report() {
+        use zensmu_core::report::{SystemBoardInfo, GITHUB_ISSUES_NEW_URL};
+
+        let report = DebugReport {
+            zensmu_version: "0.1.1".into(),
+            system: SystemBoardInfo {
+                kernel_release: Some("6.12.0".into()),
+                os_pretty_name: Some("Arch Linux".into()),
+                board_vendor: Some("Gigabyte Technology Co., Ltd.".into()),
+                board_name: Some("B450M DS3H V2".into()),
+                bios_version: Some("F65b".into()),
+                bios_date: Some("03/22/2024".into()),
+            },
+            cpuid: None,
+            topology: None,
+            driver: None,
+            driver_error: Some("ryzen_smu not loaded".into()),
+            codename: Some(Codename::Vermeer),
+            capabilities_supported: true,
+            telemetry: None,
+            telemetry_error: None,
+            raw_pm_table_floats: Vec::new(),
+            hwmon_reference: Vec::new(),
+            rsmu_ping: None,
+            mp1_ping: None,
+            pbo_status: None,
+            pbo_error: None,
+            co_snapshot: None,
+            co_error: None,
+            shaper_state: None,
+            shaper_error: None,
+            user_note: Some("Checking VRM caps".into()),
+        };
+
+        let expected = ReportPayload::from_report(report.clone());
+        let cli_json = serde_json::json!({
+            "report": report,
+            "issue_title": expected.issue_title,
+            "issue_labels": ["bug"],
+            "issue_url": expected.issue_url,
+            "markdown": expected.markdown,
+        })
+        .to_string();
+
+        let decoded = parse_report_payload(&cli_json).unwrap();
+        assert_eq!(decoded.issue_title, expected.issue_title);
+        assert!(decoded.issue_url.starts_with(GITHUB_ISSUES_NEW_URL));
+        assert!(decoded.markdown.contains("B450M DS3H V2"));
+        assert_eq!(decoded.report.codename, Some(Codename::Vermeer));
+
+        let bare_json = serde_json::to_string(&decoded.report).unwrap();
+        let decoded_bare = parse_report_payload(&bare_json).unwrap();
+        assert_eq!(decoded_bare.issue_title, expected.issue_title);
+        assert!(decoded_bare.markdown.contains("Checking VRM caps"));
+
+        let err_json = r#"{"ok":false,"error":"permission denied"}"#;
+        assert!(parse_report_payload(err_json)
+            .unwrap_err()
+            .contains("permission denied"));
+    }
+
+    #[test]
+    fn parse_cli_error_detects_hardware_clamped_and_extracts_caps() {
+        let clamped_json = serde_json::json!({
+            "error": "motherboard/BIOS firmware clamped pbo.ppt_w (req 200 W -> cap 142 W), pbo.edc_a (req 220 A -> cap 120 A) (SMU accepted the command but capped the limit at the board VRM/BIOS ceiling; check BIOS PBO Limits)",
+            "kind": "hardware_clamped"
+        })
+        .to_string();
+
+        let parsed = parse_cli_error(&clamped_json, "", Some(1), true);
+        match parsed {
+            CliError::HardwareClamped { message, caps } => {
+                assert!(message.contains("pbo.edc_a (req 220 A -> cap 120 A)"));
+                assert_eq!(
+                    caps,
+                    vec![
+                        ("pbo.ppt_w".to_string(), 142),
+                        ("pbo.edc_a".to_string(), 120)
+                    ]
+                );
+            }
+            other => panic!("expected HardwareClamped, got {other:?}"),
+        }
+
+        // Plain stderr fallback without JSON `kind` field
+        let plain = "Error: motherboard/BIOS firmware clamped apu.stapm_w (req 65 W -> cap 45 W), apu.apu_skin_temp_c (req 60 C -> cap 52 C)";
+        let parsed_plain = parse_cli_error("", plain, Some(1), false);
+        match parsed_plain {
+            CliError::HardwareClamped { caps, .. } => {
+                assert_eq!(
+                    caps,
+                    vec![
+                        ("apu.stapm_w".to_string(), 45),
+                        ("apu.apu_skin_temp_c".to_string(), 52),
+                    ]
+                );
+            }
+            other => panic!("expected HardwareClamped from plain text, got {other:?}"),
+        }
+
+        // Structured `clamped` array in JSON takes precedence when present
+        let with_array = serde_json::json!({
+            "error": "motherboard/BIOS firmware clamped limits",
+            "kind": "hardware_clamped",
+            "clamped": [
+                { "field": "pbo.tdc_a", "actual_value": 95 }
+            ]
+        })
+        .to_string();
+        match parse_cli_error(&with_array, "", Some(1), false) {
+            CliError::HardwareClamped { caps, .. } => {
+                assert_eq!(caps, vec![("pbo.tdc_a".to_string(), 95)]);
+            }
+            other => panic!("expected HardwareClamped with array caps, got {other:?}"),
+        }
+
+        // Generic error remains Generic
+        assert!(matches!(
+            parse_cli_error(r#"{"error":"SMU rejected 0x07"}"#, "", Some(1), false),
+            CliError::Generic(msg) if msg == "SMU rejected 0x07"
+        ));
     }
 }

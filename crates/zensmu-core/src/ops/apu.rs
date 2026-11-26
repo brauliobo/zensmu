@@ -3,7 +3,7 @@
 use crate::error::{Error, Result};
 use crate::hw::identity::HardwareContext;
 use crate::hw::profiles::DualOpcode;
-use crate::ops::{execute_ops, ExecOp};
+use crate::ops::{execute_ops, pm_table, verify_pm_limits, ExecOp};
 use crate::safety::bounds;
 use crate::transport::SmuTransport;
 use crate::types::{ApuPowerMode, PlannedOp, SmuArgs};
@@ -328,6 +328,44 @@ pub fn set_apu(
 
     execute_ops(transport, hw, exec_ops)?;
 
+    let need_pm_verify = req.stapm_w.is_some()
+        || req.fast_w.is_some()
+        || req.slow_w.is_some()
+        || req.apu_slow_w.is_some()
+        || req.tdc_soc_a.is_some()
+        || req.edc_soc_a.is_some()
+        || req.apu_skin_temp_c.is_some()
+        || req.dgpu_skin_temp_c.is_some();
+    if need_pm_verify && hw.driver.has_pm_table {
+        if let Ok(telem) = pm_table::read_telemetry(transport, hw) {
+            verify_pm_limits(&[
+                ("apu.stapm_w", req.stapm_w, telem.stapm_limit_w, "W"),
+                ("apu.fast_w", req.fast_w, telem.ppt_limit_w, "W"),
+                ("apu.slow_w", req.slow_w, telem.slow_limit_w, "W"),
+                (
+                    "apu.apu_slow_w",
+                    req.apu_slow_w,
+                    telem.apu_slow_limit_w,
+                    "W",
+                ),
+                ("apu.tdc_soc_a", req.tdc_soc_a, telem.tdc_soc_limit_a, "A"),
+                ("apu.edc_soc_a", req.edc_soc_a, telem.edc_soc_limit_a, "A"),
+                (
+                    "apu.apu_skin_temp_c",
+                    req.apu_skin_temp_c,
+                    telem.apu_skin_temp_limit_c,
+                    "C",
+                ),
+                (
+                    "apu.dgpu_skin_temp_c",
+                    req.dgpu_skin_temp_c,
+                    telem.dgpu_skin_temp_limit_c,
+                    "C",
+                ),
+            ])?;
+        }
+    }
+
     Ok(planned)
 }
 
@@ -353,9 +391,8 @@ mod tests {
     }
 
     fn mock_phoenix_ctx() -> (MockTransport, HardwareContext) {
-        let transport = MockTransport::granite_ridge_9700x();
-        let mut driver = transport.read_info().unwrap();
-        driver.codename_id = Codename::Phoenix as u32;
+        let transport = MockTransport::phoenix_apu();
+        let driver = transport.read_info().unwrap();
         let hw = HardwareContext {
             driver,
             codename: Codename::Phoenix,
@@ -446,5 +483,29 @@ mod tests {
         assert_eq!(ops[8].args[0], 55 << 8); // APU skin temp Q8.8
         assert_eq!(ops[9].args[0], 60 << 8); // dGPU skin temp Q8.8
         assert!(transport.history().is_empty());
+    }
+
+    #[test]
+    fn phoenix_apu_detects_pm_table_stapm_clamp() {
+        let (transport, hw) = mock_phoenix_ctx();
+        transport.set_clamp_stapm_w(Some(30));
+
+        let req = ApuSetRequest {
+            stapm_w: Some(45),
+            ..Default::default()
+        };
+        let err = set_apu(&transport, &hw, &req, false, false).unwrap_err();
+        match err {
+            Error::HardwareClamped { summary, clamped } => {
+                assert_eq!(clamped.len(), 1);
+                assert_eq!(clamped[0].field, "apu.stapm_w");
+                assert_eq!(clamped[0].requested, "45 W");
+                assert_eq!(clamped[0].actual, "30 W");
+                assert_eq!(clamped[0].actual_value, 30);
+                assert_eq!(clamped[0].unit, "W");
+                assert!(summary.contains("apu.stapm_w (req 45 W -> cap 30 W)"));
+            }
+            other => panic!("expected Error::HardwareClamped, got {other:?}"),
+        }
     }
 }
