@@ -1050,6 +1050,24 @@ pub fn format_driver_status(status: &DriverStatus) -> String {
     );
     let _ = writeln!(
         out,
+        "Kernel Headers         : {}",
+        if status.kernel_headers_installed {
+            "installed"
+        } else {
+            "missing (run `sudo zensmu driver install` to install headers & build DKMS)"
+        }
+    );
+    let _ = writeln!(
+        out,
+        "Bundled DKMS Source    : {}",
+        if status.bundled_dkms_available {
+            "available (/usr/share/zensmu/ryzen_smu-dkms)"
+        } else {
+            "not bundled (will clone upstream amkillam/ryzen_smu)"
+        }
+    );
+    let _ = writeln!(
+        out,
         "Boot Autoload          : {}",
         if status.autoload_configured {
             "configured (/etc/modules-load.d/ryzen_smu.conf)"
@@ -1632,6 +1650,9 @@ mod tests {
             module_path: Some("/lib/modules/6.12/ryzen_smu.ko".into()),
             dkms_installed: true,
             dkms_status: Some("ryzen_smu/0.1.7: installed".into()),
+            bundled_dkms_available: true,
+            zensmu_managed_dkms: true,
+            kernel_headers_installed: true,
             autoload_configured: true,
             kernel_release: "6.12.0".into(),
             distro_family: DistroFamily::Fedora,

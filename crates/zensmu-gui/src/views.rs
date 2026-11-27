@@ -10,7 +10,7 @@ use eframe::egui::{self, Color32, RichText, Stroke, Ui};
 use egui_plot::{HLine, Line, Plot, PlotPoints};
 use std::collections::BTreeMap;
 use zensmu_core::bench::{BenchWorkload, CoreBenchStatus};
-use zensmu_core::driver::{DistroFamily, DriverInstallMethod};
+use zensmu_core::driver::DriverInstallMethod;
 use zensmu_core::hw::identity::{driver_has_false_ok_bug, HardwareContext};
 use zensmu_core::metrics::{DEFAULT_METRICS_LISTEN, USER_EXPORTER_SERVICE_NAME};
 use zensmu_core::ops::apu::{
@@ -1114,7 +1114,7 @@ pub fn render_banners(app: &mut ZensmuApp, ui: &mut Ui, ctx: &egui::Context) {
                 let driver_cmd = app.driver_status.recommended_command.clone();
                 let driver_installed = app.driver_status.module_installed;
                 let driver_distro = app.driver_status.distro_name.clone();
-                let driver_family = app.driver_status.distro_family;
+                let bundled_dkms = app.driver_status.bundled_dkms_available;
                 let runner_busy = app.runner.is_busy();
                 let mut requested_driver_action: Option<CliAction> = None;
                 let mut copied_driver_cmd = false;
@@ -1144,35 +1144,25 @@ pub fn render_banners(app: &mut ZensmuApp, ui: &mut Ui, ctx: &egui::Context) {
                             }
                         } else if !is_unsupported_or_mismatch {
                             ui.label(
-                                RichText::new(format!("Install driver ({driver_distro}):"))
+                                RichText::new(format!("Build DKMS driver ({driver_distro}):"))
                                     .color(TEXT_PRIMARY),
                             );
                             ui.code(&driver_cmd);
-                            let (install_label, install_method, install_hover) =
-                                match driver_family {
-                                    DistroFamily::Debian => (
-                                        "Install ryzen_smu (.deb via pkexec)",
-                                        DriverInstallMethod::Package,
-                                        "Download SHA256-verified ryzen-smu-dkms .deb from GitHub Releases and load ryzen_smu",
-                                    ),
-                                    DistroFamily::Fedora | DistroFamily::OpenSuse => (
-                                        "Install ryzen_smu (.rpm via pkexec)",
-                                        DriverInstallMethod::Package,
-                                        "Download SHA256-verified ryzen-smu-dkms .rpm from GitHub Releases and load ryzen_smu",
-                                    ),
-                                    DistroFamily::Arch | DistroFamily::Other => (
-                                        "Install via DKMS Source (pkexec)",
-                                        DriverInstallMethod::Source,
-                                        "Clone upstream amkillam/ryzen_smu, build via DKMS, and load ryzen_smu",
-                                    ),
-                                };
+                            let install_hover = if bundled_dkms {
+                                "Build & install ryzen_smu via DKMS from bundled sources (auto-installs kernel headers/dkms if needed)"
+                            } else {
+                                "Clone upstream amkillam/ryzen_smu, build & install via DKMS (auto-installs kernel headers/dkms if needed)"
+                            };
                             if ui
-                                .add_enabled(!runner_busy, cta_button(install_label, CTA_EMERALD))
+                                .add_enabled(
+                                    !runner_busy,
+                                    cta_button("Build & Install ryzen_smu (DKMS)", CTA_EMERALD),
+                                )
                                 .on_hover_text(install_hover)
                                 .clicked()
                             {
                                 requested_driver_action = Some(CliAction::DriverInstall {
-                                    method: install_method,
+                                    method: DriverInstallMethod::Dkms,
                                 });
                             }
                             if ui.button("Copy Command").clicked() {

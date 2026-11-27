@@ -1,9 +1,10 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Clone upstream amkillam/ryzen_smu and prepare DKMS package staging files
-# for packaging/nfpm/ryzen-smu-dkms.yaml. Outputs RYZEN_SMU_VERSION to stdout
-# (and GITHUB_OUTPUT when running under GitHub Actions).
+# Clone upstream amkillam/ryzen_smu and prepare DKMS source + package staging files
+# for both the bundled zensmu DKMS tree (/usr/share/zensmu/ryzen_smu-dkms) and the
+# standalone packaging/nfpm/ryzen-smu-dkms.yaml package.
+# Outputs RYZEN_SMU_VERSION to stdout (and GITHUB_OUTPUT when running under GitHub Actions).
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 cd "${ROOT_DIR}"
@@ -22,6 +23,8 @@ cp build/ryzen_smu_git/drv.c \
    build/ryzen_smu_git/Makefile \
    build/ryzen_smu_git/LICENSE \
    build/ryzen_smu_src/
+
+printf '%s\n' "${SMU_VER}" > build/ryzen_smu_src/VERSION
 
 cat > build/ryzen_smu_src/dkms.conf <<EOF
 PACKAGE_NAME="ryzen_smu"
@@ -55,7 +58,26 @@ EOF
 cat > build/ryzen_smu_src/preremove.sh <<EOF
 #!/bin/sh
 set -eu
+# Skip removal during deb/rpm package upgrades; only remove on full uninstall.
+case "\${1:-}" in
+  upgrade|failed-upgrade|deconfigure)
+    exit 0
+    ;;
+esac
+is_rpm_upgrade=0
+case "\${1:-}" in
+  ""|*[!0-9]*) ;;
+  0) ;;
+  *) is_rpm_upgrade=1 ;;
+esac
+if [ "\${is_rpm_upgrade}" = "1" ]; then
+  exit 0
+fi
+
 VER="${SMU_VER}"
+if command -v modprobe >/dev/null 2>&1; then
+  modprobe -r ryzen_smu >/dev/null 2>&1 || true
+fi
 if command -v dkms >/dev/null 2>&1; then
   dkms remove -m ryzen_smu -v "\${VER}" --all >/dev/null 2>&1 || true
 fi

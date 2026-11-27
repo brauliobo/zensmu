@@ -199,47 +199,10 @@ fn maybe_prompt_and_setup_driver(cli: &Cli) -> bool {
         status.distro_name, status.kernel_release
     );
 
-    if status.distro_family == driver::DistroFamily::Arch {
-        if !is_root {
-            if let Some(helper) = ["paru", "yay"].into_iter().find(|h| command_in_path(h)) {
-                let prompt = format!(
-                    "Install `ryzen_smu-dkms-git` from AUR now via `{helper} -S ryzen_smu-dkms-git`?"
-                );
-                if prompt_yes_no(&prompt, true) {
-                    let installed = ProcessCommand::new(helper)
-                        .args(["-S", "ryzen_smu-dkms-git"])
-                        .status()
-                        .map(|s| s.success())
-                        .unwrap_or(false);
-                    if installed {
-                        return run_driver_setup_command(&current_exe, false, &["driver", "load"]);
-                    }
-                    return false;
-                }
-                return false;
-            }
-        }
-        if prompt_yes_no(
-            "Build & install `ryzen_smu` via DKMS from upstream amkillam/ryzen_smu now?",
-            false,
-        ) {
-            return run_driver_setup_command(
-                &current_exe,
-                is_root,
-                &["driver", "install", "--method", "source"],
-            );
-        }
-        return false;
-    }
-
-    let desc = match status.distro_family {
-        driver::DistroFamily::Debian => {
-            "Download & install verified `ryzen-smu-dkms` .deb package now?"
-        }
-        driver::DistroFamily::Fedora | driver::DistroFamily::OpenSuse => {
-            "Download & install verified `ryzen-smu-dkms` .rpm package now?"
-        }
-        _ => "Build & install `ryzen_smu` via DKMS from upstream source now?",
+    let desc = if status.bundled_dkms_available {
+        "Build & install `ryzen_smu` via DKMS from bundled sources now (auto-installs headers/dkms if needed)?"
+    } else {
+        "Build & install `ryzen_smu` via DKMS from upstream amkillam/ryzen_smu now (auto-installs headers/dkms if needed)?"
     };
     if !prompt_yes_no(desc, true) {
         return false;
@@ -261,14 +224,6 @@ fn prompt_yes_no(question: &str, default_yes: bool) -> bool {
     } else {
         matches!(ans.as_str(), "y" | "yes")
     }
-}
-
-fn command_in_path(cmd: &str) -> bool {
-    ProcessCommand::new("sh")
-        .args(["-c", &format!("command -v {cmd} >/dev/null 2>&1")])
-        .status()
-        .map(|s| s.success())
-        .unwrap_or(false)
 }
 
 fn run_driver_setup_command(exe: &Path, is_root: bool, args: &[&str]) -> bool {
@@ -485,6 +440,15 @@ fn cmd_driver(cli: &Cli, action: Option<&DriverAction>) -> Result<CliOutcome> {
                 dry_run: cli.dry_run,
             };
             let out = driver::install_driver(&sp, &opts)?;
+            if cli.json {
+                print_json(&out);
+            } else {
+                print_driver_action(&out);
+            }
+            Ok(CliOutcome::Success)
+        }
+        DriverAction::Uninstall { force } => {
+            let out = driver::uninstall_driver(&sp, *force, cli.dry_run)?;
             if cli.json {
                 print_json(&out);
             } else {

@@ -2,7 +2,7 @@
 %global debug_package %{nil}
 
 Name:           zensmu
-Version:        0.3.0
+Version:        0.3.1
 Release:        1%{?dist}
 Summary:        Safety-first Rust CLI, live TUI, and unprivileged GUI for AMD Ryzen SMU control and telemetry
 
@@ -23,6 +23,10 @@ BuildRequires:  systemd-rpm-macros
 BuildRequires:  desktop-file-utils
 
 Requires:       polkit
+Recommends:     dkms
+Recommends:     make
+Recommends:     gcc
+Recommends:     kernel-devel
 Recommends:     libglvnd-glx
 Recommends:     libxkbcommon
 Recommends:     libwayland-client
@@ -91,10 +95,25 @@ desktop-file-validate %{buildroot}%{_datadir}/applications/zensmu-gui.desktop
 %post
 %systemd_post zensmu-apply.service
 %systemd_user_post zensmu-record.service zensmu-exporter.service
+if [ -f /usr/share/zensmu/ryzen_smu-dkms/dkms.conf ] && command -v dkms >/dev/null 2>&1; then
+    sh /usr/share/zensmu/ryzen_smu-dkms/postinstall.sh >/dev/null 2>&1 || true
+fi
 
 %preun
 %systemd_preun zensmu-apply.service
 %systemd_user_preun zensmu-record.service zensmu-exporter.service
+if [ "$1" -eq 0 ]; then
+    for dir in /usr/src/ryzen_smu-*; do
+        [ -f "${dir}/.zensmu-managed" ] || continue
+        ver="${dir#/usr/src/ryzen_smu-}"
+        command -v modprobe >/dev/null 2>&1 && modprobe -r ryzen_smu >/dev/null 2>&1 || true
+        command -v dkms >/dev/null 2>&1 && dkms remove -m ryzen_smu -v "${ver}" --all >/dev/null 2>&1 || true
+        rm -rf "${dir}"
+    done
+    if [ -f /etc/modules-load.d/ryzen_smu.conf ] && grep -q '^# Managed by zensmu' /etc/modules-load.d/ryzen_smu.conf 2>/dev/null; then
+        rm -f /etc/modules-load.d/ryzen_smu.conf
+    fi
+fi
 
 %postun
 %systemd_postun zensmu-apply.service

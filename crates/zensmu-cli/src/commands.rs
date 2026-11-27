@@ -186,27 +186,30 @@ pub enum Command {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 pub enum DriverMethodArg {
-    /// Use prebuilt ryzen-smu-dkms .deb/.rpm on Debian/Ubuntu/Fedora/openSUSE, guide AUR on Arch, or DKMS source on other distros
+    /// Standard recommendation: build and install ryzen_smu via DKMS (bundled sources or upstream amkillam/ryzen_smu, auto-installing headers/dkms)
     Auto,
-    /// Download and install verified ryzen-smu-dkms .deb or .rpm from GitHub Releases
-    Package,
-    /// Clone upstream amkillam/ryzen_smu and install via `make dkms-install`
+    /// First-class DKMS build from bundled /usr/share/zensmu/ryzen_smu-dkms (falling back to upstream amkillam/ryzen_smu)
+    Dkms,
+    /// Clone fresh upstream amkillam/ryzen_smu HEAD and build via DKMS
     Source,
+    /// Download and install standalone ryzen-smu-dkms .deb or .rpm from GitHub Releases
+    Package,
 }
 
 impl From<DriverMethodArg> for DriverInstallMethod {
     fn from(arg: DriverMethodArg) -> Self {
         match arg {
             DriverMethodArg::Auto => DriverInstallMethod::Auto,
-            DriverMethodArg::Package => DriverInstallMethod::Package,
+            DriverMethodArg::Dkms => DriverInstallMethod::Dkms,
             DriverMethodArg::Source => DriverInstallMethod::Source,
+            DriverMethodArg::Package => DriverInstallMethod::Package,
         }
     }
 }
 
 #[derive(Debug, Subcommand)]
 pub enum DriverAction {
-    /// Inspect ryzen_smu driver, DKMS, autoload, and distro install guidance (unprivileged)
+    /// Inspect ryzen_smu driver, DKMS, kernel headers, autoload, and install guidance (unprivileged)
     Status,
 
     /// Load ryzen_smu via modprobe and configure /etc/modules-load.d/ryzen_smu.conf (requires root)
@@ -216,13 +219,13 @@ pub enum DriverAction {
         no_autoload: bool,
     },
 
-    /// Install and load ryzen_smu DKMS driver via verified GitHub Release package or upstream source (requires root)
+    /// Build, register, and load ryzen_smu via DKMS (auto-installs headers/dkms; requires root)
     Install {
-        /// Installation method (auto, package, or source)
+        /// Installation method (auto/dkms recommended, source for fresh upstream clone, or package for standalone .deb/.rpm)
         #[arg(long, value_enum, default_value_t = DriverMethodArg::Auto)]
         method: DriverMethodArg,
 
-        /// Specific GitHub release tag to download ryzen-smu-dkms from (defaults to latest release)
+        /// Specific GitHub release tag when using --method package (defaults to latest release)
         #[arg(long, value_name = "TAG")]
         release: Option<String>,
 
@@ -230,7 +233,15 @@ pub enum DriverAction {
         #[arg(long)]
         no_autoload: bool,
 
-        /// Reinstall even if ryzen_smu is already installed for the running kernel
+        /// Rebuild/reinstall even if ryzen_smu is already installed for the running kernel
+        #[arg(long)]
+        force: bool,
+    },
+
+    /// Unload and remove zensmu-managed ryzen_smu DKMS module registration (requires root)
+    #[command(visible_alias = "remove")]
+    Uninstall {
+        /// Also remove externally managed ryzen_smu DKMS trees under /usr/src/ryzen_smu-*
         #[arg(long)]
         force: bool,
     },
@@ -1484,6 +1495,36 @@ mod tests {
             }
             other => panic!("unexpected command: {other:?}"),
         }
+
+        let dkms_inst =
+            Cli::try_parse_from(["zensmu", "driver", "install", "--method", "dkms"]).unwrap();
+        assert!(matches!(
+            dkms_inst.command,
+            Command::Driver {
+                action: Some(DriverAction::Install {
+                    method: DriverMethodArg::Dkms,
+                    ..
+                })
+            }
+        ));
+
+        let uninst =
+            Cli::try_parse_from(["zensmu", "driver", "uninstall", "--force", "--dry-run"]).unwrap();
+        assert!(uninst.dry_run);
+        assert!(matches!(
+            uninst.command,
+            Command::Driver {
+                action: Some(DriverAction::Uninstall { force: true })
+            }
+        ));
+
+        let rem = Cli::try_parse_from(["zensmu", "driver", "remove"]).unwrap();
+        assert!(matches!(
+            rem.command,
+            Command::Driver {
+                action: Some(DriverAction::Uninstall { force: false })
+            }
+        ));
     }
 
     #[test]

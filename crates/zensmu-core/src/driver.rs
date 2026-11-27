@@ -1,11 +1,14 @@
-//! Distro-aware `ryzen_smu` kernel driver inspection, loading, and DKMS installation.
+//! Distro-aware `ryzen_smu` kernel driver inspection, loading, and first-class DKMS lifecycle.
 //!
-//! `zensmu` never hard-depends on `ryzen_smu` at package level so installations stay
-//! clean across custom kernels and distros. This module powers:
+//! `zensmu` ships bundled `ryzen_smu` DKMS sources in `/usr/share/zensmu/ryzen_smu-dkms`
+//! (automatically built/installed on package install and cleanly removed on package
+//! uninstall unless another `ryzen_smu` provider is already present). This module powers:
 //! - Unprivileged `zensmu driver status`, `zensmu doctor` diagnostics, and GUI banners.
 //! - Privileged `sudo zensmu driver load` (`modprobe ryzen_smu` + autoload config).
-//! - Privileged `sudo zensmu driver install` (verified GitHub Release `.deb`/`.rpm`
-//!   installation or upstream `amkillam/ryzen_smu` DKMS source build, with `--dry-run`).
+//! - Privileged `sudo zensmu driver install` (first-class DKMS build from bundled sources
+//!   or upstream `amkillam/ryzen_smu`, auto-installing missing DKMS/header prerequisites,
+//!   or optional standalone `.deb`/`.rpm` package download — all with `--dry-run`).
+//! - Privileged `sudo zensmu driver uninstall` (clean unload + DKMS removal).
 
 use crate::error::{Error, Result};
 use crate::report::GITHUB_REPO;
@@ -20,6 +23,15 @@ use std::process::Command;
 pub const RYZEN_SMU_UPSTREAM_REPO: &str = "https://github.com/amkillam/ryzen_smu";
 pub const RYZEN_SMU_UPSTREAM_GIT: &str = "https://github.com/amkillam/ryzen_smu.git";
 pub const RYZEN_SMU_CHECKSUMS_ASSET: &str = "ryzen-smu-dkms.SHA256SUMS.txt";
+
+/// Bundled `ryzen_smu` DKMS source directory shipped by `zensmu` packages.
+pub const BUNDLED_DKMS_SRC_DIR: &str = "/usr/share/zensmu/ryzen_smu-dkms";
+
+/// Marker file placed inside `/usr/src/ryzen_smu-<ver>/` for DKMS trees managed by `zensmu`.
+pub const ZENSMU_MANAGED_MARKER: &str = ".zensmu-managed";
+
+/// Header comment written to `/etc/modules-load.d/ryzen_smu.conf` when created by `zensmu`.
+pub const ZENSMU_MODULES_LOAD_MARKER: &str = "# Managed by zensmu";
 
 /// EFI variable path exposing UEFI Secure Boot state (5th byte: 1 = enabled, 0 = disabled).
 pub const SECURE_BOOT_EFIVAR_PATH: &str =
@@ -85,22 +97,27 @@ impl fmt::Display for DistroFamily {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum DriverInstallMethod {
-    /// Use prebuilt `ryzen-smu-dkms` `.deb`/`.rpm` on Debian/Ubuntu/Fedora/openSUSE,
-    /// guide AUR `ryzen_smu-dkms-git` on Arch, or build via DKMS source on other distros.
+    /// Standard recommendation: build and register `ryzen_smu` via DKMS (prefers bundled
+    /// `/usr/share/zensmu/ryzen_smu-dkms` sources, falls back to upstream `amkillam/ryzen_smu`,
+    /// and auto-installs missing DKMS / kernel-header prerequisites).
     #[default]
     Auto,
-    /// Download and install the prebuilt `ryzen-smu-dkms` `.deb` or `.rpm` from GitHub Releases.
-    Package,
-    /// Clone `amkillam/ryzen_smu` and install via `make dkms-install`.
+    /// First-class DKMS build from bundled `/usr/share/zensmu/ryzen_smu-dkms` sources
+    /// (falling back to upstream `amkillam/ryzen_smu` when bundled sources are absent).
+    Dkms,
+    /// Clone fresh upstream `amkillam/ryzen_smu` HEAD and build/register via DKMS.
     Source,
+    /// Download and install the standalone `ryzen-smu-dkms` `.deb` or `.rpm` from GitHub Releases.
+    Package,
 }
 
 impl DriverInstallMethod {
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Auto => "auto",
-            Self::Package => "package",
+            Self::Dkms => "dkms",
             Self::Source => "source",
+            Self::Package => "package",
         }
     }
 }
@@ -124,6 +141,12 @@ pub struct DriverStatus {
     pub dkms_installed: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub dkms_status: Option<String>,
+    #[serde(default)]
+    pub bundled_dkms_available: bool,
+    #[serde(default)]
+    pub zensmu_managed_dkms: bool,
+    #[serde(default)]
+    pub kernel_headers_installed: bool,
     pub autoload_configured: bool,
     pub kernel_release: String,
     pub distro_family: DistroFamily,
@@ -284,47 +307,58 @@ pub fn read_kernel_release() -> String {
         .unwrap_or_else(|| "unknown".to_string())
 }
 
-/// Build distro-specific manual installation commands for `ryzen_smu`.
+/// Build distro-specific installation commands for `ryzen_smu` (DKMS build first-class).
 pub fn manual_install_commands(family: DistroFamily) -> Vec<String> {
-    let releases = format!("https://github.com/{GITHUB_REPO}/releases");
+    let mut cmds = vec![
+        "sudo zensmu driver install  # recommended: builds & registers ryzen_smu via DKMS (auto-installs headers/dkms)".to_string(),
+    ];
     match family {
-        DistroFamily::Arch => vec![
-            "paru -S ryzen_smu-dkms-git  # AUR (note underscore '_')".to_string(),
-            "sudo modprobe ryzen_smu".to_string(),
-        ],
-        DistroFamily::Debian => vec![
-            "sudo zensmu driver install  # downloads & verifies ryzen-smu-dkms .deb".to_string(),
-            format!("# Or manually from {releases}:"),
-            "sudo apt install linux-headers-$(uname -r) ./ryzen-smu-dkms_*_all.deb".to_string(),
-            format!("# Or build from source ({RYZEN_SMU_UPSTREAM_REPO}):"),
-            format!("git clone {RYZEN_SMU_UPSTREAM_GIT} /tmp/ryzen_smu && sudo make -C /tmp/ryzen_smu dkms-install && sudo modprobe ryzen_smu"),
-        ],
-        DistroFamily::Fedora => vec![
-            "sudo zensmu driver install  # downloads & verifies ryzen-smu-dkms .rpm".to_string(),
-            format!("# Or manually from {releases}:"),
-            "sudo dnf install kernel-devel-$(uname -r) ./ryzen-smu-dkms-*.noarch.rpm".to_string(),
-            format!("# Or build from source ({RYZEN_SMU_UPSTREAM_REPO}):"),
-            format!("git clone {RYZEN_SMU_UPSTREAM_GIT} /tmp/ryzen_smu && sudo make -C /tmp/ryzen_smu dkms-install && sudo modprobe ryzen_smu"),
-        ],
-        DistroFamily::OpenSuse => vec![
-            "sudo zensmu driver install  # downloads & verifies ryzen-smu-dkms .rpm".to_string(),
-            format!("# Or manually from {releases}:"),
-            "sudo zypper install --allow-unsigned-rpm ./ryzen-smu-dkms-*.noarch.rpm".to_string(),
-            format!("# Or build from source ({RYZEN_SMU_UPSTREAM_REPO}):"),
-            format!("git clone {RYZEN_SMU_UPSTREAM_GIT} /tmp/ryzen_smu && sudo make -C /tmp/ryzen_smu dkms-install && sudo modprobe ryzen_smu"),
-        ],
-        DistroFamily::Other => vec![
-            "sudo zensmu driver install --method source".to_string(),
-            format!("git clone {RYZEN_SMU_UPSTREAM_GIT} /tmp/ryzen_smu && sudo make -C /tmp/ryzen_smu dkms-install && sudo modprobe ryzen_smu"),
-        ],
+        DistroFamily::Arch => {
+            cmds.push("# Or install DKMS package from AUR (note underscore '_'):".to_string());
+            cmds.push("paru -S ryzen_smu-dkms-git && sudo modprobe ryzen_smu".to_string());
+        }
+        DistroFamily::Debian => {
+            cmds.push("# Or install prerequisites + build manually via DKMS:".to_string());
+            cmds.push(
+                "sudo apt install dkms build-essential git linux-headers-$(uname -r)".to_string(),
+            );
+            cmds.push(format!(
+                "git clone {RYZEN_SMU_UPSTREAM_GIT} /tmp/ryzen_smu && sudo make -C /tmp/ryzen_smu dkms-install && sudo modprobe ryzen_smu"
+            ));
+        }
+        DistroFamily::Fedora => {
+            cmds.push("# Or install prerequisites + build manually via DKMS:".to_string());
+            cmds.push("sudo dnf install dkms gcc make git kernel-devel-$(uname -r)".to_string());
+            cmds.push(format!(
+                "git clone {RYZEN_SMU_UPSTREAM_GIT} /tmp/ryzen_smu && sudo make -C /tmp/ryzen_smu dkms-install && sudo modprobe ryzen_smu"
+            ));
+        }
+        DistroFamily::OpenSuse => {
+            cmds.push("# Or install prerequisites + build manually via DKMS:".to_string());
+            cmds.push("sudo zypper install dkms gcc make git kernel-default-devel".to_string());
+            cmds.push(format!(
+                "git clone {RYZEN_SMU_UPSTREAM_GIT} /tmp/ryzen_smu && sudo make -C /tmp/ryzen_smu dkms-install && sudo modprobe ryzen_smu"
+            ));
+        }
+        DistroFamily::Other => {
+            cmds.push("# Or build manually via DKMS:".to_string());
+            cmds.push(format!(
+                "git clone {RYZEN_SMU_UPSTREAM_GIT} /tmp/ryzen_smu && sudo make -C /tmp/ryzen_smu dkms-install && sudo modprobe ryzen_smu"
+            ));
+        }
     }
+    cmds
 }
 
 /// Recommended single command for a given driver state + distro.
+///
+/// First-class DKMS build via `sudo zensmu driver install` is the standard recommendation
+/// across all distros because it handles bundled/upstream DKMS sources, kernel headers,
+/// autoload, and module loading in one step.
 pub fn recommended_driver_command(
     loaded: bool,
     module_installed: bool,
-    family: DistroFamily,
+    _family: DistroFamily,
 ) -> String {
     if loaded {
         return "zensmu doctor".to_string();
@@ -332,13 +366,7 @@ pub fn recommended_driver_command(
     if module_installed {
         return "sudo zensmu driver load".to_string();
     }
-    match family {
-        DistroFamily::Arch => "paru -S ryzen_smu-dkms-git".to_string(),
-        DistroFamily::Debian | DistroFamily::Fedora | DistroFamily::OpenSuse => {
-            "sudo zensmu driver install".to_string()
-        }
-        DistroFamily::Other => "sudo zensmu driver install --method source".to_string(),
-    }
+    "sudo zensmu driver install".to_string()
 }
 
 /// Parse raw bytes from `/sys/firmware/efi/efivars/SecureBoot-8be4df61-93ca-11d2-aa0d-00e098032b8c`.
@@ -463,12 +491,15 @@ pub fn inspect_driver_status(sysfs_path: &Path) -> DriverStatus {
 
     let dkms_status = run_dkms_status();
     let dkms_installed = dkms_status.is_some();
+    let bundled_dkms_available = Path::new(BUNDLED_DKMS_SRC_DIR).join("dkms.conf").is_file();
+    let zensmu_managed_dkms = !find_managed_dkms_versions(Path::new("/usr/src")).is_empty();
 
     let autoload_configured = fs::read_to_string(DEFAULT_MODULES_LOAD_PATH)
         .map(|s| s.lines().any(|l| l.trim() == "ryzen_smu"))
         .unwrap_or(false);
 
     let kernel_release = read_kernel_release();
+    let kernel_headers_installed = kernel_headers_exist(&kernel_release);
     let (distro_family, distro_name) = detect_distro();
     let recommended_command = recommended_driver_command(loaded, module_installed, distro_family);
     let manual_commands = manual_install_commands(distro_family);
@@ -490,9 +521,15 @@ pub fn inspect_driver_status(sysfs_path: &Path) -> DriverStatus {
             )
         }
     } else if dkms_installed {
-        format!(
-            "ryzen_smu DKMS source is present but no compiled module was found for kernel {kernel_release}"
-        )
+        if !kernel_headers_installed {
+            format!(
+                "ryzen_smu DKMS source is present but kernel headers for {kernel_release} are missing — run `sudo zensmu driver install`"
+            )
+        } else {
+            format!(
+                "ryzen_smu DKMS source is present but no compiled module was found for kernel {kernel_release}"
+            )
+        }
     } else {
         format!(
             "ryzen_smu kernel module is not installed for kernel {kernel_release} ({distro_name})"
@@ -507,6 +544,9 @@ pub fn inspect_driver_status(sysfs_path: &Path) -> DriverStatus {
         module_path,
         dkms_installed,
         dkms_status,
+        bundled_dkms_available,
+        zensmu_managed_dkms,
+        kernel_headers_installed,
         autoload_configured,
         kernel_release,
         distro_family,
@@ -524,22 +564,12 @@ pub fn format_driver_remediation_hint(st: &DriverStatus) -> String {
         return format!("ryzen_smu is loaded at {}", st.sysfs_path);
     }
     let base = if st.module_installed {
-        "ryzen_smu is installed but not loaded — run: sudo modprobe ryzen_smu (or: sudo zensmu driver load)".to_string()
+        "ryzen_smu is installed but not loaded — run: sudo zensmu driver load (or: sudo modprobe ryzen_smu)".to_string()
     } else {
-        match st.distro_family {
-            DistroFamily::Arch => {
-                "ryzen_smu is not installed — install from AUR: paru -S ryzen_smu-dkms-git (or inspect with: zensmu driver status)".to_string()
-            }
-            DistroFamily::Debian | DistroFamily::Fedora | DistroFamily::OpenSuse => {
-                format!(
-                    "ryzen_smu is not installed ({}) — run: sudo zensmu driver install (or see: zensmu driver status)",
-                    st.distro_name
-                )
-            }
-            DistroFamily::Other => {
-                "ryzen_smu is not installed — run: sudo zensmu driver install --method source (or see: zensmu driver status)".to_string()
-            }
-        }
+        format!(
+            "ryzen_smu is not installed ({}) — build & install via DKMS with: sudo zensmu driver install (inspect: zensmu driver status)",
+            st.distro_name
+        )
     };
 
     if st.secure_boot.blocks_unsigned_modules {
@@ -654,7 +684,7 @@ pub fn load_driver(
     })
 }
 
-/// Install and load `ryzen_smu` via verified GitHub Release `.deb`/`.rpm` or upstream DKMS source.
+/// Install and load `ryzen_smu` via first-class DKMS build (default) or release package.
 pub fn install_driver(
     sysfs_path: &Path,
     opts: &DriverInstallOptions,
@@ -669,7 +699,7 @@ pub fn install_driver(
         out.notes.insert(
             0,
             format!(
-                "ryzen_smu is already installed for kernel {} (pass --force to reinstall)",
+                "ryzen_smu is already installed for kernel {} (pass --force to rebuild/reinstall)",
                 before.kernel_release
             ),
         );
@@ -677,17 +707,7 @@ pub fn install_driver(
     }
 
     let effective_method = match opts.method {
-        DriverInstallMethod::Auto => match before.distro_family {
-            DistroFamily::Debian | DistroFamily::Fedora | DistroFamily::OpenSuse => {
-                DriverInstallMethod::Package
-            }
-            DistroFamily::Arch => {
-                return Err(Error::InvalidInput(
-                    "On Arch Linux, install ryzen_smu from AUR so pacman tracks it: `paru -S ryzen_smu-dkms-git` (or pass `--method source` to build via DKMS directly)".to_string(),
-                ));
-            }
-            DistroFamily::Other => DriverInstallMethod::Source,
-        },
+        DriverInstallMethod::Auto => DriverInstallMethod::Dkms,
         explicit => explicit,
     };
 
@@ -695,18 +715,143 @@ pub fn install_driver(
         && before.distro_family.package_extension().is_none()
     {
         return Err(Error::InvalidInput(format!(
-            "No prebuilt .deb/.rpm package method for distro '{}'; use `--method source` (or on Arch: `paru -S ryzen_smu-dkms-git`)",
+            "No standalone .deb/.rpm package method for distro '{}'; run `sudo zensmu driver install` (DKMS build)",
             before.distro_name
         )));
     }
 
     match effective_method {
+        DriverInstallMethod::Dkms => install_via_dkms(sysfs_path, &before, opts, false),
+        DriverInstallMethod::Source => install_via_dkms(sysfs_path, &before, opts, true),
         DriverInstallMethod::Package => install_via_release_package(sysfs_path, &before, opts),
-        DriverInstallMethod::Source => install_via_dkms_source(sysfs_path, &before, opts),
         DriverInstallMethod::Auto => Err(Error::InvalidInput(
             "unable to resolve driver install method".to_string(),
         )),
     }
+}
+
+/// Unload and uninstall `ryzen_smu` DKMS registrations managed by `zensmu`
+/// (or all `ryzen_smu` DKMS registrations when `force` is true).
+pub fn uninstall_driver(
+    sysfs_path: &Path,
+    force: bool,
+    dry_run: bool,
+) -> Result<DriverActionOutput> {
+    let before = inspect_driver_status(sysfs_path);
+    let usr_src = Path::new("/usr/src");
+    let targets = if force {
+        find_all_ryzen_smu_dkms_versions(usr_src)
+    } else {
+        find_managed_dkms_versions(usr_src)
+    };
+
+    let mut steps = Vec::new();
+    let mut notes = Vec::new();
+
+    if targets.is_empty() && !force {
+        if before.dkms_installed {
+            notes.push(
+                "ryzen_smu DKMS appears to be managed externally (not by zensmu); pass --force to remove it anyway, or remove the external package (e.g. ryzen_smu-dkms-git / ryzen-smu-dkms)."
+                    .to_string(),
+            );
+        } else {
+            notes.push("No zensmu-managed ryzen_smu DKMS installation found.".to_string());
+        }
+        return Ok(DriverActionOutput {
+            action: "uninstall".to_string(),
+            dry_run,
+            method: "dkms".to_string(),
+            changed: false,
+            loaded: before.loaded,
+            autoload_configured: before.autoload_configured,
+            steps,
+            notes,
+            status: before,
+        });
+    }
+
+    if before.loaded {
+        steps.push("modprobe -r ryzen_smu".to_string());
+    }
+    for (ver, dir) in &targets {
+        steps.push(format!("dkms remove -m ryzen_smu -v {ver} --all"));
+        steps.push(format!("Remove {}", dir.display()));
+    }
+    let remove_autoload = is_zensmu_managed_modules_load(Path::new(DEFAULT_MODULES_LOAD_PATH));
+    if remove_autoload {
+        steps.push(format!("Remove {DEFAULT_MODULES_LOAD_PATH}"));
+    }
+
+    if dry_run {
+        notes.push("Dry-run only: no module unload or DKMS removal executed.".to_string());
+        return Ok(DriverActionOutput {
+            action: "uninstall".to_string(),
+            dry_run: true,
+            method: "dkms".to_string(),
+            changed: !steps.is_empty(),
+            loaded: before.loaded,
+            autoload_configured: before.autoload_configured,
+            steps,
+            notes,
+            status: before,
+        });
+    }
+
+    require_root("uninstalling ryzen_smu DKMS kernel driver")?;
+
+    let mut changed = false;
+    if before.loaded {
+        let out = run_cmd("modprobe", &["-r", "ryzen_smu"], &[])?;
+        if !out.status.success() {
+            let stderr = String::from_utf8_lossy(&out.stderr).trim().to_string();
+            notes.push(format!(
+                "Warning: `modprobe -r ryzen_smu` returned non-zero ({stderr}); continuing DKMS removal"
+            ));
+        } else {
+            changed = true;
+        }
+    }
+
+    for (ver, dir) in &targets {
+        if command_exists("dkms") {
+            let _ = run_cmd(
+                "dkms",
+                &["remove", "-m", "ryzen_smu", "-v", ver, "--all"],
+                &[],
+            );
+        }
+        if dir.exists() {
+            fs::remove_dir_all(dir).map_err(|source| Error::Io {
+                path: dir.display().to_string(),
+                source,
+            })?;
+        }
+        changed = true;
+    }
+
+    if remove_autoload {
+        let p = Path::new(DEFAULT_MODULES_LOAD_PATH);
+        if p.exists() {
+            fs::remove_file(p).map_err(|source| Error::Io {
+                path: p.display().to_string(),
+                source,
+            })?;
+            changed = true;
+        }
+    }
+
+    let after = inspect_driver_status(sysfs_path);
+    Ok(DriverActionOutput {
+        action: "uninstall".to_string(),
+        dry_run: false,
+        method: "dkms".to_string(),
+        changed,
+        loaded: after.loaded,
+        autoload_configured: after.autoload_configured,
+        steps,
+        notes,
+        status: after,
+    })
 }
 
 fn install_via_release_package(
@@ -950,25 +1095,334 @@ fn install_via_release_package(
     })
 }
 
-fn install_via_dkms_source(
+/// Render the standard `dkms.conf` for `ryzen_smu` at a given DKMS version.
+pub fn render_dkms_conf(version: &str) -> String {
+    format!(
+        "PACKAGE_NAME=\"ryzen_smu\"\n\
+         PACKAGE_VERSION=\"{version}\"\n\
+         MAKE[0]=\"make -C $kernel_source_dir M=$dkms_tree/$PACKAGE_NAME/$PACKAGE_VERSION/build modules\"\n\
+         BUILT_MODULE_NAME[0]=\"ryzen_smu\"\n\
+         DEST_MODULE_LOCATION[0]=\"/kernel/drivers/ryzen_smu\"\n\
+         AUTOINSTALL=\"yes\"\n"
+    )
+}
+
+/// Check whether kernel build headers exist for `kernel_release`.
+pub fn kernel_headers_exist(kernel_release: &str) -> bool {
+    let build_dir = Path::new("/lib/modules").join(kernel_release).join("build");
+    build_dir.join("Makefile").is_file() || build_dir.is_dir()
+}
+
+/// Read Arch/CachyOS kernel `pkgbase` (e.g. `linux`, `linux-zen`, `linux-cachyos-bore`)
+/// so the matching `<pkgbase>-headers` package can be installed accurately.
+pub fn read_arch_kernel_pkgbase(kernel_release: &str) -> Option<String> {
+    let path = Path::new("/usr/lib/modules")
+        .join(kernel_release)
+        .join("pkgbase");
+    fs::read_to_string(path)
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+}
+
+/// Build the distro package-manager command needed to install DKMS build prerequisites
+/// (`dkms`, `make`, `gcc`, kernel headers, and optionally `git` when cloning upstream).
+pub fn dkms_prereq_command(
+    family: DistroFamily,
+    kernel_release: &str,
+    arch_pkgbase: Option<&str>,
+    need_git: bool,
+) -> Option<(&'static str, Vec<String>)> {
+    match family {
+        DistroFamily::Debian => {
+            let mut args = vec![
+                "install".to_string(),
+                "-y".to_string(),
+                "dkms".to_string(),
+                "build-essential".to_string(),
+                format!("linux-headers-{kernel_release}"),
+            ];
+            if need_git {
+                args.push("git".to_string());
+            }
+            Some(("apt-get", args))
+        }
+        DistroFamily::Fedora => {
+            let mut args = vec![
+                "install".to_string(),
+                "-y".to_string(),
+                "dkms".to_string(),
+                "gcc".to_string(),
+                "make".to_string(),
+                format!("kernel-devel-{kernel_release}"),
+            ];
+            if need_git {
+                args.push("git".to_string());
+            }
+            Some(("dnf", args))
+        }
+        DistroFamily::OpenSuse => {
+            let mut args = vec![
+                "--non-interactive".to_string(),
+                "install".to_string(),
+                "dkms".to_string(),
+                "gcc".to_string(),
+                "make".to_string(),
+                "kernel-default-devel".to_string(),
+            ];
+            if need_git {
+                args.push("git".to_string());
+            }
+            Some(("zypper", args))
+        }
+        DistroFamily::Arch => {
+            let headers = format!("{}-headers", arch_pkgbase.unwrap_or("linux"));
+            let mut args = vec![
+                "-S".to_string(),
+                "--needed".to_string(),
+                "--noconfirm".to_string(),
+                "dkms".to_string(),
+                "base-devel".to_string(),
+                headers,
+            ];
+            if need_git {
+                args.push("git".to_string());
+            }
+            Some(("pacman", args))
+        }
+        DistroFamily::Other => None,
+    }
+}
+
+/// Find `zensmu`-managed `/usr/src/ryzen_smu-<ver>` directories containing `.zensmu-managed`.
+pub fn find_managed_dkms_versions(usr_src: &Path) -> Vec<(String, PathBuf)> {
+    find_ryzen_smu_dkms_versions(usr_src, true)
+}
+
+/// Find all `/usr/src/ryzen_smu-<ver>` directories regardless of manager.
+pub fn find_all_ryzen_smu_dkms_versions(usr_src: &Path) -> Vec<(String, PathBuf)> {
+    find_ryzen_smu_dkms_versions(usr_src, false)
+}
+
+fn find_ryzen_smu_dkms_versions(usr_src: &Path, managed_only: bool) -> Vec<(String, PathBuf)> {
+    let Ok(entries) = fs::read_dir(usr_src) else {
+        return Vec::new();
+    };
+    let mut found = Vec::new();
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if !path.is_dir() {
+            continue;
+        }
+        let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+            continue;
+        };
+        let Some(ver) = name.strip_prefix("ryzen_smu-") else {
+            continue;
+        };
+        if ver.is_empty() {
+            continue;
+        }
+        if managed_only && !path.join(ZENSMU_MANAGED_MARKER).is_file() {
+            continue;
+        }
+        found.push((ver.to_string(), path));
+    }
+    found.sort_by(|a, b| a.0.cmp(&b.0));
+    found
+}
+
+fn is_zensmu_managed_modules_load(path: &Path) -> bool {
+    fs::read_to_string(path)
+        .map(|s| {
+            s.contains(ZENSMU_MODULES_LOAD_MARKER)
+                || s.contains("# Autoload AMD Ryzen SMU driver for zensmu")
+        })
+        .unwrap_or(false)
+}
+
+fn ensure_dkms_prerequisites(
+    before: &DriverStatus,
+    need_git: bool,
+    notes: &mut Vec<String>,
+) -> Result<()> {
+    let missing_tools = !command_exists("dkms")
+        || !command_exists("make")
+        || !command_exists("gcc")
+        || (need_git && !command_exists("git"));
+    let missing_headers = !before.kernel_headers_installed;
+
+    if !missing_tools && !missing_headers {
+        return Ok(());
+    }
+
+    let arch_pkgbase = if before.distro_family == DistroFamily::Arch {
+        read_arch_kernel_pkgbase(&before.kernel_release)
+    } else {
+        None
+    };
+
+    let Some((bin, args)) = dkms_prereq_command(
+        before.distro_family,
+        &before.kernel_release,
+        arch_pkgbase.as_deref(),
+        need_git,
+    ) else {
+        return Ok(());
+    };
+
+    if !command_exists(bin) {
+        return Ok(());
+    }
+
+    let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
+    let envs: &[(&str, &str)] = if bin == "apt-get" {
+        &[("DEBIAN_FRONTEND", "noninteractive")]
+    } else {
+        &[]
+    };
+
+    let out = run_cmd(bin, &arg_refs, envs)?;
+    if out.status.success() {
+        notes.push(format!(
+            "Installed DKMS build prerequisites via `{bin} {}`",
+            args.join(" ")
+        ));
+        return Ok(());
+    }
+
+    // Fallback when an exact kernel-version headers package isn't in the repo (e.g. rolling / generic meta)
+    match before.distro_family {
+        DistroFamily::Debian => {
+            let mut fallback = vec![
+                "install",
+                "-y",
+                "dkms",
+                "build-essential",
+                "linux-headers-generic",
+            ];
+            if need_git {
+                fallback.push("git");
+            }
+            let retry = run_cmd("apt-get", &fallback, envs)?;
+            if !retry.status.success() {
+                let mut fallback_amd64 = vec![
+                    "install",
+                    "-y",
+                    "dkms",
+                    "build-essential",
+                    "linux-headers-amd64",
+                ];
+                if need_git {
+                    fallback_amd64.push("git");
+                }
+                let _ = run_cmd("apt-get", &fallback_amd64, envs);
+            }
+        }
+        DistroFamily::Fedora => {
+            let mut fallback = vec!["install", "-y", "dkms", "gcc", "make", "kernel-devel"];
+            if need_git {
+                fallback.push("git");
+            }
+            let _ = run_cmd("dnf", &fallback, &[]);
+        }
+        _ => {}
+    }
+
+    Ok(())
+}
+
+fn stage_dkms_tree(src_dir: &Path, version: &str) -> Result<PathBuf> {
+    let dst_dir = Path::new("/usr/src").join(format!("ryzen_smu-{version}"));
+    fs::create_dir_all(&dst_dir).map_err(|source| Error::Io {
+        path: dst_dir.display().to_string(),
+        source,
+    })?;
+
+    for file in ["drv.c", "smu.c", "smu.h", "Makefile", "LICENSE"] {
+        let src_file = src_dir.join(file);
+        if src_file.is_file() {
+            let dst_file = dst_dir.join(file);
+            fs::copy(&src_file, &dst_file).map_err(|source| Error::Io {
+                path: dst_file.display().to_string(),
+                source,
+            })?;
+        }
+    }
+
+    let dkms_conf_path = dst_dir.join("dkms.conf");
+    fs::write(&dkms_conf_path, render_dkms_conf(version)).map_err(|source| Error::Io {
+        path: dkms_conf_path.display().to_string(),
+        source,
+    })?;
+
+    let marker_path = dst_dir.join(ZENSMU_MANAGED_MARKER);
+    fs::write(&marker_path, format!("{version}\n")).map_err(|source| Error::Io {
+        path: marker_path.display().to_string(),
+        source,
+    })?;
+
+    Ok(dst_dir)
+}
+
+fn install_via_dkms(
     sysfs_path: &Path,
     before: &DriverStatus,
     opts: &DriverInstallOptions,
+    force_upstream: bool,
 ) -> Result<DriverActionOutput> {
-    let mut steps = vec![
-        format!("git clone --depth 1 {RYZEN_SMU_UPSTREAM_GIT} <tmpdir>"),
-        "make -C <tmpdir> dkms-install".to_string(),
-    ];
+    let bundled_dir = Path::new(BUNDLED_DKMS_SRC_DIR);
+    let use_bundled = !force_upstream && bundled_dir.join("dkms.conf").is_file();
+    let method_label = if use_bundled { "dkms" } else { "source" };
+
+    let mut steps = Vec::new();
+    let need_git = !use_bundled;
+    let missing_prereqs = !command_exists("dkms")
+        || !command_exists("make")
+        || !command_exists("gcc")
+        || (need_git && !command_exists("git"))
+        || !before.kernel_headers_installed;
+
+    if missing_prereqs {
+        let arch_pkgbase = if before.distro_family == DistroFamily::Arch {
+            read_arch_kernel_pkgbase(&before.kernel_release)
+        } else {
+            None
+        };
+        if let Some((bin, args)) = dkms_prereq_command(
+            before.distro_family,
+            &before.kernel_release,
+            arch_pkgbase.as_deref(),
+            need_git,
+        ) {
+            steps.push(format!("{bin} {}", args.join(" ")));
+        }
+    }
+
+    if use_bundled {
+        steps.push(format!(
+            "Stage bundled DKMS sources from {BUNDLED_DKMS_SRC_DIR} into /usr/src/ryzen_smu-<ver>"
+        ));
+    } else {
+        steps.push(format!(
+            "git clone --depth 1 {RYZEN_SMU_UPSTREAM_GIT} <tmpdir>"
+        ));
+        steps.push("Stage DKMS sources + dkms.conf into /usr/src/ryzen_smu-<ver>".to_string());
+    }
+    steps.push("dkms add / build / install -m ryzen_smu -v <ver> --force".to_string());
     if opts.configure_autoload {
         steps.push(format!("Ensure 'ryzen_smu' in {DEFAULT_MODULES_LOAD_PATH}"));
     }
     steps.push("modprobe ryzen_smu".to_string());
 
     if opts.dry_run {
-        let mut dry_notes = vec![
-            "Dry-run only: requires `git`, `make`, `gcc`, `dkms`, and kernel headers for the running kernel."
-                .to_string(),
-        ];
+        let mut dry_notes = vec![if use_bundled {
+            format!(
+                "Dry-run only: will build via DKMS from bundled sources in {BUNDLED_DKMS_SRC_DIR}."
+            )
+        } else {
+            format!("Dry-run only: will clone {RYZEN_SMU_UPSTREAM_REPO} and build via DKMS.")
+        }];
         if !before.loaded && before.secure_boot.blocks_unsigned_modules {
             if let Some(ref hint) = before.secure_boot.hint {
                 dry_notes.push(hint.clone());
@@ -977,7 +1431,7 @@ fn install_via_dkms_source(
         return Ok(DriverActionOutput {
             action: "install".to_string(),
             dry_run: true,
-            method: "source".to_string(),
+            method: method_label.to_string(),
             changed: true,
             loaded: before.loaded,
             autoload_configured: before.autoload_configured,
@@ -988,38 +1442,112 @@ fn install_via_dkms_source(
     }
 
     require_root("building and installing ryzen_smu via DKMS")?;
-    ensure_command_available("git", "install `git` first")?;
+
+    let mut notes = Vec::new();
+    ensure_dkms_prerequisites(before, need_git, &mut notes)?;
+
+    if need_git {
+        ensure_command_available("git", "install `git` first")?;
+    }
     ensure_command_available("make", "install `make` / build tools first")?;
+    ensure_command_available("gcc", "install `gcc` / C compiler first")?;
     ensure_command_available("dkms", "install `dkms` and kernel headers first")?;
 
-    let workdir = make_temp_dir("zensmu-driver-src")?;
-    let src_dir = workdir.join("ryzen_smu");
-    let src_str = src_dir.display().to_string();
+    let mut temp_dir: Option<PathBuf> = None;
 
-    let result = (|| -> Result<()> {
-        let clone_out = run_cmd(
-            "git",
-            &["clone", "--depth", "1", RYZEN_SMU_UPSTREAM_GIT, &src_str],
-            &[],
-        )?;
-        if !clone_out.status.success() {
+    let result = (|| -> Result<String> {
+        let (src_dir, smu_ver) = if use_bundled {
+            let ver = fs::read_to_string(bundled_dir.join("VERSION"))
+                .ok()
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .unwrap_or_else(|| "0.1.7".to_string());
+            (bundled_dir.to_path_buf(), ver)
+        } else {
+            let workdir = make_temp_dir("zensmu-driver-src")?;
+            let clone_dir = workdir.join("ryzen_smu");
+            let clone_str = clone_dir.display().to_string();
+            temp_dir = Some(workdir);
+
+            let clone_out = run_cmd("git", &["clone", RYZEN_SMU_UPSTREAM_GIT, &clone_str], &[])?;
+            if !clone_out.status.success() {
+                return Err(Error::InvalidInput(format!(
+                    "git clone failed: {}",
+                    String::from_utf8_lossy(&clone_out.stderr).trim()
+                )));
+            }
+            let rev = run_cmd(
+                "git",
+                &["-C", &clone_str, "rev-list", "--count", "HEAD"],
+                &[],
+            )
+            .ok()
+            .filter(|o| o.status.success())
+            .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+            .filter(|s| !s.is_empty());
+            let sha = run_cmd(
+                "git",
+                &["-C", &clone_str, "rev-parse", "--short=7", "HEAD"],
+                &[],
+            )
+            .ok()
+            .filter(|o| o.status.success())
+            .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+            .filter(|s| !s.is_empty());
+
+            let ver = match (rev, sha) {
+                (Some(r), Some(s)) => format!("0.1.7.r{r}.g{s}"),
+                _ => "0.1.7".to_string(),
+            };
+            (clone_dir, ver)
+        };
+
+        // Remove any older zensmu-managed DKMS version (or current version on --force)
+        let usr_src = Path::new("/usr/src");
+        for (old_ver, old_dir) in find_managed_dkms_versions(usr_src) {
+            if opts.force || old_ver != smu_ver {
+                let _ = run_cmd(
+                    "dkms",
+                    &["remove", "-m", "ryzen_smu", "-v", &old_ver, "--all"],
+                    &[],
+                );
+                let _ = fs::remove_dir_all(&old_dir);
+            }
+        }
+
+        stage_dkms_tree(&src_dir, &smu_ver)?;
+
+        let status_out = run_cmd("dkms", &["status", "-m", "ryzen_smu", "-v", &smu_ver], &[])?;
+        let already_added = status_out.status.success()
+            && String::from_utf8_lossy(&status_out.stdout).contains("ryzen_smu");
+        if !already_added {
+            let add_out = run_cmd("dkms", &["add", "-m", "ryzen_smu", "-v", &smu_ver], &[])?;
+            if !add_out.status.success() {
+                return Err(Error::InvalidInput(format!(
+                    "dkms add failed: {}",
+                    String::from_utf8_lossy(&add_out.stderr).trim()
+                )));
+            }
+        }
+
+        let build_out = run_cmd("dkms", &["build", "-m", "ryzen_smu", "-v", &smu_ver], &[])?;
+        if !build_out.status.success() {
             return Err(Error::InvalidInput(format!(
-                "git clone failed: {}",
-                String::from_utf8_lossy(&clone_out.stderr).trim()
+                "dkms build failed for kernel {} (ensure matching kernel headers are installed): {}",
+                before.kernel_release,
+                String::from_utf8_lossy(&build_out.stderr).trim()
             )));
         }
 
-        // If force reinstalling over an existing 0.1.7 DKMS tree, remove old registration first.
-        if opts.force {
-            let _ = run_cmd("make", &["-C", &src_str, "dkms-uninstall"], &[]);
-        }
-
-        let make_out = run_cmd("make", &["-C", &src_str, "dkms-install"], &[])?;
-        if !make_out.status.success() {
+        let inst_out = run_cmd(
+            "dkms",
+            &["install", "-m", "ryzen_smu", "-v", &smu_ver, "--force"],
+            &[],
+        )?;
+        if !inst_out.status.success() {
             return Err(Error::InvalidInput(format!(
-                "make dkms-install failed (ensure kernel headers for {} are installed): {}",
-                before.kernel_release,
-                String::from_utf8_lossy(&make_out.stderr).trim()
+                "dkms install failed: {}",
+                String::from_utf8_lossy(&inst_out.stderr).trim()
             )));
         }
 
@@ -1038,22 +1566,28 @@ fn install_via_dkms_source(
             };
             return Err(Error::DriverNotLoaded {
                 path: format!(
-                    "{} (DKMS built, but `modprobe ryzen_smu` failed: {}; {extra})",
+                    "{} (DKMS built & installed ryzen_smu/{smu_ver}, but `modprobe ryzen_smu` failed: {}; {extra})",
                     sysfs_path.display(),
                     String::from_utf8_lossy(&mod_out.stderr).trim()
                 ),
             });
         }
-        Ok(())
+        Ok(smu_ver)
     })();
 
-    let _ = fs::remove_dir_all(&workdir);
-    result?;
+    if let Some(dir) = temp_dir {
+        let _ = fs::remove_dir_all(&dir);
+    }
+    let smu_ver = result?;
 
     let after = inspect_driver_status(sysfs_path);
-    let mut notes = vec![format!(
-        "Built and installed via DKMS from {RYZEN_SMU_UPSTREAM_REPO}"
-    )];
+    notes.push(if use_bundled {
+        format!(
+            "Built & installed ryzen_smu/{smu_ver} via DKMS from bundled {BUNDLED_DKMS_SRC_DIR}"
+        )
+    } else {
+        format!("Built & installed ryzen_smu/{smu_ver} via DKMS from {RYZEN_SMU_UPSTREAM_REPO}")
+    });
     if !after.loaded && after.secure_boot.blocks_unsigned_modules {
         if let Some(ref hint) = after.secure_boot.hint {
             notes.push(hint.clone());
@@ -1062,7 +1596,7 @@ fn install_via_dkms_source(
     Ok(DriverActionOutput {
         action: "install".to_string(),
         dry_run: false,
-        method: "source".to_string(),
+        method: method_label.to_string(),
         changed: true,
         loaded: after.loaded,
         autoload_configured: after.autoload_configured,
@@ -1186,13 +1720,16 @@ fn require_root(action: &str) -> Result<()> {
     Ok(())
 }
 
-fn ensure_command_available(cmd: &str, hint: &str) -> Result<()> {
-    let ok = Command::new("sh")
+fn command_exists(cmd: &str) -> bool {
+    Command::new("sh")
         .args(["-c", &format!("command -v {cmd} >/dev/null 2>&1")])
         .status()
         .map(|s| s.success())
-        .unwrap_or(false);
-    if !ok {
+        .unwrap_or(false)
+}
+
+fn ensure_command_available(cmd: &str, hint: &str) -> Result<()> {
+    if !command_exists(cmd) {
         return Err(Error::InvalidInput(format!(
             "required command `{cmd}` not found ({hint})"
         )));
@@ -1304,18 +1841,81 @@ mod tests {
             recommended_driver_command(false, true, DistroFamily::Debian),
             "sudo zensmu driver load"
         );
-        assert_eq!(
-            recommended_driver_command(false, false, DistroFamily::Arch),
-            "paru -S ryzen_smu-dkms-git"
-        );
-        assert_eq!(
-            recommended_driver_command(false, false, DistroFamily::Debian),
-            "sudo zensmu driver install"
-        );
-        assert_eq!(
-            recommended_driver_command(false, false, DistroFamily::Other),
-            "sudo zensmu driver install --method source"
-        );
+        for fam in [
+            DistroFamily::Arch,
+            DistroFamily::Debian,
+            DistroFamily::Fedora,
+            DistroFamily::OpenSuse,
+            DistroFamily::Other,
+        ] {
+            assert_eq!(
+                recommended_driver_command(false, false, fam),
+                "sudo zensmu driver install"
+            );
+        }
+    }
+
+    #[test]
+    fn dkms_prereq_command_targets_distro_headers_and_pkgbase() {
+        let (bin, args) =
+            dkms_prereq_command(DistroFamily::Debian, "6.8.0-45-generic", None, false).unwrap();
+        assert_eq!(bin, "apt-get");
+        assert!(args.contains(&"dkms".to_string()));
+        assert!(args.contains(&"linux-headers-6.8.0-45-generic".to_string()));
+        assert!(!args.contains(&"git".to_string()));
+
+        let (bin, args) =
+            dkms_prereq_command(DistroFamily::Fedora, "6.12.5-200.fc41.x86_64", None, true)
+                .unwrap();
+        assert_eq!(bin, "dnf");
+        assert!(args.contains(&"kernel-devel-6.12.5-200.fc41.x86_64".to_string()));
+        assert!(args.contains(&"git".to_string()));
+
+        let (bin, args) = dkms_prereq_command(
+            DistroFamily::Arch,
+            "7.3.6-1-cachyos-bore",
+            Some("linux-cachyos-bore"),
+            false,
+        )
+        .unwrap();
+        assert_eq!(bin, "pacman");
+        assert!(args.contains(&"linux-cachyos-bore-headers".to_string()));
+        assert!(args.contains(&"dkms".to_string()));
+
+        let (bin, args) =
+            dkms_prereq_command(DistroFamily::OpenSuse, "6.12.0-default", None, false).unwrap();
+        assert_eq!(bin, "zypper");
+        assert!(args.contains(&"kernel-default-devel".to_string()));
+
+        assert!(dkms_prereq_command(DistroFamily::Other, "6.12.0", None, true).is_none());
+    }
+
+    #[test]
+    fn finds_only_zensmu_managed_dkms_trees_unless_all_requested() {
+        let dir = tempfile::tempdir().unwrap();
+        let ext = dir.path().join("ryzen_smu-191.d298366");
+        let managed = dir.path().join("ryzen_smu-0.1.7.r191.gd298366");
+        let other = dir.path().join("other_mod-1.0");
+        fs::create_dir_all(&ext).unwrap();
+        fs::create_dir_all(&managed).unwrap();
+        fs::create_dir_all(&other).unwrap();
+        fs::write(managed.join(ZENSMU_MANAGED_MARKER), "0.1.7.r191.gd298366\n").unwrap();
+
+        let only_managed = find_managed_dkms_versions(dir.path());
+        assert_eq!(only_managed.len(), 1);
+        assert_eq!(only_managed[0].0, "0.1.7.r191.gd298366");
+
+        let all = find_all_ryzen_smu_dkms_versions(dir.path());
+        assert_eq!(all.len(), 2);
+    }
+
+    #[test]
+    fn renders_valid_dkms_conf() {
+        let conf = render_dkms_conf("0.1.7.r191.gd298366");
+        assert!(conf.contains("PACKAGE_NAME=\"ryzen_smu\""));
+        assert!(conf.contains("PACKAGE_VERSION=\"0.1.7.r191.gd298366\""));
+        assert!(conf.contains("BUILT_MODULE_NAME[0]=\"ryzen_smu\""));
+        assert!(conf.contains("AUTOINSTALL=\"yes\""));
     }
 
     #[test]

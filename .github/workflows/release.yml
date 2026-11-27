@@ -71,6 +71,10 @@ jobs:
       - name: Build release binaries
         run: cargo build --release --workspace --locked
 
+      - name: Fetch bundled ryzen_smu DKMS sources
+        id: bundled_smu
+        run: bash packaging/nfpm/prepare-ryzen-smu-dkms.sh
+
       - name: Generate shell completions & stage tarball
         env:
           VERSION: ${{ steps.meta.outputs.version }}
@@ -88,6 +92,7 @@ jobs:
             "${STAGE}/packaging/systemd" \
             "${STAGE}/packaging/polkit" \
             "${STAGE}/packaging/desktop" \
+            "${STAGE}/packaging/ryzen_smu-dkms" \
             "${STAGE}/man"
           cp target/release/zensmu target/release/zensmu-gui "${STAGE}/"
           cp \
@@ -98,6 +103,15 @@ jobs:
             "${STAGE}/packaging/systemd/"
           cp packaging/polkit/org.zensmu.policy "${STAGE}/packaging/polkit/"
           cp packaging/desktop/zensmu-gui.desktop packaging/desktop/zensmu.svg "${STAGE}/packaging/desktop/"
+          cp \
+            build/ryzen_smu_src/drv.c \
+            build/ryzen_smu_src/smu.c \
+            build/ryzen_smu_src/smu.h \
+            build/ryzen_smu_src/Makefile \
+            build/ryzen_smu_src/LICENSE \
+            build/ryzen_smu_src/dkms.conf \
+            build/ryzen_smu_src/VERSION \
+            "${STAGE}/packaging/ryzen_smu-dkms/"
           cp dist/zensmu.1 "${STAGE}/man/zensmu.1"
           cp README.md LICENSE "${STAGE}/"
 
@@ -156,7 +170,7 @@ jobs:
           fi
 
   build-ryzen-smu-dkms:
-    name: Build Optional ryzen-smu-dkms Packages (.deb, .rpm)
+    name: Build Standalone ryzen-smu-dkms Packages (.deb, .rpm)
     needs: [build-and-publish]
     if: ${{ always() && (needs.build-and-publish.result == 'success' || needs.build-and-publish.result == 'skipped') }}
     runs-on: ubuntu-24.04

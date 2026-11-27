@@ -39,102 +39,75 @@ Runs directly on the stock [`ryzen_smu`](https://gitlab.com/leogx9r/ryzen_smu) k
 
 ## Install
 
-### 1. Kernel Driver (`ryzen_smu`)
+### 1. Kernel Driver (`ryzen_smu` — First-Class DKMS Build)
 
-`ryzen_smu` is an out-of-tree DKMS kernel module (not bundled in official Debian/Ubuntu/Fedora/Arch repos). `zensmu` does not hard-depend on it so installations never break on custom kernels, automatically runs `modprobe ryzen_smu` when invoked as root, and includes built-in `zensmu driver status|load|install` tooling:
+`ryzen_smu` is an out-of-tree DKMS kernel module (not bundled in official Debian/Ubuntu/Fedora/Arch repos). **DKMS build is the first-class, standard setup in `zensmu`:**
 
-- **Arch Linux / CachyOS** — install **`ryzen_smu-dkms-git`** (underscore `_`, not `ryzen-smu-dkms`):
+- **Automatic on package install & uninstall:** Every `zensmu` package (`.deb`, `.rpm`, `.pkg.tar.zst`, AUR `zensmu-bin` / `zensmu-git`) bundles the audited `amkillam/ryzen_smu` DKMS sources in `/usr/share/zensmu/ryzen_smu-dkms`. Installing `zensmu` automatically builds, registers, and loads `ryzen_smu` via DKMS (skipping safely if you already have `ryzen_smu-dkms-git`, `ryzen-smu-dkms`, or a kernel-shipped module), and uninstalling `zensmu` cleanly unloads and removes its managed DKMS registration.
+- **One-command DKMS management (all distros):** If kernel headers or `dkms` weren't installed yet, or if you built `zensmu` from source, run:
   ```bash
-  paru -S ryzen_smu-dkms-git
+  sudo zensmu driver install     # auto-installs headers/dkms if needed, builds & loads ryzen_smu via DKMS
+  zensmu driver status           # inspect driver, DKMS, kernel headers, Secure Boot & lockdown state
+  sudo zensmu driver uninstall   # cleanly unload & unregister zensmu-managed ryzen_smu DKMS module
   ```
-- **Debian / Ubuntu** — run `sudo zensmu driver install` (auto-downloads & SHA256-verifies `ryzen-smu-dkms_*_all.deb` from [Releases](https://github.com/brauliobo/zensmu/releases)), or install manually:
-  ```bash
-  # Option A: automatic verified DKMS .deb install
-  sudo zensmu driver install
-
-  # Option B: manual .deb install from Releases
-  sudo apt install linux-headers-$(uname -r) ./ryzen-smu-dkms_*_all.deb
-
-  # Option C: build directly from upstream amkillam/ryzen_smu via DKMS
-  sudo apt install dkms git build-essential linux-headers-$(uname -r)
-  git clone https://github.com/amkillam/ryzen_smu.git /tmp/ryzen_smu
-  sudo make -C /tmp/ryzen_smu dkms-install && sudo modprobe ryzen_smu
-  ```
-- **Fedora / RHEL / openSUSE** — run `sudo zensmu driver install` (auto-downloads & SHA256-verifies `ryzen-smu-dkms-*.noarch.rpm` from [Releases](https://github.com/brauliobo/zensmu/releases)), or install manually:
-  ```bash
-  # Option A: automatic verified DKMS .rpm install
-  sudo zensmu driver install
-
-  # Option B: manual .rpm install from Releases
-  sudo dnf install kernel-devel-$(uname -r) ./ryzen-smu-dkms-*.noarch.rpm
-  # (openSUSE: sudo zypper install --allow-unsigned-rpm ./ryzen-smu-dkms-*.noarch.rpm)
-
-  # Option C: build directly from upstream amkillam/ryzen_smu via DKMS
-  sudo dnf install dkms git gcc make kernel-devel-$(uname -r)
-  git clone https://github.com/amkillam/ryzen_smu.git /tmp/ryzen_smu
-  sudo make -C /tmp/ryzen_smu dkms-install && sudo modprobe ryzen_smu
-  ```
+- **Alternatives:** You can also use the standalone `ryzen-smu-dkms` `.deb`/`.rpm` packages (`sudo zensmu driver install --method package`) or Arch AUR `paru -S ryzen_smu-dkms-git` (note underscore `_`, not `ryzen-smu-dkms`).
 
 > **Secure Boot / MOK signing:** Out-of-tree DKMS modules like `ryzen_smu` cannot load unsigned when UEFI Secure Boot or kernel lockdown (`integrity`/`confidentiality`) is active. Enroll your DKMS Machine Owner Key (`sudo mokutil --import /var/lib/dkms/mok.pub` and reboot to complete enrollment) or disable Secure Boot in UEFI firmware. Run `zensmu driver status` to inspect Secure Boot and lockdown status.
 
 ### 2. Install `zensmu`
 
-#### APT Repository (Debian / Ubuntu — Auto-Updates)
+#### APT Repository (Debian / Ubuntu — Auto-Updates + Automatic DKMS)
 
 Hosted on GitHub Pages ([`https://brauliobo.github.io/zensmu/apt/`](https://brauliobo.github.io/zensmu/)):
 
 ```bash
 echo "deb [trusted=yes] https://brauliobo.github.io/zensmu/apt ./" | sudo tee /etc/apt/sources.list.d/zensmu.list
 sudo apt update
-sudo apt install zensmu
-
-# Optional: install the out-of-tree ryzen_smu DKMS kernel driver
-sudo apt install linux-headers-$(uname -r) ryzen-smu-dkms
+sudo apt install linux-headers-$(uname -r) zensmu
 ```
 
-#### RPM / DNF Repository (Fedora / RHEL / openSUSE — Auto-Updates)
+#### RPM / DNF Repository (Fedora / RHEL / openSUSE — Auto-Updates + Automatic DKMS)
 
 Hosted on GitHub Pages ([`https://brauliobo.github.io/zensmu/rpm/`](https://brauliobo.github.io/zensmu/)):
 
 ```bash
 # Fedora / RHEL (DNF)
 curl -fsSL https://brauliobo.github.io/zensmu/rpm/zensmu.repo | sudo tee /etc/yum.repos.d/zensmu.repo
-sudo dnf install zensmu
-# Optional: sudo dnf install kernel-devel-$(uname -r) ryzen-smu-dkms
+sudo dnf install kernel-devel-$(uname -r) zensmu
 
 # openSUSE (Zypper)
 sudo zypper addrepo --no-gpgcheck https://brauliobo.github.io/zensmu/rpm zensmu
 sudo zypper refresh
-sudo zypper install --allow-unsigned-rpm zensmu
-# Optional: sudo zypper install --allow-unsigned-rpm kernel-default-devel ryzen-smu-dkms
+sudo zypper install --allow-unsigned-rpm kernel-default-devel dkms zensmu
 ```
 
 A Fedora COPR RPM spec is also maintained in [`packaging/copr/zensmu.spec`](packaging/copr/zensmu.spec) for source-built COPR / `rpmbuild` packages.
 
 #### AUR, Direct Packages & Source Build
 
-Prebuilt packages for **Debian/Ubuntu (`.deb`)**, **Fedora/RHEL/openSUSE (`.rpm`)**, **Arch/CachyOS (`.pkg.tar.zst`)**, and generic Linux (`.tar.gz`) — plus optional `ryzen-smu-dkms` `.deb`/`.rpm` packages — are published automatically on every [GitHub Release](https://github.com/brauliobo/zensmu/releases):
+Prebuilt packages for **Debian/Ubuntu (`.deb`)**, **Fedora/RHEL/openSUSE (`.rpm`)**, **Arch/CachyOS (`.pkg.tar.zst`)**, and generic Linux (`.tar.gz`) — plus standalone `ryzen-smu-dkms` `.deb`/`.rpm` packages — are published automatically on every [GitHub Release](https://github.com/brauliobo/zensmu/releases):
 
 ```bash
-# Arch Linux / CachyOS (AUR)
+# Arch Linux / CachyOS (AUR — auto-builds bundled DKMS if dkms + kernel headers are installed)
 paru -S zensmu-bin     # prebuilt binary
 paru -S zensmu-git     # build from main
 
-# Debian / Ubuntu (direct .deb from Releases)
-sudo apt install ./zensmu_*_amd64.deb
+# Debian / Ubuntu (direct .deb from Releases — auto-builds bundled DKMS)
+sudo apt install linux-headers-$(uname -r) ./zensmu_*_amd64.deb
 
-# Fedora / RHEL / openSUSE (direct .rpm from Releases)
-sudo dnf install ./zensmu-*.x86_64.rpm
+# Fedora / RHEL / openSUSE (direct .rpm from Releases — auto-builds bundled DKMS)
+sudo dnf install kernel-devel-$(uname -r) ./zensmu-*.x86_64.rpm
 ```
 
-Or build from source (Rust 1.78+):
+Or build from source (Rust 1.78+) and install the DKMS driver:
 
 ```bash
 git clone https://github.com/brauliobo/zensmu.git && cd zensmu
 cargo build --release --workspace
+sudo ./target/release/zensmu driver install
 ```
 
-All packages install `zensmu`, `zensmu-gui`, the desktop launcher (`zensmu-gui.desktop` + `zensmu.svg` icon), the `zensmu.1` man page (`man zensmu`), `zensmu-apply.service`, `zensmu-record.service` and `zensmu-exporter.service` (unprivileged user daemons), the `systemd-sleep` resume hook, the PolicyKit rule (`org.zensmu.policy`), and `bash`/`zsh`/`fish` completions.
+All packages install `zensmu`, `zensmu-gui`, the bundled `ryzen_smu` DKMS driver sources (`/usr/share/zensmu/ryzen_smu-dkms`) with automatic install/uninstall hooks, the desktop launcher (`zensmu-gui.desktop` + `zensmu.svg` icon), the `zensmu.1` man page (`man zensmu`), `zensmu-apply.service`, `zensmu-record.service` and `zensmu-exporter.service` (unprivileged user daemons), the `systemd-sleep` resume hook, the PolicyKit rule (`org.zensmu.policy`), and `bash`/`zsh`/`fish` completions.
 
 ---
 
@@ -153,9 +126,10 @@ In `zensmu top`: `1`–`4` switch tabs (`Overview`, `Clocks & Volts`, `CO & Shap
 ### CLI Essentials
 
 ```bash
-# Diagnostics & driver management
-zensmu driver status                               # Inspect ryzen_smu module, DKMS, autoload & distro guidance
-sudo zensmu driver install                         # Auto-install verified ryzen-smu-dkms (.deb/.rpm) or DKMS source
+# Diagnostics & first-class DKMS driver management
+zensmu driver status                               # Inspect ryzen_smu module, DKMS, kernel headers, Secure Boot & autoload
+sudo zensmu driver install                         # Build & load ryzen_smu via DKMS (auto-installs headers/dkms if needed)
+sudo zensmu driver uninstall                       # Unload & remove zensmu-managed ryzen_smu DKMS registration
 zensmu info                                        # CPU, CPUID, topology, capabilities
 sudo zensmu doctor                                 # Driver, false-OK mitigation, mailbox ping, guard check
 sudo zensmu status                                 # Live telemetry + CO + Shaper + PBO + factory limits

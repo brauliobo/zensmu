@@ -239,7 +239,7 @@ jobs:
             <main>
               <h1><span>zensmu</span> Linux Package Repositories</h1>
               <p class="meta">
-                Safety-first AMD Ryzen SMU CLI, live TUI, GUI, and optional <code>ryzen-smu-dkms</code> driver packages.
+                Safety-first AMD Ryzen SMU CLI, live TUI, GUI, and first-class DKMS <code>ryzen_smu</code> kernel driver support.
                 Latest release: <strong>${LATEST_TAG}</strong> &middot; Updated ${UPDATED_UTC} &middot;
                 <a href="https://github.com/${GH_REPO}">GitHub</a> &middot;
                 <a href="https://github.com/${GH_REPO}/releases">Releases</a>
@@ -247,13 +247,13 @@ jobs:
 
               <section class="card">
                 <h2>Debian / Ubuntu (APT)</h2>
-                <p>Add the repository and install <code>zensmu</code> (and optionally the <code>ryzen-smu-dkms</code> kernel driver):</p>
+                <p>Installing <code>zensmu</code> automatically builds &amp; registers the bundled <code>ryzen_smu</code> DKMS kernel module (and removes it cleanly on uninstall):</p>
                 <pre><code>echo "deb [trusted=yes] ${BASE_URL}/apt ./" | sudo tee /etc/apt/sources.list.d/zensmu.list
           sudo apt update
-          sudo apt install zensmu
+          sudo apt install linux-headers-\$(uname -r) zensmu
 
-          # Optional: install the out-of-tree ryzen_smu DKMS kernel driver
-          sudo apt install linux-headers-\$(uname -r) ryzen-smu-dkms</code></pre>
+          # If headers were missing during install, build &amp; load DKMS anytime with:
+          sudo zensmu driver install</code></pre>
                 <h3>Published .deb Packages</h3>
                 <ul>
           ${DEB_LIST}        </ul>
@@ -261,20 +261,17 @@ jobs:
 
               <section class="card">
                 <h2>Fedora / RHEL (DNF)</h2>
-                <p>Add the DNF repository and install <code>zensmu</code>:</p>
+                <p>Add the DNF repository and install <code>zensmu</code> (auto-builds bundled <code>ryzen_smu</code> DKMS module):</p>
                 <pre><code>curl -fsSL ${BASE_URL}/rpm/zensmu.repo | sudo tee /etc/yum.repos.d/zensmu.repo
-          sudo dnf install zensmu
+          sudo dnf install kernel-devel-\$(uname -r) zensmu
 
-          # Optional: install the out-of-tree ryzen_smu DKMS kernel driver
-          sudo dnf install kernel-devel-\$(uname -r) ryzen-smu-dkms</code></pre>
+          # Or build/reinstall the DKMS module anytime:
+          sudo zensmu driver install</code></pre>
 
                 <h3>openSUSE (Zypper)</h3>
                 <pre><code>sudo zypper addrepo --no-gpgcheck ${BASE_URL}/rpm zensmu
           sudo zypper refresh
-          sudo zypper install --allow-unsigned-rpm zensmu
-
-          # Optional: install the out-of-tree ryzen_smu DKMS kernel driver
-          sudo zypper install --allow-unsigned-rpm kernel-default-devel ryzen-smu-dkms</code></pre>
+          sudo zypper install --allow-unsigned-rpm kernel-default-devel dkms zensmu</code></pre>
 
                 <h3>Published .rpm Packages</h3>
                 <ul>

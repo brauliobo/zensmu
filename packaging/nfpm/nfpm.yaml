@@ -20,6 +20,10 @@ overrides:
       - libgcc-s1
       - polkitd | policykit-1
     recommends:
+      - dkms
+      - make
+      - gcc
+      - linux-headers-generic | linux-headers-amd64
       - libgl1
       - libxkbcommon0
       - libwayland-client0
@@ -32,6 +36,10 @@ overrides:
       - libgcc
       - polkit
     recommends:
+      - dkms
+      - make
+      - gcc
+      - kernel-devel
       - libglvnd-glx
       - libxkbcommon
       - libwayland-client
@@ -44,6 +52,7 @@ overrides:
       - gcc-libs
       - glibc
     recommends:
+      - dkms
       - ryzen_smu-dkms-git
       - libglvnd
       - libxkbcommon
@@ -121,6 +130,41 @@ contents:
     file_info:
       mode: 0644
 
+  - src: build/ryzen_smu_src/drv.c
+    dst: /usr/share/zensmu/ryzen_smu-dkms/drv.c
+    file_info:
+      mode: 0644
+
+  - src: build/ryzen_smu_src/smu.c
+    dst: /usr/share/zensmu/ryzen_smu-dkms/smu.c
+    file_info:
+      mode: 0644
+
+  - src: build/ryzen_smu_src/smu.h
+    dst: /usr/share/zensmu/ryzen_smu-dkms/smu.h
+    file_info:
+      mode: 0644
+
+  - src: build/ryzen_smu_src/Makefile
+    dst: /usr/share/zensmu/ryzen_smu-dkms/Makefile
+    file_info:
+      mode: 0644
+
+  - src: build/ryzen_smu_src/LICENSE
+    dst: /usr/share/zensmu/ryzen_smu-dkms/LICENSE
+    file_info:
+      mode: 0644
+
+  - src: build/ryzen_smu_src/dkms.conf
+    dst: /usr/share/zensmu/ryzen_smu-dkms/dkms.conf
+    file_info:
+      mode: 0644
+
+  - src: build/ryzen_smu_src/VERSION
+    dst: /usr/share/zensmu/ryzen_smu-dkms/VERSION
+    file_info:
+      mode: 0644
+
   - src: README.md
     dst: /usr/share/doc/zensmu/README.md
     file_info:
@@ -133,3 +177,4 @@ contents:
 
 scripts:
   postinstall: packaging/nfpm/postinstall.sh
+  preremove: packaging/nfpm/preremove.sh
