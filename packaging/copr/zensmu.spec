@@ -2,7 +2,7 @@
 %global debug_package %{nil}
 
 Name:           zensmu
-Version:        0.3.2
+Version:        0.3.3
 Release:        1%{?dist}
 Summary:        Safety-first Rust CLI, live TUI, and unprivileged GUI for AMD Ryzen SMU control and telemetry
 
