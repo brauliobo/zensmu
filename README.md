@@ -9,6 +9,9 @@
 
 Uses the standard [`ryzen_smu`](https://github.com/amkillam/ryzen_smu) DKMS kernel module (`/sys/kernel/ryzen_smu_drv`) — no custom kernel required.
 
+> [!WARNING]
+> **Disclaimer:** Modifying CPU voltage, power, and thermal limits via SMU carries inherent risk of system instability, data loss, voided warranty, or hardware damage — use at your own risk.
+
 ### Live TUI (`zensmu top`)
 
 <p align="center">
