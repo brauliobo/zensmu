@@ -266,6 +266,15 @@ mod tests {
         assert!(verify_codename_against_cpuid(Codename::Cezanne, &mk(0x19, 0x50)).is_ok());
         assert!(verify_codename_against_cpuid(Codename::Rembrandt, &mk(0x19, 0x44)).is_ok());
         assert!(verify_codename_against_cpuid(Codename::Raphael, &mk(0x19, 0x61)).is_ok());
+        // Verified live on AMD Ryzen 9 7950X3D (GitHub issue #3: family 0x19, model 0x61, stepping 0x2)
+        let raphael_7950x3d = CpuidInfo {
+            vendor: "AuthenticAMD".into(),
+            brand: "AMD Ryzen 9 7950X3D 16-Core Processor".into(),
+            family: 0x19,
+            model: 0x61,
+            stepping: 0x2,
+        };
+        assert!(verify_codename_against_cpuid(Codename::Raphael, &raphael_7950x3d).is_ok());
         assert!(verify_codename_against_cpuid(Codename::Phoenix, &mk(0x19, 0x74)).is_ok());
         assert!(verify_codename_against_cpuid(Codename::HawkPoint, &mk(0x19, 0x75)).is_ok());
         assert!(verify_codename_against_cpuid(Codename::StormPeak, &mk(0x19, 0x18)).is_ok());

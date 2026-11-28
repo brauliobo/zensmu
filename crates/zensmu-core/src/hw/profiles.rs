@@ -247,7 +247,9 @@ fn zen4_desktop(codename: Codename) -> CpuCapabilities {
         get_ln2_mode: Some(OpcodeSpec::rsmu(0xDD)),
         get_perf_data: Some(OpcodeSpec::rsmu(0x5C)),
         // Verified live on Ryzen 7 9700X (Granite Ridge):
-        // 0xD9 = 88000 mW (PPT), 0xDB = 75000 mA (TDC), 0xDC = 150000 mA (EDC)
+        // 0xD9 = 88000 mW (PPT), 0xDB = 75000 mA (TDC), 0xDC = 150000 mA (EDC).
+        // On Zen 4 (Raphael, e.g. Ryzen 9 7950X3D in GitHub issue #3), BIOSes commonly lock
+        // 0xD9..0xDC; `query_optional` cleanly returns `None` while MP1 0x23 still reports TDP/TjMax.
         get_fused_ppt: Some(OpcodeSpec::rsmu(0xD9)),
         get_fused_slow: None,
         get_fused_fast: None,
