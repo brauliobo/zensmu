@@ -195,7 +195,8 @@ pub fn capabilities_for(codename: Codename) -> Option<CpuCapabilities> {
         Codename::VanGogh => Some(apu1_vangogh(codename)),
         Codename::Rembrandt => Some(apu1_rembrandt(codename)),
         Codename::Phoenix | Codename::HawkPoint => Some(apu1_phoenix(codename)),
-        Codename::StrixPoint | Codename::StrixHalo => Some(apu1_strix(codename)),
+        Codename::StrixPoint => Some(apu1_strix(codename)),
+        Codename::StrixHalo => Some(apu1_strix_halo(codename)),
         Codename::RavenRidge | Codename::RavenRidge2 | Codename::Dali => Some(apu0_base(codename)),
         Codename::Picasso => Some(apu0_picasso(codename)),
         _ => None,
@@ -667,8 +668,7 @@ fn apu1_rembrandt(codename: Codename) -> CpuCapabilities {
     caps
 }
 
-/// Zen 5 Mobile APUs: Strix Point, Krackan Point (mapped to StrixPoint by `ryzen_smu`),
-/// and Strix Halo.
+/// Zen 5 Mobile APUs: Strix Point and Krackan Point (mapped to StrixPoint by `ryzen_smu`).
 ///
 /// Spec-implemented from `ryzen_smu` / `ZenStates-Core` (MP1 RSP `0x03B1_0978`,
 /// RSMU `GetDldoPsmMargin = 0xAF`, CO `-50..+50`, full APU DPTC) — community report
@@ -677,6 +677,25 @@ fn apu1_strix(codename: Codename) -> CpuCapabilities {
     let mut caps = apu1_phoenix(codename);
     caps.rsp_addrs.mp1_rsp = Some(0x03B1_0978);
     caps.get_co_per_core = Some(OpcodeSpec::rsmu(0xAF));
+    caps
+}
+
+/// Zen 5 Halo APU: Strix Halo (Ryzen AI Max / Max+ 395 / 390 / 385).
+///
+/// Verified live on Ryzen AI Max+ 395 (SMU `10.100.6.0` & `10.100.7.0`, GitHub issues #1 & #2):
+/// - RSMU RSP `0x03B1_0A80` & MP1 RSP `0x03B1_0978` (`TestMessage 0x01` -> `OK 0x1338`).
+/// - PBO status queries (`0x0F` scalar, `0x42` Fmax, `0x11` fused PPT, `0x15` fused TDC,
+///   `0x82` overclockable, `0x0B` CPPC perf scores, `MP1 0x5F` TDP/TjMax) verified live.
+/// - `RSMU 0xAF` is NOT `GetDldoPsmMargin` on Strix Halo (returns constant `525` on all
+///   16 cores across multiple boards/SMU versions), so `get_co_per_core` is left `None`
+///   to prevent bogus CO readouts, failed write verification, and invalid snapshots.
+/// - CO writes prefer hardware-verified `MP1 0x4C`/`0x4B` with `RSMU 0x5D`/`0x53` fallback.
+fn apu1_strix_halo(codename: Codename) -> CpuCapabilities {
+    let mut caps = apu1_strix(codename);
+    caps.get_co_per_core = None;
+    caps.set_co_per_core = Some(DualOpcode::mp1_then_rsmu(0x4B, 0x53));
+    caps.set_co_all_cores = Some(DualOpcode::mp1_then_rsmu(0x4C, 0x5D));
+    caps.set_apu_slow_limit = Some(DualOpcode::mp1_then_rsmu(0x23, 0x34));
     caps
 }
 
@@ -838,34 +857,74 @@ mod tests {
 
     #[test]
     fn strix_point_and_strix_halo_profiles_match_zen5_apu_spec() {
-        for codename in [Codename::StrixPoint, Codename::StrixHalo] {
-            let caps = capabilities_for(codename).unwrap();
-            assert!(!caps.is_family_17h);
-            assert_eq!(caps.rsp_addrs.rsmu_rsp, Some(0x03B1_0A80));
-            assert_eq!(caps.rsp_addrs.mp1_rsp, Some(0x03B1_0978));
-            assert_eq!(
-                caps.co_bounds,
-                Some(CoBounds {
-                    min: -50,
-                    max: 50,
-                    soft_min: -35,
-                })
-            );
-            assert_eq!(caps.get_co_per_core, Some(OpcodeSpec::rsmu(0xAF)));
-            assert_eq!(
-                caps.set_co_per_core,
-                Some(DualOpcode::rsmu_then_mp1(0x53, 0x4B))
-            );
-            assert_eq!(
-                caps.set_co_all_cores,
-                Some(DualOpcode::rsmu_then_mp1(0x5D, 0x4C))
-            );
-            assert_eq!(caps.get_igpu_co, Some(OpcodeSpec::rsmu(0x20)));
-            assert_eq!(caps.set_igpu_co, Some(OpcodeSpec::rsmu(0x1F)));
-            assert!(caps.get_curve_shaper.is_none());
-            assert!(caps.set_curve_shaper.is_none());
-            assert!(caps.set_stapm_limit.is_some());
-            assert!(caps.set_apu_skin_temp.is_some());
-        }
+        let sp = capabilities_for(Codename::StrixPoint).unwrap();
+        assert!(!sp.is_family_17h);
+        assert_eq!(sp.rsp_addrs.rsmu_rsp, Some(0x03B1_0A80));
+        assert_eq!(sp.rsp_addrs.mp1_rsp, Some(0x03B1_0978));
+        assert_eq!(
+            sp.co_bounds,
+            Some(CoBounds {
+                min: -50,
+                max: 50,
+                soft_min: -35,
+            })
+        );
+        assert_eq!(sp.get_co_per_core, Some(OpcodeSpec::rsmu(0xAF)));
+        assert_eq!(
+            sp.set_co_per_core,
+            Some(DualOpcode::rsmu_then_mp1(0x53, 0x4B))
+        );
+        assert_eq!(
+            sp.set_co_all_cores,
+            Some(DualOpcode::rsmu_then_mp1(0x5D, 0x4C))
+        );
+        assert_eq!(sp.get_igpu_co, Some(OpcodeSpec::rsmu(0x20)));
+        assert_eq!(sp.set_igpu_co, Some(OpcodeSpec::rsmu(0x1F)));
+        assert!(sp.get_curve_shaper.is_none());
+        assert!(sp.set_curve_shaper.is_none());
+        assert!(sp.set_stapm_limit.is_some());
+        assert!(sp.set_apu_skin_temp.is_some());
+
+        // Strix Halo (verified against Ryzen AI Max+ 395 reports, issues #1 & #2):
+        // RSMU 0xAF returns bogus 525 across all cores so get_co_per_core is disabled;
+        // CO writes prefer MP1 0x4C/0x4B with RSMU 0x5D/0x53 fallback.
+        let sh = capabilities_for(Codename::StrixHalo).unwrap();
+        assert!(!sh.is_family_17h);
+        assert_eq!(sh.rsp_addrs.rsmu_rsp, Some(0x03B1_0A80));
+        assert_eq!(sh.rsp_addrs.mp1_rsp, Some(0x03B1_0978));
+        assert_eq!(
+            sh.co_bounds,
+            Some(CoBounds {
+                min: -50,
+                max: 50,
+                soft_min: -35,
+            })
+        );
+        assert_eq!(sh.get_co_per_core, None);
+        assert_eq!(
+            sh.set_co_per_core,
+            Some(DualOpcode::mp1_then_rsmu(0x4B, 0x53))
+        );
+        assert_eq!(
+            sh.set_co_all_cores,
+            Some(DualOpcode::mp1_then_rsmu(0x4C, 0x5D))
+        );
+        assert_eq!(
+            sh.set_apu_slow_limit,
+            Some(DualOpcode::mp1_then_rsmu(0x23, 0x34))
+        );
+        assert_eq!(sh.get_igpu_co, Some(OpcodeSpec::rsmu(0x20)));
+        assert_eq!(sh.set_igpu_co, Some(OpcodeSpec::rsmu(0x1F)));
+        assert_eq!(sh.get_pbo_scalar, Some(OpcodeSpec::rsmu(0x0F)));
+        assert_eq!(sh.get_fmax, Some(OpcodeSpec::rsmu(0x42)));
+        assert_eq!(sh.get_fused_ppt, Some(OpcodeSpec::rsmu(0x11)));
+        assert_eq!(sh.get_fused_vdd_tdc, Some(OpcodeSpec::rsmu(0x15)));
+        assert_eq!(sh.get_sustained_power_thm, Some(OpcodeSpec::mp1(0x5F)));
+        assert_eq!(sh.get_is_overclockable, Some(OpcodeSpec::rsmu(0x82)));
+        assert_eq!(sh.get_perf_data, Some(OpcodeSpec::rsmu(0x0B)));
+        assert!(sh.get_curve_shaper.is_none());
+        assert!(sh.set_curve_shaper.is_none());
+        assert!(sh.set_stapm_limit.is_some());
+        assert!(sh.set_apu_skin_temp.is_some());
     }
 }

@@ -3601,7 +3601,7 @@ dependencies = [
 
 [[package]]
 name = "zensmu-cli"
-version = "0.3.1"
+version = "0.3.2"
 dependencies = [
  "clap",
  "clap_complete",
@@ -3619,7 +3619,7 @@ dependencies = [
 
 [[package]]
 name = "zensmu-core"
-version = "0.3.1"
+version = "0.3.2"
 dependencies = [
  "libc",
  "serde",
@@ -3631,7 +3631,7 @@ dependencies = [
 
 [[package]]
 name = "zensmu-gui"
-version = "0.3.1"
+version = "0.3.2"
 dependencies = [
  "eframe",
  "egui_plot",

@@ -365,11 +365,38 @@ fn layout_for(codename: Codename, version: u32) -> Option<PmTableLayout> {
             }),
             _ => None,
         },
-        Codename::StrixHalo => match version {
-            // Spec-implemented for Strix Halo (0xDC0 bytes, standard APU header) — community report welcome.
-            0x0064_0107..=0x0064_010C => Some(apu_std_header(0xDC0)),
-            _ => None,
-        },
+        Codename::StrixHalo => {
+            // Verified live on Ryzen AI Max+ 395 (Strix Halo, PM table 0x0064020C, 0xE50 = 3664 B,
+            // GitHub issues #1 & #2) and cross-referenced against RyzenAdj, amkillam/ryzen_smu PR #50,
+            // and SMUDebugTool PowerLimitMap:
+            // - 0x000/0x004 STAPM, 0x008/0x00C Fast PPT, 0x010/0x014 Slow PPT, 0x018/0x01C APU Slow
+            // - 0x020..0x02C are zeroed on Strix Halo; VDD TDC sits at 0x030/0x034
+            // - 0x058/0x05C Tctl thermal limit/value (matches k10temp Tctl & MP1 0x5F TjMax)
+            // - 1-CCD (0x0064_0107..=0x0064_010C, min 0xDC0 B) and 2-CCD (0x0064_0207..=0x0064_020C,
+            //   0xE50 B) share this header layout.
+            // - Ambiguous/unverified fields (SoC TDC, EDC, skin temps, clocks, voltages) stay None.
+            let min_size = match version {
+                0x0064_0107..=0x0064_010C => 0xDC0,
+                0x0064_0207..=0x0064_020C => 0xE50,
+                _ => return None,
+            };
+            Some(PmTableLayout {
+                min_size,
+                stapm_limit_w: Some(0x000),
+                stapm_value_w: Some(0x004),
+                ppt_limit_w: Some(0x008),
+                ppt_value_w: Some(0x00C),
+                slow_limit_w: Some(0x010),
+                slow_value_w: Some(0x014),
+                apu_slow_limit_w: Some(0x018),
+                apu_slow_value_w: Some(0x01C),
+                tdc_limit_a: Some(0x030),
+                tdc_value_a: Some(0x034),
+                tctl_limit_c: Some(0x058),
+                tctl_value_c: Some(0x05C),
+                ..PmTableLayout::default()
+            })
+        }
         Codename::VanGogh => match version {
             0x003F_0000 => Some(PmTableLayout {
                 fclk_mhz: Some(0x3BC),
@@ -719,7 +746,7 @@ mod tests {
         assert_eq!(snap_sp.uclk_mhz, Some(2800.0));
         assert_eq!(snap_sp.mclk_mhz, Some(3750.0));
 
-        // Strix Halo 0x0064_010C (0xDC0 bytes) + truncated buffer refusal
+        // Strix Halo 1-CCD 0x0064_010C (min 0xDC0 bytes) + truncated buffer refusal
         assert!(matches!(
             decode_pm_table(Codename::StrixHalo, 0x0064_010C, &strix_p),
             Err(Error::UnsupportedPmTable { .. })
@@ -727,11 +754,104 @@ mod tests {
         let mut strix_h = vec![0u8; 0xDC0];
         write_f32(&mut strix_h, 0x000, 120.0);
         write_f32(&mut strix_h, 0x008, 140.0);
-        write_f32(&mut strix_h, 0x040, 95.0);
+        write_f32(&mut strix_h, 0x030, 160.0);
+        write_f32(&mut strix_h, 0x058, 98.0);
         let snap_sh = decode_pm_table(Codename::StrixHalo, 0x0064_010C, &strix_h).unwrap();
         assert_eq!(snap_sh.stapm_limit_w, Some(120.0));
         assert_eq!(snap_sh.ppt_limit_w, Some(140.0));
-        assert_eq!(snap_sh.tctl_limit_c, Some(95.0));
+        assert_eq!(snap_sh.tdc_limit_a, Some(160.0));
+        assert_eq!(snap_sh.tctl_limit_c, Some(98.0));
+    }
+
+    #[test]
+    fn decodes_strix_halo_0x0064020c_ai_max_395_pm_table() {
+        // Synthetic 3664-byte (0xE50) PM table populated with real float values
+        // captured from AMD Ryzen AI Max+ 395 (GitHub issue #1, SMU 10.100.7.0).
+        let mut raw = vec![0u8; 0xE50];
+        write_f32(&mut raw, 0x000, 85.000); // STAPM limit
+        write_f32(&mut raw, 0x004, 21.725); // STAPM value
+        write_f32(&mut raw, 0x008, 120.000); // Fast PPT limit
+        write_f32(&mut raw, 0x00C, 6.546); // Fast PPT value
+        write_f32(&mut raw, 0x010, 85.000); // Slow PPT limit
+        write_f32(&mut raw, 0x014, 6.658); // Slow PPT value
+        write_f32(&mut raw, 0x018, 70.000); // APU Slow limit
+        write_f32(&mut raw, 0x01C, 0.000); // APU Slow value
+        write_f32(&mut raw, 0x030, 160.000); // VDD TDC limit
+        write_f32(&mut raw, 0x034, 3.541); // VDD TDC value
+                                           // Unverified secondary rails & thermal sensors from issue #1 dump — must NOT
+                                           // be mis-decoded into unverified TelemetrySnapshot fields.
+        write_f32(&mut raw, 0x038, 80.000);
+        write_f32(&mut raw, 0x03C, 1.061);
+        write_f32(&mut raw, 0x040, 40.000);
+        write_f32(&mut raw, 0x044, 1.778);
+        write_f32(&mut raw, 0x048, 98.000);
+        write_f32(&mut raw, 0x04C, 36.011);
+        write_f32(&mut raw, 0x050, 98.000);
+        write_f32(&mut raw, 0x054, 37.073);
+        write_f32(&mut raw, 0x058, 98.000); // Tctl limit (matches MP1 0x5F TjMax=98C)
+        write_f32(&mut raw, 0x05C, 39.670); // Tctl value (matches k10temp Tctl=39.6C)
+        write_f32(&mut raw, 0x060, 98.000);
+        write_f32(&mut raw, 0x064, 40.249);
+        write_f32(&mut raw, 0x090, 270.000);
+        write_f32(&mut raw, 0x0A8, 79.500);
+        write_f32(&mut raw, 0x104, 6.547);
+        write_f32(&mut raw, 0x2A8, 2000.000);
+
+        let snap = decode_pm_table(Codename::StrixHalo, 0x0064_020C, &raw).unwrap();
+        assert_eq!(snap.codename, Codename::StrixHalo);
+        assert_eq!(snap.table_version, 0x0064_020C);
+        assert_eq!(snap.table_size, 3664);
+
+        // Verified decoded fields
+        assert_eq!(snap.stapm_limit_w, Some(85.000));
+        assert_eq!(snap.stapm_value_w, Some(21.725));
+        assert_eq!(snap.ppt_limit_w, Some(120.000));
+        assert_eq!(snap.ppt_value_w, Some(6.546));
+        assert_eq!(snap.slow_limit_w, Some(85.000));
+        assert_eq!(snap.slow_value_w, Some(6.658));
+        assert_eq!(snap.apu_slow_limit_w, Some(70.000));
+        assert_eq!(snap.apu_slow_value_w, Some(0.000));
+        assert_eq!(snap.tdc_limit_a, Some(160.000));
+        assert_eq!(snap.tdc_value_a, Some(3.541));
+        assert_eq!(snap.tctl_limit_c, Some(98.000));
+        assert_eq!(snap.tctl_value_c, Some(39.670));
+
+        // Ambiguous / unverified fields must remain None
+        assert_eq!(snap.tdc_soc_limit_a, None);
+        assert_eq!(snap.tdc_soc_value_a, None);
+        assert_eq!(snap.edc_limit_a, None);
+        assert_eq!(snap.edc_value_a, None);
+        assert_eq!(snap.edc_soc_limit_a, None);
+        assert_eq!(snap.edc_soc_value_a, None);
+        assert_eq!(snap.apu_skin_temp_limit_c, None);
+        assert_eq!(snap.apu_skin_temp_value_c, None);
+        assert_eq!(snap.dgpu_skin_temp_limit_c, None);
+        assert_eq!(snap.dgpu_skin_temp_value_c, None);
+        assert_eq!(snap.fclk_mhz, None);
+        assert_eq!(snap.uclk_mhz, None);
+        assert_eq!(snap.mclk_mhz, None);
+        assert_eq!(snap.vddcr_soc_v, None);
+        assert_eq!(snap.vddcr_misc_v, None);
+        assert_eq!(snap.cldo_vddp_v, None);
+        assert_eq!(snap.cldo_vddg_iod_v, None);
+        assert_eq!(snap.cldo_vddg_ccd_v, None);
+
+        // Truncated buffer (< 0xE50) refused for 2-CCD 0x0064_020C
+        let short = vec![0u8; 0xDC0];
+        assert!(matches!(
+            decode_pm_table(Codename::StrixHalo, 0x0064_020C, &short),
+            Err(Error::UnsupportedPmTable {
+                version: 0x0064_020C,
+                size: 0xDC0,
+                ..
+            })
+        ));
+
+        // Wrong codename refused even with valid Strix Halo version & size
+        assert!(matches!(
+            decode_pm_table(Codename::StrixPoint, 0x0064_020C, &raw),
+            Err(Error::UnsupportedPmTable { .. })
+        ));
     }
 
     #[test]

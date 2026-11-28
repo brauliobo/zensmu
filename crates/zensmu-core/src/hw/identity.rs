@@ -241,8 +241,15 @@ mod tests {
         // Zen 5 Strix Point (0x24) & Krackan Point (0x60)
         assert!(verify_codename_against_cpuid(Codename::StrixPoint, &mk(0x1A, 0x24)).is_ok());
         assert!(verify_codename_against_cpuid(Codename::StrixPoint, &mk(0x1A, 0x60)).is_ok());
-        // Zen 5 Strix Halo (0x70)
-        assert!(verify_codename_against_cpuid(Codename::StrixHalo, &mk(0x1A, 0x70)).is_ok());
+        // Zen 5 Strix Halo (0x70, e.g. AMD RYZEN AI MAX+ 395 w/ Radeon 8060S)
+        let strix_halo_395 = CpuidInfo {
+            vendor: "AuthenticAMD".into(),
+            brand: "AMD RYZEN AI MAX+ 395 w/ Radeon 8060S".into(),
+            family: 0x1A,
+            model: 0x70,
+            stepping: 0,
+        };
+        assert!(verify_codename_against_cpuid(Codename::StrixHalo, &strix_halo_395).is_ok());
 
         // Cross-model mismatch within family 0x1A is rejected
         assert!(verify_codename_against_cpuid(Codename::GraniteRidge, &mk(0x1A, 0x24)).is_err());
