@@ -175,10 +175,10 @@ pub(super) fn draw_co_table(frame: &mut Frame, area: Rect, app: &App, hw: &Hardw
                 .map(|c| {
                     let color = margin_color(c.margin);
                     let bar = format_co_bar(c.margin, max_abs, 6);
-                    let perf = perf_scores
+                    let rank = perf_scores
                         .iter()
                         .find(|(idx, _)| *idx == c.core_index)
-                        .map(|(_, score)| score.to_string())
+                        .map(|(_, rank)| format!("#{rank}"))
                         .unwrap_or_else(|| "—".to_string());
 
                     Row::new(vec![
@@ -195,7 +195,7 @@ pub(super) fn draw_co_table(frame: &mut Frame, area: Rect, app: &App, hw: &Hardw
                         Cell::from(format!("{:>4}", format_signed_margin(c.margin)))
                             .style(Style::default().fg(color).add_modifier(Modifier::BOLD)),
                         Cell::from(bar).style(Style::default().fg(color)),
-                        Cell::from(perf).style(Style::default().fg(palette::TEAL)),
+                        Cell::from(rank).style(Style::default().fg(palette::TEAL)),
                     ])
                 })
                 .collect();
@@ -207,7 +207,7 @@ pub(super) fn draw_co_table(frame: &mut Frame, area: Rect, app: &App, hw: &Hardw
                 "CPUs",
                 "CO",
                 "Offset Bar",
-                "Perf",
+                "Rank",
             ])
             .style(
                 Style::default()

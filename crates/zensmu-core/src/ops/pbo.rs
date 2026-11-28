@@ -67,6 +67,7 @@ pub struct PboStatus {
     pub fmax_mhz: Option<u32>,
     pub fused: FusedLimits,
     pub flags: PlatformFlags,
+    /// Preferred core ranking (`(core_index, rank)` where `rank` is 1-based: `1` = fastest core).
     pub core_perf_scores: Vec<(u32, u32)>,
 }
 
@@ -169,14 +170,30 @@ pub fn get_pbo_status(transport: &dyn SmuTransport, hw: &HardwareContext) -> Res
 
     let mut core_perf_scores = Vec::new();
     if caps.get_perf_data.is_some() {
-        for core in &hw.topology.cores {
-            if let Some(out) = query_optional(
-                transport,
-                hw,
-                caps.get_perf_data,
-                [core.index, 0, 0, 0, 0, 0],
-            )? {
-                core_perf_scores.push((core.index, out[0]));
+        // SMU `GetPerfData` (`RSMU 0x5C` on AM5, `RSMU 0x0B` on Strix Point/Halo)
+        // takes `arg0 = rank` (`0` = fastest preferred core, `N - 1` = slowest) and
+        // returns `(ccd << 16) | core_in_ccd`.
+        for rank_idx in 0..hw.topology.cores.len() as u32 {
+            if let Some(out) =
+                query_optional(transport, hw, caps.get_perf_data, [rank_idx, 0, 0, 0, 0, 0])?
+            {
+                let ccd = (out[0] >> 16) & 0xFFFF;
+                let core_in_ccd = out[0] & 0xFFFF;
+                let resolved = hw
+                    .topology
+                    .cores
+                    .iter()
+                    .find(|c| c.ccd == ccd && c.core_in_ccd == core_in_ccd)
+                    .or_else(|| {
+                        (ccd == 0)
+                            .then(|| hw.topology.cores.iter().find(|c| c.index == core_in_ccd))
+                            .flatten()
+                    });
+                if let Some(core) = resolved {
+                    if !core_perf_scores.iter().any(|(idx, _)| *idx == core.index) {
+                        core_perf_scores.push((core.index, rank_idx + 1));
+                    }
+                }
             }
         }
     }
@@ -451,7 +468,8 @@ mod tests {
         assert_eq!(status.flags.expo_active, Some(true));
         assert_eq!(status.flags.ln2_mode, Some(false));
         assert_eq!(status.core_perf_scores.len(), 8);
-        assert_eq!(status.core_perf_scores[0], (0, 200));
+        assert_eq!(status.core_perf_scores[0], (0, 1));
+        assert_eq!(status.core_perf_scores[1], (3, 2));
 
         // Lock EXPO query in BIOS -> gracefully returns None without failing
         transport.set_reject_opcode(0x35, SmuStatus::CmdRejectedPrereq);
@@ -601,5 +619,108 @@ mod tests {
             }
             other => panic!("expected Error::HardwareClamped, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn get_pbo_status_decodes_multi_ccd_cppc_ranking() {
+        use crate::transport::{DriverSysfsInfo, MailboxResponse};
+
+        struct DualCcdPerfTransport;
+
+        impl SmuTransport for DualCcdPerfTransport {
+            fn read_info(&self) -> Result<DriverSysfsInfo> {
+                Ok(DriverSysfsInfo {
+                    drv_version: "0.1.7".into(),
+                    smu_version: "10.100.7.0".into(),
+                    codename_id: 26,
+                    mp1_if_version: 4,
+                    has_rsmu: true,
+                    has_pm_table: false,
+                    pm_table_version: None,
+                    pm_table_size: None,
+                })
+            }
+
+            fn read_pm_table(&self) -> Result<Vec<u8>> {
+                Err(Error::UnsupportedCapability {
+                    capability: "pm_table",
+                    codename: "Strix Halo".into(),
+                })
+            }
+
+            fn send_command(
+                &self,
+                mailbox: Mailbox,
+                opcode: u32,
+                args: SmuArgs,
+                _verify_rsp_smn_addr: Option<u32>,
+            ) -> Result<MailboxResponse> {
+                let mut out = [0u32; 6];
+                let status = match (mailbox, opcode) {
+                    (Mailbox::Rsmu, 0x01) => {
+                        out[0] = args[0].wrapping_add(1);
+                        SmuStatus::Ok
+                    }
+                    // Observed on Strix Halo (#1): rank 0..7 -> CCD1 cores, rank 8..15 -> CCD0 cores
+                    (Mailbox::Rsmu, 0x0B) => {
+                        const ORDER: [u32; 16] = [
+                            0x0001_0006,
+                            0x0001_0003,
+                            0x0001_0005,
+                            0x0001_0000,
+                            0x0001_0004,
+                            0x0001_0001,
+                            0x0001_0002,
+                            0x0001_0007,
+                            0x0000_0004,
+                            0x0000_0001,
+                            0x0000_0002,
+                            0x0000_0006,
+                            0x0000_0005,
+                            0x0000_0007,
+                            0x0000_0000,
+                            0x0000_0003,
+                        ];
+                        if let Some(&encoded) = ORDER.get(args[0] as usize) {
+                            out[0] = encoded;
+                            SmuStatus::Ok
+                        } else {
+                            SmuStatus::CmdRejectedPrereq
+                        }
+                    }
+                    _ => SmuStatus::CmdRejectedPrereq,
+                };
+                Ok(MailboxResponse {
+                    driver_status: status,
+                    hw_status: None,
+                    args: out,
+                })
+            }
+
+            fn read_smn(&self, _addr: u32) -> Result<u32> {
+                Ok(SmuStatus::Ok as u32)
+            }
+        }
+
+        let transport = DualCcdPerfTransport;
+        let driver = transport.read_info().unwrap();
+        let hw = HardwareContext {
+            driver,
+            codename: Codename::StrixHalo,
+            cpuid: None,
+            topology: CpuTopology::synthetic(2, 8, 2),
+            capabilities: capabilities_for(Codename::StrixHalo).unwrap(),
+        };
+
+        let status = get_pbo_status(&transport, &hw).unwrap();
+        assert_eq!(status.core_perf_scores.len(), 16);
+        // Rank 1 = CCD 1 local core 6 -> physical core index 14
+        assert_eq!(status.core_perf_scores[0], (14, 1));
+        // Rank 2 = CCD 1 local core 3 -> physical core index 11
+        assert_eq!(status.core_perf_scores[1], (11, 2));
+        // Rank 9 = CCD 0 local core 4 -> physical core index 4
+        assert_eq!(status.core_perf_scores[8], (4, 9));
+        // Rank 16 = CCD 0 local core 3 -> physical core index 3
+        assert_eq!(status.core_perf_scores[15], (3, 16));
     }
 }

@@ -183,10 +183,10 @@ pub(super) fn format_pbo_status_with_board(out: &PboGetOutput, board: &SystemBoa
         let _ = writeln!(s);
         let _ = writeln!(s, "CPPC Core Performance Ranking:");
         let mut ranked = out.status.core_perf_scores.clone();
-        ranked.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
-        let _ = writeln!(s, "  {:<6} {:<8} {:>8}", "RANK", "CORE", "SCORE");
-        for (rank, (core_idx, score)) in ranked.iter().enumerate() {
-            let _ = writeln!(s, "  {:<6} {:<8} {:>8}", rank + 1, core_idx, score);
+        ranked.sort_by(|a, b| a.1.cmp(&b.1).then_with(|| a.0.cmp(&b.0)));
+        let _ = writeln!(s, "  {:<6} {:<8}", "RANK", "CORE");
+        for (core_idx, rank) in &ranked {
+            let _ = writeln!(s, "  {:<6} {:<8}", rank, core_idx);
         }
     }
     s

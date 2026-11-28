@@ -208,6 +208,27 @@ fn pbo_format_renders_fused_tdp_and_tjmax_when_present() {
 }
 
 #[test]
+fn pbo_format_renders_cppc_ranking_in_ascending_rank_order() {
+    let status = PboStatus {
+        core_perf_scores: vec![(3, 2), (5, 1), (0, 3)],
+        ..Default::default()
+    };
+    let out = format_pbo_status_with_board(
+        &PboGetOutput {
+            codename: Codename::GraniteRidge,
+            active_limits: ActivePboLimits::default(),
+            status,
+        },
+        &SystemBoardInfo::default(),
+    );
+    let idx1 = out.find("  1      5").expect(&out);
+    let idx2 = out.find("  2      3").expect(&out);
+    let idx3 = out.find("  3      0").expect(&out);
+    assert!(idx1 < idx2 && idx2 < idx3, "{out}");
+    assert!(!out.contains("SCORE"), "{out}");
+}
+
+#[test]
 fn report_output_serializes_expected_json_contract() {
     use zensmu_core::report::{collect_debug_report, ReportOptions};
     use zensmu_core::transport::mock::MockTransport;

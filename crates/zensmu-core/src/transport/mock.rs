@@ -516,9 +516,15 @@ impl SmuTransport for MockTransport {
                     out[0] = st.sustained_power_thm_raw;
                 }
                 (Mailbox::Rsmu, 0x5C) => {
-                    // CPPC perf score mock: higher on core 0 & 3
-                    let idx = args[0];
-                    out[0] = 200u32.saturating_sub(idx * 5);
+                    // CPPC core preference order: arg0 = rank (0 = fastest),
+                    // returns `(ccd << 16) | core_in_ccd`. Mock prefers cores 0 & 3.
+                    const ORDER: [u32; 8] = [0, 3, 1, 2, 4, 5, 6, 7];
+                    let rank = args[0] as usize;
+                    if let Some(&core_in_ccd) = ORDER.get(rank) {
+                        out[0] = core_in_ccd;
+                    } else {
+                        hw = SmuStatus::CmdRejectedPrereq;
+                    }
                 }
                 _ => {
                     hw = SmuStatus::UnknownCmd;
